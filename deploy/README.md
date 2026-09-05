@@ -6,7 +6,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Deployment assets
 
-- `binaries/` builds the architecture-matched controller and adapter bundle
+- [`binaries/`](binaries/README.md) builds the architecture-matched controller and adapter bundle
   used as a verified backup to GitHub release attachments.
 - `vllm/` builds the ColdSnap-enabled vLLM runtime and CRIU RPC evaluation image.
 - `sglang/` builds the ColdSnap-enabled SGLang runtime.

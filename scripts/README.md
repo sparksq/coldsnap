@@ -23,6 +23,8 @@ Repository-owned checks and provider tools are:
 - `check-license-headers.py` enforces the first-party SPDX header policy while
   excluding legal instruments, generated data, and verbatim third-party texts;
 - `nccl-payload-release-plan.py` selects locked provider payloads for publication;
+- `verify-binary-bundle.py` checks OCI executable hashes, platform, and release
+  identity before publishing a versioned Docker Hub binary bundle;
 - `nccl-target-observe.py` records the target image's NCCL/runtime identity;
 - `nccl-provider-runtime-probe.py` checks a built provider's runtime contract;
 - `nccl-nvcc-reproducible.sh` supplies deterministic per-output NVCC seeds.

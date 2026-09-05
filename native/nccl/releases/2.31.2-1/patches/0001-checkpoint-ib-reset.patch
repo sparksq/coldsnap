@@ -1,0 +1,311 @@
+diff --git a/contrib/nccl_checkpoint/gen_shim.py b/contrib/nccl_checkpoint/gen_shim.py
+index e3ae887..de0bc9f 100644
+--- a/contrib/nccl_checkpoint/gen_shim.py
++++ b/contrib/nccl_checkpoint/gen_shim.py
+@@ -56,6 +56,7 @@ MANUALLY_SHIMMED_FUNCS: Set[str] = {
+ }
+ 
+ EXTRA_EXPORTED_FUNCS: Set[str] = {
++    "ncclCheckpointCommGetReal",
+     "ncclCheckpointGetVersion",
+     "ncclCheckpointPrepare",
+     "ncclCheckpointRestore",
+diff --git a/contrib/nccl_checkpoint/shim.cc b/contrib/nccl_checkpoint/shim.cc
+index 1ff4c46..ce0b076 100644
+--- a/contrib/nccl_checkpoint/shim.cc
++++ b/contrib/nccl_checkpoint/shim.cc
+@@ -16,6 +16,11 @@ extern "C" ncclResult_t ncclCheckpointGetVersion(int* checkpointVersion, int* nc
+   return ncclSuccess;
+ }
+ 
++extern "C" ncclResult_t ncclCheckpointCommGetReal(ncclComm_t comm, ncclComm_t* realComm) {
++  if (realComm == nullptr) return ncclInvalidArgument;
++  return g_commHandles.toReal(comm, realComm);
++}
++
+ static CommInitParams* allocInitParams(int nranks, int rank, const ncclConfig_t* configPtr) {
+   CommInitParams* params = new CommInitParams{};
+   params->creation = create_via_init;
+@@ -36,9 +41,6 @@ static CommInitParams* allocInitParams(int nranks, int rank, const ncclConfig_t*
+   } else {
+     params->config = NCCL_CONFIG_INITIALIZER;
+   }
+-  params->config.size = sizeof(ncclConfig_t);
+-  params->config.magic = NCCL_API_MAGIC;
+-  params->config.version = NCCL_VERSION_CODE;
+   params->config.netName = params->net_name[0] ? params->net_name : nullptr;
+   params->config.commName = params->comm_name[0] ? params->comm_name : nullptr;
+   params->commParent = nullptr;
+diff --git a/contrib/nccl_checkpoint/shim_core.h b/contrib/nccl_checkpoint/shim_core.h
+index 109fd48..e5360b8 100644
+--- a/contrib/nccl_checkpoint/shim_core.h
++++ b/contrib/nccl_checkpoint/shim_core.h
+@@ -413,3 +413,4 @@ static inline void markWindowCommRestoreUnsafe(ncclWindow_t synthWin, const char
+ extern "C" ncclResult_t ncclCheckpointPrepare(void);
+ extern "C" ncclResult_t ncclCheckpointRestore(void);
+ extern "C" ncclResult_t ncclCheckpointGetVersion(int* checkpointVersion, int* ncclVersion);
++extern "C" ncclResult_t ncclCheckpointCommGetReal(ncclComm_t comm, ncclComm_t* realComm);
+diff --git a/src/include/ras.h b/src/include/ras.h
+index 09d6c9b..1e39423 100644
+--- a/src/include/ras.h
++++ b/src/include/ras.h
+@@ -22,6 +22,7 @@ struct rasRankInit {
+ 
+ ncclResult_t ncclRasCommInit(struct ncclComm* comm, struct rasRankInit* myRank);
+ ncclResult_t ncclRasCommFini(const struct ncclComm* comm);
++ncclResult_t ncclRasCheckpointReset();
+ ncclResult_t ncclRasAddRanks(struct rasRankInit* ranks, int nranks);
+ ncclResult_t ncclRunDiagnosticsPassive(struct ncclComm* comm);
+
+diff --git a/src/include/bootstrap.h b/src/include/bootstrap.h
+index 12e98b2..f38c103 100644
+--- a/src/include/bootstrap.h
++++ b/src/include/bootstrap.h
+@@ -20,6 +20,7 @@ static_assert(sizeof(struct ncclBootstrapHandle) <= sizeof(ncclUniqueId),
+               "Bootstrap handle is too large to fit inside NCCL unique ID");
+ 
+ ncclResult_t bootstrapNetInit();
++ncclResult_t bootstrapNetCheckpointReset();
+ ncclResult_t bootstrapCreateRoot(struct ncclBootstrapHandle* handle, bool idFromEnv);
+ ncclResult_t bootstrapGetUniqueId(struct ncclBootstrapHandle* handle, struct ncclComm* comm);
+ ncclResult_t bcastGrowHandle(struct ncclBootstrapHandle* handle, struct ncclComm* parent, bool isRoot);
+
+diff --git a/src/include/net.h b/src/include/net.h
+index 5660c2b..7ca514e 100644
+--- a/src/include/net.h
++++ b/src/include/net.h
+@@ -20,6 +20,8 @@
+ ncclResult_t ncclNetInit(struct ncclComm* comm);
+ ncclResult_t ncclNetInitFromParent(struct ncclComm* comm, struct ncclComm* parent);
+ ncclResult_t ncclNetFinalize(struct ncclComm* comm);
++ncclResult_t ncclNetSocketCheckpointReset();
++extern "C" ncclResult_t ncclCheckpointIbReset();
+ ncclResult_t ncclNetGetDevCount(int netPluginIndex, int* nPhysDev, int* nVirtDev);
+ ncclResult_t ncclNetSetVirtDevCount(int netPluginIndex, int nVirtDev);
+ ncclResult_t ncclCollNetGetDevCount(int netPluginIndex, int* nPhysDev, int* nVirtDev);
+
+diff --git a/src/bootstrap.cc b/src/bootstrap.cc
+index 0f323ea..a514a98 100644
+--- a/src/bootstrap.cc
++++ b/src/bootstrap.cc
+@@ -137,6 +137,17 @@ ncclResult_t bootstrapNetInit() {
+   return ncclSuccess;
+ }
+ 
++ncclResult_t bootstrapNetCheckpointReset() {
++  std::lock_guard<std::mutex> lock(bootstrapNetMutex);
++  // Communicators have been destroyed at this checkpoint boundary.  Drop the
++  // process-global interface selection so restore discovers the address that
++  // belongs to the destination host instead of rebinding the captured host.
++  bootstrapNetInitDone = 0;
++  memset(bootstrapNetIfName, 0, sizeof(bootstrapNetIfName));
++  memset(&bootstrapNetIfAddr, 0, sizeof(bootstrapNetIfAddr));
++  return ncclSuccess;
++}
++
+ /* Socket Interface Selection type */
+ enum bootstrapInterface_t {
+   findSubnetIf = -1,
+
+diff --git a/src/transport/net_socket.cc b/src/transport/net_socket.cc
+index f760ae3..a00e3dc 100644
+--- a/src/transport/net_socket.cc
++++ b/src/transport/net_socket.cc
+@@ -811,6 +811,21 @@ ncclResult_t ncclNetSocketFinalize(void* ctx) {
+   return ncclSuccess;
+ }
+ 
++ncclResult_t ncclNetSocketCheckpointReset() {
++  std::lock_guard<std::mutex> lock(ncclNetSocketMutex);
++  if (netRefCount != 0) {
++    WARN("NET/Socket : checkpoint reset refused with %d live references", netRefCount);
++    return ncclInvalidUsage;
++  }
++  for (int device = 0; device < ncclNetIfs; device++) {
++    free(ncclNetSocketDevs[device].pciPath);
++  }
++  memset(ncclNetSocketDevs, 0, sizeof(ncclNetSocketDevs));
++  ncclNetIfs = -1;
++  ncclProfilerFunction = nullptr;
++  return ncclSuccess;
++}
++
+ ncclNet_t ncclNetSocket = {
+   "Socket",
+   ncclNetSocketInit,
+
+diff --git a/src/ras/ras.cc b/src/ras/ras.cc
+index 8020300..c21d031 100644
+--- a/src/ras/ras.cc
++++ b/src/ras/ras.cc
+@@ -178,6 +178,17 @@ static void rasTerminate() {
+   if (rasLocalNotify(&msg) == ncclSuccess) rasThread.join();
+ }
+ 
++ncclResult_t ncclRasCheckpointReset() {
++  if (!rasInitialized) return ncclSuccess;
++  int references = COMPILER_ATOMIC_LOAD(&rasInitRefCount, std::memory_order_acquire);
++  if (references != 0) {
++    WARN("RAS checkpoint reset refused with %d live communicator references", references);
++    return ncclInvalidUsage;
++  }
++  rasTerminate();
++  return ncclSuccess;
++}
++
+ // Invoked by regular NCCL threads on every (non-split) comm initialization.  Provides info on all the ranks within
+ // the communicator.
+ ncclResult_t ncclRasAddRanks(struct rasRankInit* ranks, int nranks) {
+diff --git a/src/transport/net_ib/common.cc b/src/transport/net_ib/common.cc
+index 75f810d..b3229d5 100644
+--- a/src/transport/net_ib/common.cc
++++ b/src/transport/net_ib/common.cc
+@@ -162,7 +162,7 @@ static void ncclIbUpdateDeviceSpeed(struct ncclIbDev* dev) {
+   }
+ }
+ 
+-std::thread ncclIbAsyncThread;
++std::thread ncclIbAsyncThreads[MAX_IB_DEVS];
+ void* ncclIbAsyncThreadMain(void* args) {
+   struct ncclIbDev* dev = (struct ncclIbDev*)args;
+   while (1) {
+diff --git a/src/transport/net_ib/common.h b/src/transport/net_ib/common.h
+index b9007f7..f9af185 100644
+--- a/src/transport/net_ib/common.h
++++ b/src/transport/net_ib/common.h
+@@ -25,6 +25,7 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ #include <mutex>
++#include <new>
+ #define ENABLE_TIMER 0
+ #include "timer.h"
+ 
+@@ -677,7 +678,7 @@ ncclResult_t ncclIbStatsCheckFatalCount(struct ncclIbStats* stat, const char* fu
+ 
+ extern ncclProfilerCallback_t ncclProfilerFunction;
+ 
+-extern std::thread ncclIbAsyncThread;
++extern std::thread ncclIbAsyncThreads[MAX_IB_DEVS];
+ void* ncclIbAsyncThreadMain(void* args);
+ 
+ ncclResult_t ncclIbGdrSupport();
+diff --git a/src/transport/net_ib/init.cc b/src/transport/net_ib/init.cc
+index c40b214..f992463 100644
+--- a/src/transport/net_ib/init.cc
++++ b/src/transport/net_ib/init.cc
+@@ -7,6 +7,7 @@
+ 
+ #include "common.h"
+ #include "p2p_resiliency_recovery.h"
++#include "ras.h"
+ 
+ NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
+ NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
+@@ -28,6 +29,7 @@ NCCL_PARAM(IbDisable, "IB_DISABLE", 0);
+ NCCL_PARAM(IbMergeVfs, "IB_MERGE_VFS", 1);
+ NCCL_PARAM(IbMergeNics, "IB_MERGE_NICS", 1);
+ NCCL_PARAM(IbDevicePciOrder, "IB_DEVICE_PCI_ORDER", 1);
++NCCL_PARAM(IbReleaseOnFinalize, "IB_RELEASE_ON_FINALIZE", 0);
+ 
+ extern int64_t ncclParamIbArThreshold();
+ 
+@@ -279,10 +281,84 @@ const char* ibProviderName[] = {
+ };
+ 
+ ncclResult_t ncclIbFinalizeDevices(void) {
+-  netRefCount--;
++  if (--netRefCount != 0 || !ncclParamIbReleaseOnFinalize()) return ncclSuccess;
++
++  std::lock_guard<std::mutex> lock(ncclIbMutex);
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    ncclIbDev* dev = ncclIbDevs + d;
++    if (dev->pdRefs != 0 || dev->mrCache.population != 0) {
++      WARN("NET/IB : Device %d still owns checkpoint-unsafe resources (pdRefs=%d mrCount=%d)", d, dev->pdRefs,
++           dev->mrCache.population);
++      return ncclInternalError;
++    }
++  }
++
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    if (ncclIbAsyncThreads[d].joinable()) {
++      int err = pthread_cancel(ncclIbAsyncThreads[d].native_handle());
++      if (err != 0) {
++        WARN("NET/IB : Failed to stop async event thread for device %d: %s", d, strerror(err));
++        return ncclSystemError;
++      }
++    }
++  }
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    if (ncclIbAsyncThreads[d].joinable()) ncclIbAsyncThreads[d].join();
++  }
++
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    ibv_context* context = ncclIbDevs[d].context;
++    bool first = context != NULL;
++    for (int prev = 0; prev < d && first; prev++) {
++      if (ncclIbDevs[prev].context == context) first = false;
++    }
++    if (first && wrap_ibv_close_device(context) != ncclSuccess) {
++      WARN("NET/IB : Failed to close device context %p", context);
++      return ncclSystemError;
++    }
++  }
++
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    free(ncclIbDevs[d].pciPath);
++    free(ncclIbDevs[d].mrCache.slots);
++    ncclIbDevs[d].~ncclIbDev();
++    new (ncclIbDevs + d) ncclIbDev();
++  }
++  memset(ncclIbMergedDevs, 0, sizeof(ncclIbMergedDevs));
++  ncclIbRelaxedOrderingEnabled = 0;
++  ncclNMergedIbDevs = -1;
++  ncclNIbDevs = -1;
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointIbGetStatus, int* netRefs, int* ndevs, int* pdRefs, int* mrCount);
++ncclResult_t ncclCheckpointIbGetStatus(int* netRefs, int* ndevs, int* pdRefs, int* mrCount) {
++  if (netRefs == nullptr || ndevs == nullptr || pdRefs == nullptr || mrCount == nullptr) return ncclInvalidArgument;
++
++  std::lock_guard<std::mutex> lock(ncclIbMutex);
++  *netRefs = netRefCount;
++  *ndevs = ncclNIbDevs < 0 ? 0 : ncclNIbDevs;
++  *pdRefs = 0;
++  *mrCount = 0;
++  for (int d = 0; d < *ndevs; d++) {
++    std::lock_guard<std::mutex> devLock(ncclIbDevs[d].mutex);
++    *pdRefs += ncclIbDevs[d].pdRefs;
++    *mrCount += ncclIbDevs[d].mrCache.population;
++  }
+   return ncclSuccess;
+ }
+ 
++NCCL_API(ncclResult_t, ncclCheckpointIbReset);
++ncclResult_t ncclCheckpointIbReset() {
++  if (!ncclParamIbReleaseOnFinalize()) return ncclInvalidUsage;
++  NCCLCHECK(ncclRasCheckpointReset());
++  // The checkpoint shim has destroyed every communicator, but unsuccessful
++  // network/GIN probes can leave unmatched device-cache references behind.
++  // Force the same last-user path at this explicit checkpoint boundary.
++  netRefCount = 1;
++  return ncclIbFinalizeDevices();
++}
++
+ extern int64_t ncclIbArThreshold;
+ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
+   ncclResult_t ret = ncclSuccess;
+@@ -452,9 +528,9 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
+                  ncclIbDevs[ncclNIbDevs].speed, context, ncclIbDevs[ncclNIbDevs].pciPath, ncclIbDevs[ncclNIbDevs].ar,
+                  ncclIbDevs[ncclNIbDevs].oooRqSize);
+ 
+-            ncclIbAsyncThread = std::thread(ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs);
+-            ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
+-            ncclIbAsyncThread.detach();
++            ncclIbAsyncThreads[ncclNIbDevs] = std::thread(ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs);
++            ncclSetThreadName(ncclIbAsyncThreads[ncclNIbDevs], "NCCL IbAsync %2d", ncclNIbDevs);
++            if (!ncclParamIbReleaseOnFinalize()) ncclIbAsyncThreads[ncclNIbDevs].detach();
+ 
+             ncclNIbDevs++;
+             nPorts++;

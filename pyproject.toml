@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldsnap-development"
+version = "0.3.20"
+description = "ColdSnap source workspace; not a published runtime distribution"
+requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+
+[tool.setuptools]
+packages = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+  "integrations/core",
+  "integrations/sglang",
+  "integrations/vllm",
+]
+
+[tool.uv.sources]
+coldsnap-core = { workspace = true }

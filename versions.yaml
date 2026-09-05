@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Authoritative release version and generated CI configuration.
+# Run: python scripts/update-versions.py --check
+# Run: python scripts/generate-ci-gha.py --check
+
+coldsnap: 0.3.20
+coldsnap-vllm: 0.5.9
+coldsnap-sglang: 0.3.4
+coldsnap-criu-rpc: 0.3.11
+
+go_toolchain:
+  go: "1.25.14"
+
+project_rules:
+  coldsnap:
+    - { type: gomod, path: go.mod }
+    - { type: go_version, path: internal/buildinfo/buildinfo.go }
+    - { type: pyproject, path: pyproject.toml }
+    - { type: pyproject, path: integrations/core/pyproject.toml }
+  coldsnap-vllm:
+    - { type: pyproject, path: integrations/vllm/pyproject.toml }
+  coldsnap-sglang:
+    - { type: pyproject, path: integrations/sglang/pyproject.toml }
+    - { type: init_py, path: integrations/sglang/coldsnap_sglang/__init__.py }
+  coldsnap-criu-rpc:
+    - { type: gomod, path: cmd/coldsnap-criu-rpc/go.mod }
+
+dependency_mappings:
+  python:
+    packages:
+      coldsnap: coldsnap-core
+    dependencies:
+      coldsnap-vllm: [coldsnap]
+      coldsnap-sglang: [coldsnap]
+
+ci:
+  repo_tools_source: "git+https://github.com/scitrera/repo-tools.git@b4aa219f66bfbc8c03e1c42644eb77ebb7983bd9"
+  test_branches: [main]
+  # Docker bundle and NCCL payload publication are repository-owned workflows.
+  # Native builds must share a validated source version with manifest assembly.
+  only_workflows: [version-check, publish-go]
+  github_release: true
+  go:
+    lint: none
+    test_args: "-count=1"
+    verify_tag_version: coldsnap
+    binary_platforms: [linux/amd64, linux/arm64]
+    binaries:
+      - name: coldsnap
+        project: coldsnap
+        package: ./cmd/coldsnap
+        ldflags: -s -w -buildid= -X github.com/sparksq/coldsnap/internal/buildinfo.Version=$VERSION -X github.com/sparksq/coldsnap/internal/buildinfo.Commit=$COMMIT
+        extra_files: [LICENSE, THIRD_PARTY_NOTICES.md]
+      - name: coldsnap-vllm-adapter
+        project: coldsnap
+        package: ./cmd/coldsnap-vllm-adapter
+        ldflags: -s -w -buildid= -X github.com/sparksq/coldsnap/internal/buildinfo.Version=$VERSION -X github.com/sparksq/coldsnap/internal/buildinfo.Commit=$COMMIT
+        extra_files: [LICENSE, THIRD_PARTY_NOTICES.md]
+      - name: coldsnap-sglang-adapter
+        project: coldsnap
+        package: ./cmd/coldsnap-sglang-adapter
+        ldflags: -s -w -buildid= -X github.com/sparksq/coldsnap/internal/buildinfo.Version=$VERSION -X github.com/sparksq/coldsnap/internal/buildinfo.Commit=$COMMIT
+        extra_files: [LICENSE, THIRD_PARTY_NOTICES.md]
+      - name: coldsnap-criu-rpc
+        project: coldsnap-criu-rpc
+        package: .
+        ldflags: -s -w -buildid=
+        extra_files: [LICENSE, THIRD_PARTY_NOTICES.md]

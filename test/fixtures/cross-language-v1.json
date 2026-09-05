@@ -1,0 +1,160 @@
+{
+  "format": 1,
+  "kind": "coldsnap-cross-language-contract-fixtures",
+  "canonical_json": [
+    {
+      "name": "nested-unicode",
+      "value": {
+        "z": "雪😀",
+        "a": [3, 1.25, -0.0, true, null],
+        "control": "line\nbreak"
+      },
+      "canonical": "{\"a\":[3,1.25,-0.0,true,null],\"control\":\"line\\nbreak\",\"z\":\"\\u96ea\\ud83d\\ude00\"}",
+      "sha256": "beb03953b8f8c274fc50c0d37a60635fd5d75d7126318c460f59fbeaec895273"
+    },
+    {
+      "name": "numeric-boundaries",
+      "value": {
+        "fixed": 0.0001,
+        "scientific": 1e+16,
+        "large_integer": 9007199254740993
+      },
+      "canonical": "{\"fixed\":0.0001,\"large_integer\":9007199254740993,\"scientific\":1e+16}",
+      "sha256": "de1045d0016304d0e1d8e250c9aac4d03b3d0fa5a933698302a0f23c33a96488"
+    },
+    {
+      "name": "escaped-keys",
+      "value": {
+        "Ω": "quote\"slash\\tab\t",
+        "ascii": "</script>&"
+      },
+      "canonical": "{\"ascii\":\"</script>&\",\"\\u03a9\":\"quote\\\"slash\\\\tab\\t\"}",
+      "sha256": "dd7dcaed98efbceda27fedaf39be24b61ae221660ec996f0899b24241313f7ce"
+    }
+  ],
+  "memory_layouts": [
+    {
+      "name": "discardable-kv-cache",
+      "arguments": {
+        "provider": "vllm-cumem-v2",
+        "provider_abi": 2,
+        "region": "kv_cache",
+        "device": "cuda:0",
+        "base_address": 17592186044416,
+        "logical_bytes": 268435456,
+        "allocation_granularity": 2097152,
+        "mapping_granularity": 65536,
+        "layout_kind": "per-layer",
+        "groups": ["decode", "prefill"],
+        "extent_count": 32,
+        "transport_registration_mode": "detached-during-release",
+        "extension": {
+          "contract_revision": 1,
+          "external_region_provider": false,
+          "page_table": "cuda-virtual-memory"
+        }
+      },
+      "fields": {
+        "format": 1,
+        "provider": "vllm-cumem-v2",
+        "provider_abi": 2,
+        "region": {
+          "name": "kv_cache",
+          "policy": "discard",
+          "stable_address": true
+        },
+        "device": "cuda:0",
+        "base_address": 17592186044416,
+        "logical_bytes": 268435456,
+        "allocation_granularity": 2097152,
+        "mapping_granularity": 65536,
+        "layout_kind": "per-layer",
+        "groups": ["decode", "prefill"],
+        "extent_count": 32,
+        "transport_registration_mode": "detached-during-release",
+        "extension": {
+          "contract_revision": 1,
+          "external_region_provider": false,
+          "page_table": "cuda-virtual-memory"
+        }
+      },
+      "extension_json": "{\"contract_revision\":1,\"external_region_provider\":false,\"page_table\":\"cuda-virtual-memory\"}",
+      "layout_digest": "sha256:e0392012f35751da4f8fefdc6a1736c2c7ed30c52a3da2a002f3c1bbb59918e3"
+    }
+  ],
+  "manifests": [
+    {
+      "name": "semantic-weight-artifact",
+      "value": {
+        "format": 1,
+        "kind": "coldsnap-pytorch-semantic-weights",
+        "identity": {
+          "engine": "sglang",
+          "model": "fixture/model",
+          "revision": "0123456789abcdef"
+        },
+        "identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "blob": "weights.blob",
+        "blob_bytes": 12288,
+        "blob_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "storages": [
+          {
+            "offset": 0,
+            "nbytes": 8192,
+            "crc32": "1234abcd",
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "refs": [
+              {
+                "name": "parameter:model.embed.weight",
+                "dtype": "torch.float16",
+                "shape": [64, 64],
+                "stride": [64, 1],
+                "storage_offset_bytes": 0,
+                "nbytes": 8192
+              }
+            ]
+          },
+          {
+            "offset": 8192,
+            "nbytes": 4096,
+            "crc32": "89abcdef",
+            "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "refs": [
+              {
+                "name": "buffer:model.scale",
+                "dtype": "torch.float32",
+                "shape": [1024],
+                "stride": [1],
+                "storage_offset_bytes": 0,
+                "nbytes": 4096
+              }
+            ]
+          }
+        ]
+      },
+      "canonical": "{\"blob\":\"weights.blob\",\"blob_bytes\":12288,\"blob_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"format\":1,\"identity\":{\"engine\":\"sglang\",\"model\":\"fixture/model\",\"revision\":\"0123456789abcdef\"},\"identity_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"kind\":\"coldsnap-pytorch-semantic-weights\",\"storages\":[{\"crc32\":\"1234abcd\",\"nbytes\":8192,\"offset\":0,\"refs\":[{\"dtype\":\"torch.float16\",\"name\":\"parameter:model.embed.weight\",\"nbytes\":8192,\"shape\":[64,64],\"storage_offset_bytes\":0,\"stride\":[64,1]}],\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},{\"crc32\":\"89abcdef\",\"nbytes\":4096,\"offset\":8192,\"refs\":[{\"dtype\":\"torch.float32\",\"name\":\"buffer:model.scale\",\"nbytes\":4096,\"shape\":[1024],\"storage_offset_bytes\":0,\"stride\":[1]}],\"sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}",
+      "sha256": "dc8a5b7e8adca965a8f840ce3c72ea3eec1371dca964deeeb1b1bdf5353320f8"
+    }
+  ],
+  "coordinator_frames": [
+    {
+      "name": "append-request",
+      "request": {
+        "operation": 6,
+        "timeout_ms": 2500,
+        "token_utf8": "test-test-test-test",
+        "key_utf8": "scope-1/nccl/events",
+        "value_utf8": "{\"rank\":1}"
+      },
+      "hex": "43534b5601060000000009c400000013000000130000000a00000030746573742d746573742d746573742d7465737473636f70652d312f6e63636c2f6576656e74737b2272616e6b223a317d"
+    },
+    {
+      "name": "success-response",
+      "response": {
+        "status": 0,
+        "value_utf8": "ready"
+      },
+      "hex": "43534b5601000000000000057265616479"
+    }
+  ]
+}

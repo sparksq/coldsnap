@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+.git
+.gitignore
+.agents
+.codex
+.github
+.idea
+.ruff_cache
+.pytest_cache
+.slop
+.venv
+bin
+build
+dist
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+docs
+scripts/*
+!scripts/nccl-nvcc-reproducible.sh
+!scripts/nccl-target-observe.py
+tools
+deploy/registry/.env
+deploy/registry/secrets
+benchmarks/*
+test

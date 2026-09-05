@@ -1,0 +1,113 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+ARG NCCL_BUILD_IMAGE
+
+FROM ${NCCL_BUILD_IMAGE} AS provider_payload_build
+ARG NCCL_BUILD_IMAGE
+ARG NCCL_LIBRARY_RELEASE
+ARG NCCL_VERSION_CODE
+
+RUN case "${NCCL_BUILD_IMAGE}" in *@sha256:*) ;; *) echo "NCCL_BUILD_IMAGE must be digest-pinned" >&2; exit 2 ;; esac \
+    && image_digest="${NCCL_BUILD_IMAGE##*@sha256:}" \
+    && test "${#image_digest}" -eq 64 \
+    && case "${image_digest}" in *[!0-9a-f]*) echo "NCCL_BUILD_IMAGE digest is invalid" >&2; exit 2 ;; esac \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        patch \
+        pkg-config \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=nccl_source . /opt/nccl
+COPY --from=nccl_release . /tmp/coldsnap-nccl-release
+COPY --chmod=0755 scripts/nccl-nvcc-reproducible.sh \
+    /usr/local/bin/coldsnap-nccl-nvcc
+
+ARG NCCL_BUILD_JOBS=2
+ARG NCCL_NVCC_GENCODE
+ARG NCCL_REPRODUCIBLE_NVCC=0
+ARG NCCL_STRIP_OUTPUTS=0
+RUN test -n "${NCCL_LIBRARY_RELEASE}" \
+    && test -n "${NCCL_VERSION_CODE}" \
+    && test -n "${NCCL_NVCC_GENCODE}" \
+    && rm -rf /opt/nccl/.git \
+    && while IFS= read -r patch_name; do \
+         test -n "${patch_name}" || continue; \
+         case "${patch_name}" in */*|.*) echo "invalid patch series entry: ${patch_name}" >&2; exit 2 ;; esac; \
+         patch --fuzz=0 -d /opt/nccl -p1 -i "/tmp/coldsnap-nccl-release/patches/${patch_name}"; \
+       done < /tmp/coldsnap-nccl-release/patches/series \
+    && case "${NCCL_REPRODUCIBLE_NVCC}" in \
+         0) make -C /opt/nccl -j"${NCCL_BUILD_JOBS}" src.build \
+              NVCC_GENCODE="${NCCL_NVCC_GENCODE}" ;; \
+         1) make -C /opt/nccl -j"${NCCL_BUILD_JOBS}" src.build \
+              NVCC=/usr/local/bin/coldsnap-nccl-nvcc \
+              NVCC_GENCODE="${NCCL_NVCC_GENCODE}" ;; \
+         *) echo "NCCL_REPRODUCIBLE_NVCC must be 0 or 1" >&2; exit 2 ;; \
+       esac
+
+COPY native/nccl_checkpoint_coord/kv_store_client.cc \
+    native/nccl_checkpoint_coord/kv_store_client.h \
+    /opt/nccl/contrib/nccl_checkpoint/
+COPY native/nccl/abi/coldsnap_nccl_provider.h \
+    /opt/nccl/contrib/nccl_checkpoint/
+
+RUN cp /tmp/coldsnap-nccl-release/*.cc /opt/nccl/contrib/nccl_checkpoint/ \
+    && case "${NCCL_REPRODUCIBLE_NVCC}" in \
+         0) make -C /opt/nccl/contrib/nccl_checkpoint -j"${NCCL_BUILD_JOBS}" ;; \
+         1) make -C /opt/nccl/contrib/nccl_checkpoint -j"${NCCL_BUILD_JOBS}" \
+              NVCC=/usr/local/bin/coldsnap-nccl-nvcc ;; \
+         *) echo "NCCL_REPRODUCIBLE_NVCC must be 0 or 1" >&2; exit 2 ;; \
+       esac \
+    && mkdir -p /opt/nccl-checkpoint/lib \
+    && test "$(grep -E '^#define NCCL_VERSION_CODE ' /opt/nccl/build/include/nccl.h | awk '{print $3}')" = "${NCCL_VERSION_CODE}" \
+    && cp "/opt/nccl/build/lib/libnccl.so.${NCCL_LIBRARY_RELEASE}" \
+        "/opt/nccl-checkpoint/lib/libnccl.so.${NCCL_LIBRARY_RELEASE}" \
+    && ln -s "libnccl.so.${NCCL_LIBRARY_RELEASE}" /opt/nccl-checkpoint/lib/libnccl.so.2 \
+    && ln -s libnccl.so.2 /opt/nccl-checkpoint/lib/libnccl.so \
+    && cp /opt/nccl/contrib/nccl_checkpoint/build/lib/libnccl-checkpoint-shim.so \
+        /opt/nccl-checkpoint/lib/ \
+    && case "${NCCL_STRIP_OUTPUTS}" in \
+         0) ;; \
+         1) strip --strip-unneeded \
+              "/opt/nccl-checkpoint/lib/libnccl.so.${NCCL_LIBRARY_RELEASE}" \
+              /opt/nccl-checkpoint/lib/libnccl-checkpoint-shim.so ;; \
+         *) echo "NCCL_STRIP_OUTPUTS must be 0 or 1" >&2; exit 2 ;; \
+       esac \
+    && test "$(readelf -d "/opt/nccl-checkpoint/lib/libnccl.so.${NCCL_LIBRARY_RELEASE}" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')" = "libnccl.so.2" \
+    && test "$(readelf -d /opt/nccl-checkpoint/lib/libnccl-checkpoint-shim.so | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')" = "libnccl-checkpoint-shim.so" \
+    && machine="$(readelf -h "/opt/nccl-checkpoint/lib/libnccl.so.${NCCL_LIBRARY_RELEASE}" | sed -n 's/^ *Machine: *//p')" \
+    && case "$(uname -m):${machine}" in \
+         aarch64:AArch64|x86_64:Advanced\ Micro\ Devices\ X86-64) ;; \
+         *) echo "NCCL payload architecture mismatch: $(uname -m), ${machine}" >&2; exit 2 ;; \
+       esac
+
+FROM scratch AS provider_payload_oci
+ARG COLDSNAP_NCCL_PROVIDER_ID
+ARG COLDSNAP_SOURCE_REVISION
+ARG NCCL_LIBRARY_RELEASE
+ARG NCCL_NVCC_GENCODE
+ARG TARGETOS
+ARG TARGETARCH
+LABEL org.opencontainers.image.title="ColdSnap NCCL provider payload" \
+      org.opencontainers.image.description="Patched NCCL runtime and ColdSnap checkpoint provider" \
+      org.opencontainers.image.source="https://github.com/sparksq/coldsnap" \
+      org.opencontainers.image.revision="${COLDSNAP_SOURCE_REVISION}" \
+      org.opencontainers.image.version="${COLDSNAP_NCCL_PROVIDER_ID}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only AND BSD-3-Clause" \
+      io.sparksq.coldsnap.nccl.release="${NCCL_LIBRARY_RELEASE}" \
+      io.sparksq.coldsnap.cuda.gencode="${NCCL_NVCC_GENCODE}" \
+      io.sparksq.coldsnap.platform="${TARGETOS}/${TARGETARCH}"
+COPY --from=provider_payload_build /opt/nccl-checkpoint /
+COPY LICENSE /licenses/coldsnap/LICENSE
+COPY THIRD_PARTY_NOTICES.md /licenses/coldsnap/THIRD_PARTY_NOTICES.md
+COPY third_party/licenses/nccl/LICENSE.txt /licenses/nccl/LICENSE.txt
+COPY deploy/nccl/README.md /README.md
+COPY LICENSE THIRD_PARTY_NOTICES.md /source/coldsnap/
+COPY deploy/nccl/Dockerfile.payload /source/coldsnap/deploy/nccl/Dockerfile.payload
+COPY scripts/nccl-nvcc-reproducible.sh /source/coldsnap/scripts/nccl-nvcc-reproducible.sh
+COPY native/nccl /source/coldsnap/native/nccl
+COPY native/nccl_checkpoint_coord /source/coldsnap/native/nccl_checkpoint_coord

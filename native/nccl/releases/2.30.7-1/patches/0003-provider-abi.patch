@@ -1,0 +1,34 @@
+diff --git a/contrib/nccl_checkpoint/Makefile b/contrib/nccl_checkpoint/Makefile
+index fdeedbbb63291b6293e7c13525f925304a98545c..077047f9d45fafbb9a4eb1d6c9af369fc70e996e 100644
+--- a/contrib/nccl_checkpoint/Makefile
++++ b/contrib/nccl_checkpoint/Makefile
+@@ -67,7 +67,7 @@ $(SHIM_EXPORTS): $(SHIM_HEADERS) gen_shim.py
+ 	python3 gen_shim.py $(SHIM_HEADERS) --exports >$@
+ $(OBJDIR)/shim.o: shim.cc $(SHIM_AUTO)
+ 
+-HOST_SRC := shim_core.cc shim.cc shim_checkpoint.cc kv_store_client.cc
++HOST_SRC := shim_core.cc shim.cc shim_checkpoint.cc kv_store_client.cc coldsnap_provider.cc
+ HOST_OBJ := $(HOST_SRC:%.cc=$(OBJDIR)/%.o)
+ $(HOST_OBJ): $(NCCL_HEADER)
+ 
+@@ -80,7 +80,7 @@ $(OBJDIR)/%.o: %.cc
+ $(SHIM_SO): $(HOST_OBJ) $(SHIM_EXPORTS)
+ 	@echo "Linking $@"
+ 	@mkdir -p $(dir $@)
+-	$(CXX) -shared -fPIC $(CXXFLAGS) $(LFLAGS) $(HOST_OBJ) -o $@ -Wl,--version-script=$(SHIM_EXPORTS) -ldl $(CUDALIBS) $(HIREDIS_LIBS)
++	$(CXX) -shared -fPIC $(CXXFLAGS) $(LFLAGS) $(HOST_OBJ) -o $@ -Wl,--version-script=$(SHIM_EXPORTS) -Wl,-soname,libnccl-checkpoint-shim.so -ldl $(CUDALIBS) $(HIREDIS_LIBS)
+ $(KV_TEST): kv_sanity_test.cc kv_store_client.cc
+ 	@mkdir -p $(dir $@)
+ 	$(CXX) $(CXXSTD) $(INCFLAGS) $^ -o $@ $(HIREDIS_LIBS)
+diff --git a/contrib/nccl_checkpoint/gen_shim.py b/contrib/nccl_checkpoint/gen_shim.py
+index de0bc9ff654b4882b0296dd8fab9fa77c92c74d1..974b97fe420c7c0a9035d7c909c2a2bff8b81f74 100644
+--- a/contrib/nccl_checkpoint/gen_shim.py
++++ b/contrib/nccl_checkpoint/gen_shim.py
+@@ -56,6 +56,7 @@ MANUALLY_SHIMMED_FUNCS: Set[str] = {
+ }
+ 
+ EXTRA_EXPORTED_FUNCS: Set[str] = {
++    "coldsnapNcclProviderQuery",
+     "ncclCheckpointCommGetReal",
+     "ncclCheckpointGetVersion",
+     "ncclCheckpointPrepare",

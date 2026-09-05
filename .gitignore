@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+__pycache__/
+*.py[cod]
+*.snapshot
+.ruff_cache/
+.pytest_cache/
+.idea/
+*.swp
+.coverage
+*.egg-info/
+/dist/
+/bin/
+/build/
+# Benchmark outputs and private development history never enter the public tree.
+/benchmarks/*
+!/benchmarks/README.md
+!/benchmarks/harnesses/
+/docs/archive/
+/native/nccl/experiments/
+/.venv/
+/.agents/
+/.codex/
+deploy/registry/.env
+deploy/registry/secrets/
+.slop/

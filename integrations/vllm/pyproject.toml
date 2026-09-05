@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldsnap-vllm"
+version = "0.5.9"
+description = "ColdSnap checkpoint, hydration, and memory lifecycle plugin for vLLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+dependencies = ["coldsnap-core==0.3.20"]
+
+[project.entry-points."vllm.general_plugins"]
+coldsnap = "coldsnap_plugin:register"
+
+[tool.setuptools]
+py-modules = [
+  "coldsnap_cache_bootstrap",
+  "coldsnap_cuda_epoch",
+  "coldsnap_disk_backend",
+  "coldsnap_forkserver_preload",
+  "coldsnap_graph_memory",
+  "coldsnap_import_hook",
+  "coldsnap_layout",
+  "coldsnap_materializer",
+  "coldsnap_plugin",
+  "coldsnap_recovery_loader",
+  "coldsnap_startup_plan",
+  "coldsnap_supervisor",
+  "coldsnap_synthetic_loader",
+  "coldsnap_torch_memory_saver",
+  "coldsnap_vllm",
+  "coldsnap_vllm_async_graphs",
+  "coldsnap_vllm_checkpoint",
+  "coldsnap_vllm_cuda_runtime",
+  "coldsnap_vllm_deferred_api_warmup",
+  "coldsnap_vllm_deferred_warmup",
+  "coldsnap_vllm_graphs",
+  "coldsnap_vllm_kv_capacity",
+  "coldsnap_vllm_kv_payload",
+  "coldsnap_vllm_memory",
+  "coldsnap_vllm_nccl_checkpoint",
+  "coldsnap_vllm_process_template",
+  "coldsnap_vllm_shape_calibration",
+  "coldsnap_vllm_worker_reexec",
+  "sitecustomize",
+]

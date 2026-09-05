@@ -1,0 +1,25 @@
+diff --git a/contrib/nccl_checkpoint/Makefile b/contrib/nccl_checkpoint/Makefile
+index 070c427..27ec25f 100644
+--- a/contrib/nccl_checkpoint/Makefile
++++ b/contrib/nccl_checkpoint/Makefile
+@@ -64,7 +64,7 @@ $(SHIM_EXPORTS): $(SHIM_HEADERS) gen_shim.py
+ 	python3 gen_shim.py $(SHIM_HEADERS) --exports >$@
+ $(OBJDIR)/shim.o: shim.cc $(SHIM_AUTO)
+ 
+-HOST_SRC := shim_core.cc shim.cc shim_checkpoint.cc kv_store_client.cc coldsnap_provider.cc
++HOST_SRC := shim_core.cc shim.cc shim_checkpoint.cc kv_store_client.cc coldsnap_provider.cc coldsnap_in_place_provider.cc
+ HOST_OBJ := $(HOST_SRC:%.cc=$(OBJDIR)/%.o)
+ $(HOST_OBJ): $(NCCL_HEADER)
+ 
+diff --git a/contrib/nccl_checkpoint/gen_shim.py b/contrib/nccl_checkpoint/gen_shim.py
+index 7ad0a21..7be588b 100644
+--- a/contrib/nccl_checkpoint/gen_shim.py
++++ b/contrib/nccl_checkpoint/gen_shim.py
+@@ -57,6 +57,7 @@ MANUALLY_SHIMMED_FUNCS: Set[str] = {
+ 
+ EXTRA_EXPORTED_FUNCS: Set[str] = {
+     "coldsnapNcclProviderQuery",
++    "coldsnapNcclInPlaceQuery",
+     "ncclCheckpointCommGetReal",
+     "ncclCheckpointGetVersion",
+     "ncclCheckpointPrepare",

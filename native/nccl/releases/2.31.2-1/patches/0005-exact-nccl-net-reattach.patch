@@ -1,0 +1,430 @@
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index b3b3540..3494e50 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -18,6 +18,12 @@
+ #include "shm.h"
+ #include "compiler.h"
+ #include "register_inline.h"
++#include "bootstrap.h"
++
++#include <chrono>
++#include <thread>
++#include <unordered_set>
++#include <vector>
+ 
+ static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
+ 
+@@ -113,6 +119,7 @@ struct sendNetResources {
+   ncclNetDeviceType netDeviceType;
+   ncclNetDeviceHandle_t* netDeviceHandle;
+   size_t maxP2pBytes;
++  int checkpointDetached;
+ };
+ 
+ struct recvNetResources {
+@@ -147,8 +154,24 @@ struct recvNetResources {
+   ncclNetDeviceType netDeviceType;
+   ncclNetDeviceHandle_t* netDeviceHandle;
+   size_t maxP2pBytes;
++  int checkpointDetached;
++};
++
++// Exact-version experimental ABI used by ColdSnap's in-place NCCL provider.
++// The endpoint is deliberately transport-opaque: the provider coordinates the
++// bytes, while this matching NCCL build owns their interpretation.
++struct coldsnapNcclNetEndpoint {
++  uint32_t structSize;
++  uint32_t version;
++  int32_t senderRank;
++  int32_t receiverRank;
++  int32_t channelId;
++  int32_t connIndex;
++  ncclNetHandle_t handle;
+ };
+ 
++#define COLDSNAP_NCCL_NET_ENDPOINT_VERSION 1
++
+ struct netRegInfo {
+   uintptr_t buffer;
+   size_t size;
+@@ -2123,6 +2146,379 @@ static ncclResult_t recvProxyDeregBuffer(struct ncclProxyConnection* connection,
+   return ncclSuccess;
+ }
+ 
++namespace {
++
++static bool coldsnapUsedIb = false;
++
++template <typename Function>
++static ncclResult_t coldsnapForEachNetConnection(struct ncclComm* comm, int send, Function function) {
++  std::unordered_set<struct ncclProxyConnection*> visited;
++  for (int channelId = 0; channelId < MAXCHANNELS; channelId++) {
++    struct ncclChannel* channel = comm->channels + channelId;
++    if (channel->peers == NULL) continue;
++    for (int peerRank = 0; peerRank < comm->nRanks; peerRank++) {
++      struct ncclChannelPeer* peer = channel->peers[peerRank];
++      if (peer == NULL) continue;
++      for (int connIndex = 0; connIndex < NCCL_MAX_CONNS; connIndex++) {
++        struct ncclConnector* connector = send ? peer->send + connIndex : peer->recv + connIndex;
++        if (!connector->connected || !connector->proxyConn.initialized || connector->proxyConn.connection == NULL) {
++          continue;
++        }
++        if (!connector->proxyConn.sameProcess) {
++          WARN("ColdSnap in-place NET requires a process-local proxy connection");
++          return ncclInvalidUsage;
++        }
++        struct ncclProxyConnection* connection = connector->proxyConn.connection;
++        if (connection->transport != TRANSPORT_NET || connection->send != send) continue;
++        if (!visited.insert(connection).second) continue;
++        NCCLCHECK(function(connection));
++      }
++    }
++  }
++  return ncclSuccess;
++}
++
++static ncclResult_t coldsnapCheckNetBoundary(struct ncclComm* comm) {
++  if (comm == NULL || comm->endMagic != NCCL_MAGIC || comm->proxyState == NULL) return ncclInvalidArgument;
++  const auto idleDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++  while (COMPILER_ATOMIC_LOAD(&comm->proxyState->progressState.active, std::memory_order_acquire) != NULL &&
++         std::chrono::steady_clock::now() < idleDeadline) {
++    std::this_thread::yield();
++  }
++  if (COMPILER_ATOMIC_LOAD(&comm->proxyState->progressState.active, std::memory_order_acquire) != NULL) {
++    WARN("ColdSnap in-place NET detach requires an idle proxy progress queue");
++    return ncclInvalidUsage;
++  }
++  const char* name = comm->proxyState->ncclNet == NULL ? NULL : comm->proxyState->ncclNet->name;
++  if (name == NULL || (strcmp(name, "Socket") != 0 && strcmp(name, "IB") != 0)) {
++    WARN("ColdSnap in-place NET experiment requires NCCL's built-in Socket or IB backend (got %s)",
++         name == NULL ? "none" : name);
++    return ncclInvalidUsage;
++  }
++  if (strcmp(name, "IB") == 0) {
++    const char* release = getenv("NCCL_IB_RELEASE_ON_FINALIZE");
++    if (release == NULL || strcmp(release, "1") != 0) {
++      WARN("ColdSnap in-place NET requires NCCL_IB_RELEASE_ON_FINALIZE=1 for the IB backend");
++      return ncclInvalidUsage;
++    }
++    coldsnapUsedIb = true;
++  }
++  if (comm->proxyState->netContext == NULL && comm->netContext != NULL) {
++    WARN("ColdSnap in-place NET found inconsistent communicator/proxy NET contexts");
++    return ncclInvalidUsage;
++  }
++  return ncclSuccess;
++}
++
++static ncclResult_t coldsnapDetachSend(struct ncclProxyConnection* connection,
++                                       struct ncclProxyState* proxyState) {
++  if (connection->state != connConnected) return ncclInvalidUsage;
++  struct sendNetResources* resources = (struct sendNetResources*)connection->transportResources;
++  if (resources == NULL || resources->shared || resources->netDeviceHandle != NULL ||
++      !ncclIntruQueueEmpty(&connection->proxyMemHandleQueue)) {
++    WARN("ColdSnap in-place NET send connection is outside the exact transport qualification envelope");
++    return ncclInvalidUsage;
++  }
++  if (resources->checkpointDetached) return ncclSuccess;
++  for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
++    if (resources->buffers[p]) {
++      NCCLCHECK(proxyState->ncclNet->deregMr(resources->netSendComm, resources->mhandles[p]));
++      resources->mhandles[p] = NULL;
++      connection->mhandles[p] = NULL;
++    }
++  }
++  NCCLCHECK(proxyState->ncclNet->closeSend(resources->netSendComm));
++  resources->netSendComm = NULL;
++  resources->checkpointDetached = 1;
++  return ncclSuccess;
++}
++
++static ncclResult_t coldsnapDetachRecv(struct ncclProxyConnection* connection,
++                                       struct ncclProxyState* proxyState) {
++  if (connection->state != connConnected) return ncclInvalidUsage;
++  struct recvNetResources* resources = (struct recvNetResources*)connection->transportResources;
++  if (resources == NULL || resources->shared || resources->netDeviceHandle != NULL ||
++      !ncclIntruQueueEmpty(&connection->proxyMemHandleQueue)) {
++    WARN("ColdSnap in-place NET receive connection is outside the exact transport qualification envelope");
++    return ncclInvalidUsage;
++  }
++  if (resources->checkpointDetached) return ncclSuccess;
++  for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
++    if (resources->buffers[p]) {
++      NCCLCHECK(proxyState->ncclNet->deregMr(resources->netRecvComm, resources->mhandles[p]));
++      resources->mhandles[p] = NULL;
++      connection->mhandles[p] = NULL;
++    }
++  }
++  NCCLCHECK(proxyState->ncclNet->closeRecv(resources->netRecvComm));
++  resources->netRecvComm = NULL;
++  resources->checkpointDetached = 1;
++  return ncclSuccess;
++}
++
++static void coldsnapEndpointIdentity(struct coldsnapNcclNetEndpoint* endpoint, int senderRank, int receiverRank,
++                                     int channelId, int connIndex) {
++  memset(endpoint, 0, sizeof(*endpoint));
++  endpoint->structSize = sizeof(*endpoint);
++  endpoint->version = COLDSNAP_NCCL_NET_ENDPOINT_VERSION;
++  endpoint->senderRank = senderRank;
++  endpoint->receiverRank = receiverRank;
++  endpoint->channelId = channelId;
++  endpoint->connIndex = connIndex;
++}
++
++static bool coldsnapEndpointMatches(const struct coldsnapNcclNetEndpoint* endpoint, int senderRank, int receiverRank,
++                                    int channelId, int connIndex) {
++  return endpoint->structSize == sizeof(*endpoint) && endpoint->version == COLDSNAP_NCCL_NET_ENDPOINT_VERSION &&
++         endpoint->senderRank == senderRank && endpoint->receiverRank == receiverRank &&
++         endpoint->channelId == channelId && endpoint->connIndex == connIndex;
++}
++
++static ncclResult_t coldsnapRegisterSend(struct ncclProxyConnection* connection,
++                                         struct ncclProxyState* proxyState) {
++  struct sendNetResources* resources = (struct sendNetResources*)connection->transportResources;
++  for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
++    if (resources->buffers[p]) {
++#if CUDA_VERSION >= 11070
++      int type = NCCL_NET_MAP_DEV_MEM(&resources->map, buffs[p]) ? NCCL_PTR_CUDA : NCCL_PTR_HOST;
++      if (type == NCCL_PTR_CUDA && resources->useDmaBuf) {
++        int dmabufFd;
++        size_t dmaBufSize = resources->buffSizes[p];
++        ALIGN_SIZE(dmaBufSize, ncclOsGetPageSize());
++        CUCHECK(cuMemGetHandleForAddressRange((void*)&dmabufFd, (CUdeviceptr)resources->buffers[p], dmaBufSize,
++                                              CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
++                                              getHandleForAddressRangeFlags(resources->useGdr)));
++        NCCLCHECK(proxyState->ncclNet->regMrDmaBuf(resources->netSendComm, resources->buffers[p],
++                                                   resources->buffSizes[p], type, 0ULL, dmabufFd,
++                                                   &resources->mhandles[p]));
++        (void)close(dmabufFd);
++      } else
++#endif
++      {
++      NCCLCHECK(proxyState->ncclNet->regMr(resources->netSendComm, resources->buffers[p], resources->buffSizes[p],
++                                           NCCL_NET_MAP_DEV_MEM(&resources->map, buffs[p]) ? NCCL_PTR_CUDA :
++                                                                                           NCCL_PTR_HOST,
++                                           &resources->mhandles[p]));
++      }
++    }
++  }
++  resources->checkpointDetached = 0;
++  return ncclSuccess;
++}
++
++static ncclResult_t coldsnapRegisterRecv(struct ncclProxyConnection* connection,
++                                         struct ncclProxyState* proxyState) {
++  struct recvNetResources* resources = (struct recvNetResources*)connection->transportResources;
++  for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
++    if (resources->buffers[p]) {
++#if CUDA_VERSION >= 11070
++      int type = NCCL_NET_MAP_DEV_MEM(&resources->map, buffs[p]) ? NCCL_PTR_CUDA : NCCL_PTR_HOST;
++      if (type == NCCL_PTR_CUDA && resources->useDmaBuf) {
++        int dmabufFd;
++        size_t dmaBufSize = resources->buffSizes[p];
++        ALIGN_SIZE(dmaBufSize, ncclOsGetPageSize());
++        CUCHECK(cuMemGetHandleForAddressRange((void*)&dmabufFd, (CUdeviceptr)resources->buffers[p], dmaBufSize,
++                                              CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
++                                              getHandleForAddressRangeFlags(resources->useGdr)));
++        NCCLCHECK(proxyState->ncclNet->regMrDmaBuf(resources->netRecvComm, resources->buffers[p],
++                                                   resources->buffSizes[p], type, 0ULL, dmabufFd,
++                                                   &resources->mhandles[p]));
++        (void)close(dmabufFd);
++      } else
++#endif
++      {
++      NCCLCHECK(proxyState->ncclNet->regMr(resources->netRecvComm, resources->buffers[p], resources->buffSizes[p],
++                                           NCCL_NET_MAP_DEV_MEM(&resources->map, buffs[p]) ? NCCL_PTR_CUDA :
++                                                                                           NCCL_PTR_HOST,
++                                           &resources->mhandles[p]));
++      }
++    }
++  }
++  resources->checkpointDetached = 0;
++  return ncclSuccess;
++}
++
++} // namespace
++
++NCCL_API(ncclResult_t, ncclCheckpointNetDetach, ncclComm_t comm);
++ncclResult_t ncclCheckpointNetDetach(ncclComm_t comm) {
++  NCCLCHECK(coldsnapCheckNetBoundary(comm));
++  struct ncclProxyState* proxyState = comm->proxyState;
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 1, [&](struct ncclProxyConnection* connection) {
++    return coldsnapDetachSend(connection, proxyState);
++  }));
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 0, [&](struct ncclProxyConnection* connection) {
++    return coldsnapDetachRecv(connection, proxyState);
++  }));
++  NCCLCHECK(comm->ncclNet->finalize(comm->netContext));
++  comm->netContext = NULL;
++  proxyState->netContext = NULL;
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointNetResetGlobals);
++ncclResult_t ncclCheckpointNetResetGlobals() {
++  NCCLCHECK(bootstrapNetCheckpointReset());
++  NCCLCHECK(ncclNetSocketCheckpointReset());
++  if (coldsnapUsedIb) NCCLCHECK(ncclCheckpointIbReset());
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointNetReinitialize, ncclComm_t comm);
++ncclResult_t ncclCheckpointNetReinitialize(ncclComm_t comm) {
++  NCCLCHECK(coldsnapCheckNetBoundary(comm));
++  if (comm->netContext != NULL || comm->proxyState->netContext != NULL) return ncclInvalidUsage;
++  ncclNetCommConfig_t commConfig = {};
++  commConfig.trafficClass = comm->config.trafficClass == NCCL_CONFIG_UNDEF_INT ?
++                              NCCL_NET_TRAFFIC_CLASS_UNDEF : comm->config.trafficClass;
++  NCCLCHECK(comm->ncclNet->init(&comm->netContext, comm->commHash, &commConfig, ncclDebugLog,
++                                ncclProfilerCallback));
++  comm->proxyState->netContext = comm->netContext;
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointNetRecvEndpoints, ncclComm_t comm,
++         struct coldsnapNcclNetEndpoint* endpoints, int capacity, int* count);
++ncclResult_t ncclCheckpointNetRecvEndpoints(ncclComm_t comm, struct coldsnapNcclNetEndpoint* endpoints, int capacity,
++                                             int* count) {
++  if (count == NULL || capacity < 0 || (capacity != 0 && endpoints == NULL)) return ncclInvalidArgument;
++  NCCLCHECK(coldsnapCheckNetBoundary(comm));
++  int required = 0;
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 0, [&](struct ncclProxyConnection*) {
++    required++;
++    return ncclSuccess;
++  }));
++  *count = required;
++  if (capacity < required) return endpoints == NULL ? ncclSuccess : ncclInvalidArgument;
++  if (endpoints == NULL) return ncclSuccess;
++
++  int index = 0;
++  struct ncclProxyState* proxyState = comm->proxyState;
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 0, [&](struct ncclProxyConnection* connection) {
++    struct recvNetResources* resources = (struct recvNetResources*)connection->transportResources;
++    if (resources == NULL || !resources->checkpointDetached || resources->netRecvComm != NULL) {
++      return ncclInvalidUsage;
++    }
++    // NCCL closes the initial setup listener after accept but intentionally
++    // leaves the opaque pointer value in netListenComm.  Once the receive
++    // transport is checkpoint-detached that value is stale, not a live
++    // listener, and must be replaced by the new activation epoch.
++    resources->netListenComm = NULL;
++    coldsnapEndpointIdentity(endpoints + index, resources->tpRemoteRank, resources->tpRank, resources->channelId,
++                             resources->connIndex);
++    NCCLCHECK(proxyState->ncclNet->listen(proxyState->netContext, resources->netDev, endpoints[index].handle,
++                                          &resources->netListenComm));
++    index++;
++    return ncclSuccess;
++  }));
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointNetSendEndpoints, ncclComm_t comm,
++         struct coldsnapNcclNetEndpoint* endpoints, int capacity, int* count);
++ncclResult_t ncclCheckpointNetSendEndpoints(ncclComm_t comm, struct coldsnapNcclNetEndpoint* endpoints, int capacity,
++                                             int* count) {
++  if (count == NULL || capacity < 0 || (capacity != 0 && endpoints == NULL)) return ncclInvalidArgument;
++  NCCLCHECK(coldsnapCheckNetBoundary(comm));
++  int required = 0;
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 1, [&](struct ncclProxyConnection*) {
++    required++;
++    return ncclSuccess;
++  }));
++  *count = required;
++  if (capacity < required) return endpoints == NULL ? ncclSuccess : ncclInvalidArgument;
++  if (endpoints == NULL) return ncclSuccess;
++
++  int index = 0;
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 1, [&](struct ncclProxyConnection* connection) {
++    struct sendNetResources* resources = (struct sendNetResources*)connection->transportResources;
++    if (resources == NULL || !resources->checkpointDetached || resources->netSendComm != NULL) {
++      return ncclInvalidUsage;
++    }
++    coldsnapEndpointIdentity(endpoints + index, resources->tpRank, resources->tpRemoteRank, resources->channelId,
++                             resources->connIndex);
++    index++;
++    return ncclSuccess;
++  }));
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointNetReattach, ncclComm_t comm,
++         struct coldsnapNcclNetEndpoint* sendEndpoints, int sendEndpointCount);
++ncclResult_t ncclCheckpointNetReattach(ncclComm_t comm, struct coldsnapNcclNetEndpoint* sendEndpoints,
++                                        int sendEndpointCount) {
++  if (sendEndpointCount < 0 || (sendEndpointCount != 0 && sendEndpoints == NULL)) return ncclInvalidArgument;
++  NCCLCHECK(coldsnapCheckNetBoundary(comm));
++  struct ncclProxyState* proxyState = comm->proxyState;
++  std::vector<struct ncclProxyConnection*> sends;
++  std::vector<struct ncclProxyConnection*> recvs;
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 1, [&](struct ncclProxyConnection* connection) {
++    sends.push_back(connection);
++    return ncclSuccess;
++  }));
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 0, [&](struct ncclProxyConnection* connection) {
++    recvs.push_back(connection);
++    return ncclSuccess;
++  }));
++  if ((int)sends.size() != sendEndpointCount) return ncclInvalidArgument;
++
++  std::vector<struct coldsnapNcclNetEndpoint*> matched(sends.size(), NULL);
++  for (size_t i = 0; i < sends.size(); i++) {
++    struct sendNetResources* resources = (struct sendNetResources*)sends[i]->transportResources;
++    for (int j = 0; j < sendEndpointCount; j++) {
++      if (coldsnapEndpointMatches(sendEndpoints + j, resources->tpRank, resources->tpRemoteRank,
++                                  resources->channelId, resources->connIndex)) {
++        matched[i] = sendEndpoints + j;
++        break;
++      }
++    }
++    if (matched[i] == NULL) return ncclInvalidArgument;
++  }
++
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
++  for (;;) {
++    bool complete = true;
++    for (size_t i = 0; i < sends.size(); i++) {
++      struct sendNetResources* resources = (struct sendNetResources*)sends[i]->transportResources;
++      if (!resources->checkpointDetached) continue;
++      if (resources->netSendComm == NULL) {
++        ncclNetDeviceHandle_t* deviceHandle = NULL;
++        NCCLCHECK(proxyState->ncclNet->connect(proxyState->netContext, resources->netDev, matched[i]->handle,
++                                               &resources->netSendComm, &deviceHandle));
++        if (deviceHandle != NULL) return ncclInvalidUsage;
++      }
++      if (resources->netSendComm == NULL) complete = false;
++    }
++    for (struct ncclProxyConnection* connection : recvs) {
++      struct recvNetResources* resources = (struct recvNetResources*)connection->transportResources;
++      if (!resources->checkpointDetached) continue;
++      if (resources->netRecvComm == NULL) {
++        ncclNetDeviceHandle_t* deviceHandle = NULL;
++        NCCLCHECK(proxyState->ncclNet->accept(resources->netListenComm, &resources->netRecvComm, &deviceHandle));
++        if (deviceHandle != NULL) return ncclInvalidUsage;
++      }
++      if (resources->netRecvComm == NULL) complete = false;
++    }
++    if (complete) break;
++    if (std::chrono::steady_clock::now() >= deadline) {
++      WARN("ColdSnap in-place NET reattach timed out");
++      return ncclSystemError;
++    }
++    std::this_thread::yield();
++  }
++
++  for (struct ncclProxyConnection* connection : recvs) {
++    struct recvNetResources* resources = (struct recvNetResources*)connection->transportResources;
++    NCCLCHECK(proxyState->ncclNet->closeListen(resources->netListenComm));
++    resources->netListenComm = NULL;
++    NCCLCHECK(coldsnapRegisterRecv(connection, proxyState));
++  }
++  for (struct ncclProxyConnection* connection : sends) {
++    NCCLCHECK(coldsnapRegisterSend(connection, proxyState));
++  }
++  return ncclSuccess;
++}
++
+ struct ncclTransport netTransport = {
+   "NET",
+   canConnect,

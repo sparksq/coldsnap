@@ -1,0 +1,78 @@
+{
+  "format": 2,
+  "kind": "coldsnap-nccl-provider-recipe",
+  "provider_id": "nccl-2.30.7-1+coldsnap.1",
+  "provider_revision": 1,
+  "nccl_release": "2.30.7",
+  "nccl_version_code": 23007,
+  "provider_abi": {
+    "major": 1,
+    "minor": 0
+  },
+  "checkpoint_abi": 100,
+  "dlsym_bridge_abi": 1,
+  "capabilities": [
+    "communicator-unwrap",
+    "coordinator-protocol-v1",
+    "full-network-reset",
+    "ib-roce-device-release",
+    "private-dlopen-routing",
+    "ras-reset",
+    "registration-window-replay",
+    "split-shrink-grow-replay",
+    "synchronous-termination"
+  ],
+  "limitations": [],
+  "builder": {
+    "provider_dockerfile": "deploy/nccl/Dockerfile.provider",
+    "payload_dockerfile": "deploy/nccl/Dockerfile.payload",
+    "payload_repository": "docker.io/scitrera/coldsnap-nccl",
+    "payload_build_image": "docker.io/nvidia/cuda@sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92",
+    "payload_platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "base_image_policy": "digest-pinned-multiarch-payload-and-target-images",
+    "mutable_tags_allowed": false
+  },
+  "inputs": {
+    "source_lock": "native/nccl/releases/2.30.7-1/source.lock",
+    "source_diff": "native/nccl/releases/2.30.7-1/source-diff.md",
+    "provider_header": "native/nccl/abi/coldsnap_nccl_provider.h",
+    "provider_source": "native/nccl/releases/2.30.7-1/coldsnap_provider.cc",
+    "patches": [
+      {
+        "path": "native/nccl/releases/2.30.7-1/patches/0001-checkpoint-ib-reset.patch",
+        "sha256": "be190dabe2eae4e0c87a98629df7fea273c6811ff3e5d9689dcde9da61376019"
+      },
+      {
+        "path": "native/nccl/releases/2.30.7-1/patches/0002-checkpoint-termination.patch",
+        "sha256": "ba06314fa8801916a930d6c89345a4421d7e31c7609a144f80887f2834441f84"
+      },
+      {
+        "path": "native/nccl/releases/2.30.7-1/patches/0003-provider-abi.patch",
+        "sha256": "81c253390ca8c6ddbc50cddecf3be4b99afa3d6ebf9e560e355b5a81bfd31808"
+      }
+    ]
+  },
+  "build": {
+    "nccl_build_jobs_argument": "NCCL_BUILD_JOBS",
+    "nvcc_gencode_argument": "NCCL_NVCC_GENCODE",
+    "nvcc_gencode": "-gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_110,code=sm_110 -gencode=arch=compute_120,code=sm_120 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_120,code=compute_120",
+    "use_reproducible_nvcc": true,
+    "strip_unneeded": true,
+    "verify_compiled_and_loaded_version": true
+  },
+  "outputs": [
+    {
+      "path": "lib/libnccl.so.2.30.7",
+      "role": "nccl-runtime",
+      "soname": "libnccl.so.2"
+    },
+    {
+      "path": "lib/libnccl-checkpoint-shim.so",
+      "role": "checkpoint-shim",
+      "soname": "libnccl-checkpoint-shim.so"
+    }
+  ]
+}

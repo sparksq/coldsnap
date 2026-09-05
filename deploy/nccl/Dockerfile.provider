@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+ARG TARGET_IMAGE
+ARG NCCL_PAYLOAD_IMAGE
+
+FROM golang:1.25.14@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS provider_tool_builder
+WORKDIR /src/coldsnap
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -o /out/coldsnap ./cmd/coldsnap
+
+FROM ${NCCL_PAYLOAD_IMAGE} AS provider_payload
+
+FROM ${TARGET_IMAGE} AS provider_assembly
+ARG TARGET_IMAGE
+ARG NCCL_PAYLOAD_IMAGE
+ARG NCCL_RELEASE_TAG
+ARG COLDSNAP_NCCL_POLICY=exact
+ARG COLDSNAP_ALLOW_LOCAL_NCCL_PAYLOAD=0
+
+RUN case "${TARGET_IMAGE}" in *@sha256:*) ;; *) echo "TARGET_IMAGE must be digest-pinned" >&2; exit 2 ;; esac \
+    && case "${NCCL_PAYLOAD_IMAGE}" in \
+         *@sha256:*) ;; \
+         *) test "${COLDSNAP_ALLOW_LOCAL_NCCL_PAYLOAD}" = 1 || { echo "NCCL_PAYLOAD_IMAGE must be digest-pinned" >&2; exit 2; } ;; \
+       esac \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/coldsnap
+COPY --from=provider_tool_builder /out/coldsnap /usr/local/bin/coldsnap
+COPY --from=provider_payload / /tmp/nccl-checkpoint/
+COPY native/nccl ./native/nccl
+COPY deploy/nccl ./deploy/nccl
+COPY LICENSE THIRD_PARTY_NOTICES.md ./
+COPY third_party/licenses/nccl/LICENSE.txt ./third_party/licenses/nccl/LICENSE.txt
+COPY scripts/nccl-target-observe.py ./scripts/nccl-target-observe.py
+
+RUN python3 scripts/nccl-target-observe.py \
+      --base-image-digest "sha256:${TARGET_IMAGE##*@sha256:}" \
+      --transport ib-roce \
+      --nccl-policy "${COLDSNAP_NCCL_POLICY}" \
+      > /tmp/nccl-target.json \
+    && coldsnap nccl-provider assemble \
+      --source-root /src/coldsnap \
+      --recipe "/src/coldsnap/native/nccl/releases/${NCCL_RELEASE_TAG}/recipe.json" \
+      --qualification "/src/coldsnap/native/nccl/releases/${NCCL_RELEASE_TAG}/qualification.json" \
+      --payload /tmp/nccl-checkpoint \
+      --target /tmp/nccl-target.json \
+      --output /out/provider \
+    && coldsnap nccl-provider verify --provider /out/provider
+
+FROM scratch
+LABEL org.opencontainers.image.source="https://github.com/sparksq/coldsnap" \
+      org.opencontainers.image.licenses="AGPL-3.0-only AND BSD-3-Clause" \
+      io.sparksq.coldsnap.copyright-holders="Scitrera LLC and Fox Engine Ltd"
+COPY --from=provider_assembly /out/provider /

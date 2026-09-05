@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+ARG VLLM_IMAGE=ghcr.io/spark-arena/dgx-vllm-eugr-nightly-b12x:latest
+ARG CRIU_IMAGE
+
+FROM golang:1.25.14@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS coldsnap_criu_rpc_builder
+COPY --from=go_criu_source . /src/coldsnap/build/sources/go-criu
+COPY cmd/coldsnap-criu-rpc /src/coldsnap/cmd/coldsnap-criu-rpc
+WORKDIR /src/coldsnap/cmd/coldsnap-criu-rpc
+RUN go test ./... \
+    && CGO_ENABLED=0 go build -trimpath -o /out/coldsnap-criu-rpc .
+
+FROM golang:1.25.14@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS coldsnap_coordinator_builder
+WORKDIR /src/coldsnap
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/coldsnap-coordinator ./cmd/coldsnap-coordinator
+COPY internal/coord ./internal/coord
+RUN go test ./internal/coord \
+    && CGO_ENABLED=0 go build -trimpath -o /out/coldsnap-coordinator \
+        ./cmd/coldsnap-coordinator
+
+FROM ${VLLM_IMAGE}
+LABEL io.sparksq.coldsnap.copyright-holders="Scitrera LLC and Fox Engine Ltd" \
+      io.sparksq.coldsnap.license="AGPL-3.0-only" \
+      io.sparksq.coldsnap.source="https://github.com/sparksq/coldsnap"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        iproute2 \
+        iptables \
+        kmod \
+        nftables \
+        procps \
+        python3 \
+        util-linux \
+        libbsd0 \
+        libgnutls30t64 \
+        liblz4-1 \
+        libnet1 \
+        libnftables1 \
+        libnl-3-200 \
+        libprotobuf-c1 \
+        libselinux1 \
+        libuuid1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=criu_image /usr/sbin/criu /opt/criu/criu/criu
+RUN /opt/criu/criu/criu --version \
+    && lz4_path="$(find /usr/lib -name liblz4.so.1 -print -quit)" \
+    && test -n "$lz4_path" \
+    && cp -L "$lz4_path" /opt/criu/liblz4.so.1
+
+COPY --from=coldsnap_criu_rpc_builder /out/coldsnap-criu-rpc /usr/local/bin/coldsnap-criu-rpc
+COPY --from=coldsnap_coordinator_builder /out/coldsnap-coordinator /usr/local/bin/coldsnap-coordinator
+COPY LICENSE THIRD_PARTY_NOTICES.md /opt/coldsnap/licenses/coldsnap/
+COPY third_party/licenses/criu/COPYING /opt/coldsnap/licenses/third-party/criu/COPYING
+COPY third_party/licenses/nccl/LICENSE.txt /opt/coldsnap/licenses/third-party/nccl/LICENSE.txt
+COPY --from=go_criu_source LICENSE /opt/coldsnap/licenses/third-party/go-criu/LICENSE
+COPY --from=cuda_checkpoint_source LICENSE /opt/coldsnap/licenses/third-party/cuda-checkpoint/LICENSE
+
+COPY --from=cuda_checkpoint_source bin/aarch64_Linux/cuda-checkpoint /usr/local/bin/cuda-checkpoint
+RUN chmod 0755 /usr/local/bin/cuda-checkpoint \
+    && test -x /usr/local/bin/cuda-checkpoint
+
+RUN mkdir -p /opt/coldsnap/runtime /opt/coldsnap/plugin \
+    && find /opt/coldsnap/licenses -type f -exec chmod 0644 {} + \
+    && test -s /opt/coldsnap/licenses/coldsnap/LICENSE \
+    && test -s /opt/coldsnap/licenses/third-party/criu/COPYING \
+    && test -s /opt/coldsnap/licenses/third-party/nccl/LICENSE.txt \
+    && test -s /opt/coldsnap/licenses/third-party/go-criu/LICENSE \
+    && test -s /opt/coldsnap/licenses/third-party/cuda-checkpoint/LICENSE
+COPY runtime/engine/coldsnap_cuda_criu.py /opt/coldsnap/runtime/coldsnap_cuda_criu.py
+COPY runtime/engine/vllm_cuda_snapshot_target.py /opt/coldsnap/runtime/vllm_cuda_snapshot_target.py
+COPY integrations/vllm/coldsnap_vllm_checkpoint.py /opt/coldsnap/plugin/coldsnap_vllm_checkpoint.py
+
+ENV PYTHONPATH=/opt/coldsnap/plugin:/opt/coldsnap/runtime

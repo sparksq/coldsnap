@@ -1,0 +1,37 @@
+{
+  "format": 2,
+  "kind": "coldsnap-nccl-provider-qualification-source",
+  "provider_id": "nccl-2.31.2-1+coldsnap.12",
+  "state": "accepted",
+  "policy": "production",
+  "capabilities": [
+    "communicator-suspend-in-place",
+    "communicator-unwrap",
+    "coordinator-protocol-v1",
+    "cuda-graph",
+    "full-network-reset",
+    "graph-resource-retention",
+    "ib-roce-device-release",
+    "private-dlopen-routing",
+    "ras-reset",
+    "registration-window-replay",
+    "split-shrink-grow-replay",
+    "synchronous-termination",
+    "transport-detach-in-place"
+  ],
+  "transports": [
+    "ib-roce",
+    "socket"
+  ],
+  "checks": [
+    "abi-contract",
+    "artifact-round-trip",
+    "cuda-graph-replay",
+    "ib-roce-restore",
+    "provider-format",
+    "rank-swap",
+    "repeated-restore",
+    "socket-restore",
+    "tp2-real-engine"
+  ]
+}

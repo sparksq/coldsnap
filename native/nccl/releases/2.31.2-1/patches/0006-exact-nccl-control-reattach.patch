@@ -1,0 +1,200 @@
+--- a/src/include/proxy.h
++++ b/src/include/proxy.h
+@@ -346,6 +346,8 @@
+   struct ncclIpcSocket ipcSock;
+   int stop;
+   ncclResult_t asyncResult;
++  std::atomic<int> checkpointServiceState{0};
++  int checkpointPeerIndex;
+ 
+   // Used by main thread
+   union ncclSocketAddress* peerAddresses;
+@@ -414,6 +416,8 @@
+ ncclResult_t ncclProxyInit(struct ncclComm* comm, struct ncclSocket* sock, union ncclSocketAddress* peerAddresses,
+                            uint64_t* peerAddressesUDS);
+ ncclResult_t ncclProxyCreate(struct ncclComm* comm);
++ncclResult_t ncclProxyCheckpointDetach(struct ncclComm* comm);
++ncclResult_t ncclProxyCheckpointResume(struct ncclComm* comm);
+ ncclResult_t ncclProxyConnect(struct ncclComm* comm, int transport, int send, int proxyRank,
+                               struct ncclProxyConnector* proxyConn);
+ 
+--- a/src/proxy.cc
++++ b/src/proxy.cc
+@@ -30,6 +30,13 @@
+   proxyRecv = 0,
+   proxySend = 1
+ };
++
++enum {
++  proxyCheckpointActive = 0,
++  proxyCheckpointDetachRequested = 1,
++  proxyCheckpointDetached = 2,
++  proxyCheckpointResumeRequested = 3,
++};
+ void* ncclProxyServiceUDS(void* _args);
+ 
+ static bool NeedProxy(int type, int pattern, int root, struct ncclRing* ring, int nranks) {
+@@ -1784,6 +1791,35 @@
+     INFO(NCCL_INIT, "proxy listening socket at %s", ncclSocketToString(&proxyState->listenSock->addr, line));
+   }
+   while (stop == PROXY_RUNNING || npeers > 0) {
++    if (proxyState->checkpointServiceState.load(std::memory_order_acquire) ==
++        proxyCheckpointDetachRequested) {
++      for (int s = 0; s < maxnpeers; s++) {
++        if (pollfds[s].fd != NCCL_INVALID_SOCKET) {
++          (void)ncclSocketClose(&peers[s].sock);
++          pollfds[s].fd = NCCL_INVALID_SOCKET;
++          pollfds[s].events = 0;
++          pollfds[s].revents = 0;
++        }
++      }
++      npeers = 0;
++      maxnpeers = 0;
++      (void)ncclSocketClose(proxyState->listenSock);
++      pollfds[maxProxyConnections].fd = NCCL_INVALID_SOCKET;
++      proxyState->checkpointServiceState.store(proxyCheckpointDetached, std::memory_order_release);
++      while (proxyState->checkpointServiceState.load(std::memory_order_acquire) ==
++                 proxyCheckpointDetached &&
++             COMPILER_ATOMIC_LOAD(proxyState->abortFlag, std::memory_order_acquire) == 0) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(1));
++      }
++      if (proxyState->checkpointServiceState.load(std::memory_order_acquire) ==
++          proxyCheckpointResumeRequested) {
++        NCCLCHECKGOTO(ncclSocketGetFd(proxyState->listenSock, &pollfds[maxProxyConnections].fd), ret, fail);
++        pollfds[maxProxyConnections].events = NCCL_POLLIN;
++        pollfds[maxProxyConnections].revents = 0;
++        proxyState->checkpointServiceState.store(proxyCheckpointActive, std::memory_order_release);
++      }
++      continue;
++    }
+     /* Even if local comm aborts, we cannot let proxy thread exit if we still have peer
+      * connections. Need to wait until all other related comms call abort and safely exit
+      * together, or we could face segmentation fault. */
+@@ -2065,12 +2101,75 @@
+   comm->proxyState->peerAddresses = peerAddresses;
+   comm->proxyState->peerAddressesUDS = peerAddressesUDS;
+   comm->proxyState->netAttr = NCCL_NET_ATTR_INIT;
++  comm->proxyState->checkpointPeerIndex = -1;
+ 
+   // UDS support
+   NCCLCHECK(ncclIpcSocketInit(&comm->proxyState->ipcSock, comm->rank, peerAddressesUDS[comm->rank], comm->abortFlag));
+   return ncclSuccess;
+ }
+ 
++ncclResult_t ncclProxyCheckpointDetach(struct ncclComm* comm) {
++  struct ncclProxyState* proxyState = comm == NULL ? NULL : comm->proxyState;
++  if (proxyState == NULL || proxyState->listenSock == NULL ||
++      proxyState->checkpointServiceState.load(std::memory_order_acquire) != proxyCheckpointActive ||
++      proxyState->expectedResponses != NULL) {
++    return ncclInvalidUsage;
++  }
++  proxyState->checkpointPeerIndex = -1;
++  if (proxyState->peerSocks != NULL) {
++    const int self = comm->topParentRanks[comm->rank];
++    for (int index = 0; index < proxyState->peerArraySize; index++) {
++      int ready = 0;
++      NCCLCHECK(ncclSocketReady(proxyState->peerSocks + index, &ready));
++      if (!ready) continue;
++      if (index != self || proxyState->checkpointPeerIndex != -1) {
++        WARN("ColdSnap in-place proxy checkpoint requires exactly one process-local control socket");
++        return ncclInvalidUsage;
++      }
++      proxyState->checkpointPeerIndex = index;
++    }
++  }
++  proxyState->checkpointServiceState.store(proxyCheckpointDetachRequested, std::memory_order_release);
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++  while (proxyState->checkpointServiceState.load(std::memory_order_acquire) != proxyCheckpointDetached &&
++         std::chrono::steady_clock::now() < deadline) {
++    std::this_thread::yield();
++  }
++  if (proxyState->checkpointServiceState.load(std::memory_order_acquire) != proxyCheckpointDetached) {
++    WARN("ColdSnap in-place proxy service did not reach the checkpoint boundary");
++    return ncclSystemError;
++  }
++  if (proxyState->checkpointPeerIndex != -1) {
++    NCCLCHECK(ncclSocketClose(proxyState->peerSocks + proxyState->checkpointPeerIndex));
++  }
++  return ncclSuccess;
++}
++
++ncclResult_t ncclProxyCheckpointResume(struct ncclComm* comm) {
++  struct ncclProxyState* proxyState = comm == NULL ? NULL : comm->proxyState;
++  if (proxyState == NULL || proxyState->listenSock == NULL ||
++      proxyState->checkpointServiceState.load(std::memory_order_acquire) != proxyCheckpointDetached) {
++    return ncclInvalidUsage;
++  }
++  proxyState->checkpointServiceState.store(proxyCheckpointResumeRequested, std::memory_order_release);
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++  while (proxyState->checkpointServiceState.load(std::memory_order_acquire) != proxyCheckpointActive &&
++         std::chrono::steady_clock::now() < deadline) {
++    std::this_thread::yield();
++  }
++  if (proxyState->checkpointServiceState.load(std::memory_order_acquire) != proxyCheckpointActive) {
++    WARN("ColdSnap in-place proxy service did not resume");
++    return ncclSystemError;
++  }
++  if (proxyState->checkpointPeerIndex != -1) {
++    struct ncclSocket* sock = proxyState->peerSocks + proxyState->checkpointPeerIndex;
++    NCCLCHECK(ncclSocketInit(sock, proxyState->peerAddresses + proxyState->checkpointPeerIndex,
++                             comm->sharedRes->magic, ncclSocketTypeProxy, comm->abortFlag));
++    NCCLCHECK(ncclSocketConnect(sock));
++  }
++  return ncclSuccess;
++}
++
+ ncclResult_t ncclProxyCreate(struct ncclComm* comm) {
+   /* proxyState is shared among parent comm and split comms. comm->proxyState->thread is
+    * join()'d by commFree() in init.cc when the refCount reduces down to 0. */
+--- a/src/bootstrap.cc
++++ b/src/bootstrap.cc
+@@ -535,6 +535,7 @@
+   int nranks;
+   uint64_t magic;
+   volatile uint32_t* abortFlag;
++  int checkpointDetached;
+ };
+ #define STATE_RING(s, f) (s->ring.f)
+ #define STATE_LISTEN(s, f) (s->listen.f)
+@@ -1349,6 +1350,41 @@
+   return ncclSuccess;
+ }
+ 
++NCCL_API(ncclResult_t, ncclCheckpointControlDetach, ncclComm_t comm);
++ncclResult_t ncclCheckpointControlDetach(ncclComm_t comm) {
++  if (comm == NULL || comm->endMagic != NCCL_MAGIC || comm->bootstrap == NULL || comm->proxyState == NULL) {
++    return ncclInvalidArgument;
++  }
++  struct bootstrapState* state = (struct bootstrapState*)comm->bootstrap;
++  if (state->unexpectedConnections != NULL || ncclParamBootstrapNetEnable()) {
++    WARN("ColdSnap in-place control checkpoint requires idle socket bootstrap state");
++    return ncclInvalidUsage;
++  }
++  NCCLCHECK(ncclProxyCheckpointDetach(comm));
++  if (!state->checkpointDetached) {
++    NCCLCHECK(ncclSocketClose(&STATE_RING(state, socket.send)));
++    NCCLCHECK(ncclSocketClose(&STATE_RING(state, socket.recv)));
++    NCCLCHECK(ncclSocketClose(&STATE_LISTEN(state, socket)));
++    NCCLCHECK(ncclSocketClose(&STATE_LISTEN(state, peerSocket)));
++    state->checkpointDetached = 1;
++  }
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointProxyReattach, ncclComm_t comm);
++ncclResult_t ncclCheckpointProxyReattach(ncclComm_t comm) {
++  if (comm == NULL || comm->endMagic != NCCL_MAGIC || comm->bootstrap == NULL || comm->proxyState == NULL) {
++    return ncclInvalidArgument;
++  }
++  struct bootstrapState* state = (struct bootstrapState*)comm->bootstrap;
++  if (!state->checkpointDetached) return ncclInvalidUsage;
++  NCCLCHECK(bootstrapNetInit());
++  NCCLCHECK(createListenSocket(comm, comm->magic, comm->proxyState->listenSock,
++                               state->peerProxyAddresses + state->rank, ncclSocketTypeProxy));
++  NCCLCHECK(ncclProxyCheckpointResume(comm));
++  return ncclSuccess;
++}
++
+ ncclResult_t bootstrapAbort(void* commState) {
+   if (commState == NULL) return ncclSuccess;
+   struct bootstrapState* state = (struct bootstrapState*)commState;

@@ -1,0 +1,183 @@
+diff --git a/contrib/nccl_checkpoint/shim_checkpoint.cc b/contrib/nccl_checkpoint/shim_checkpoint.cc
+index a735c070a37bd281e800f43901e0a137ced08ffb..b3dd06f1284cdeebbf50112b5815427e38b9fb75 100644
+--- a/contrib/nccl_checkpoint/shim_checkpoint.cc
++++ b/contrib/nccl_checkpoint/shim_checkpoint.cc
+@@ -3,11 +3,56 @@
+ #include "kv_store_client.h"
+ #include <dlfcn.h>
+ #include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace nccl_checkpoint;
+ 
+ static int g_CommCheckpointCount = 0;
+ 
++enum CheckpointTermination {
++  checkpoint_termination_destroy,
++  checkpoint_termination_abort,
++  checkpoint_termination_abort_sync,
++};
++
++static ncclResult_t checkpointTerminationFromEnv(CheckpointTermination* termination) {
++  const char* value = std::getenv("NCCL_CHECKPOINT_TERMINATION");
++  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "destroy") == 0) {
++    *termination = checkpoint_termination_destroy;
++    return ncclSuccess;
++  }
++  if (std::strcmp(value, "abort") == 0) {
++    *termination = checkpoint_termination_abort;
++    return ncclSuccess;
++  }
++  if (std::strcmp(value, "abort-sync") == 0) {
++    *termination = checkpoint_termination_abort_sync;
++    return ncclSuccess;
++  }
++  WARN("NCCL_CHECKPOINT_TERMINATION must be 'destroy', 'abort', or 'abort-sync', got '%s'", value);
++  return ncclInvalidArgument;
++}
++
++static const char* checkpointTerminationString(CheckpointTermination termination) {
++  switch (termination) {
++  case checkpoint_termination_abort:
++    return "abort";
++  case checkpoint_termination_abort_sync:
++    return "abort-sync";
++  case checkpoint_termination_destroy:
++    return "destroy";
++  }
++  return "unknown";
++}
++
++static ncclResult_t checkpointNetworkInit() {
++  using network_init_t = ncclResult_t (*)(void);
++  static network_init_t real_network_init = nullptr;
++  NCCLCHECK(resolveRealFunction("ncclCheckpointNetworkInit", &real_network_init));
++  return real_network_init();
++}
++
+ static ncclResult_t replayRegistration(ncclComm_t synthComm, void* synthMR, RegConfig* config) {
+   using real_t = ncclResult_t (*)(const ncclComm_t, void*, size_t, void**);
+   static real_t real_ncclCommRegister = nullptr;
+@@ -120,7 +165,7 @@ static ncclResult_t restoreCommViaInit(KVStoreClient& kv, ncclComm_t synthComm,
+ 
+   ncclUniqueId newUid;
+   if (params->rank == 0) {
+-    ncclGetUniqueId(&newUid);
++    NCCLCHECK(ncclGetUniqueId(&newUid));
+     if (!kv.set(uidKey, &newUid, sizeof(newUid))) return ncclInternalError;
+     TRACE(NCCL_CHECKPOINT, "set restore uid for comm %p key %s", synthComm, uidKey);
+   }
+@@ -423,10 +468,15 @@ static ncclResult_t destroyRestoredUserDestroyedComms() {
+ 
+ extern "C" ncclResult_t ncclCheckpointPrepare(void) {
+   using finalize_t = ncclResult_t (*)(ncclComm_t);
+-  using destroy_t = ncclResult_t (*)(ncclComm_t);
++  using terminate_t = ncclResult_t (*)(ncclComm_t);
+   static finalize_t real_finalize = nullptr;
+-  static destroy_t real_destroy = nullptr;
++  static terminate_t real_destroy = nullptr;
++  static terminate_t real_abort = nullptr;
++  static terminate_t real_abort_sync = nullptr;
+   ncclResult_t ret;
++  CheckpointTermination termination;
++
++  NCCLCHECK(checkpointTerminationFromEnv(&termination));
+ 
+   g_CommCheckpointCount = 0;
+ 
+@@ -456,9 +506,9 @@ extern "C" ncclResult_t ncclCheckpointPrepare(void) {
+     // extract hash at prepare time rather than blocking during init time.
+     NCCLCHECK(commGetHash(realComm, &params->commHash));
+     params->cudaDev = realComm->cudaDev;
+-    TRACE(NCCL_CHECKPOINT, "prepare finalize comm %p real=%p hash=0x%016lx cudaDev=%d", synthComm, realComm,
+-          params->commHash, params->cudaDev);
+-    if (isActive) {
++    TRACE(NCCL_CHECKPOINT, "prepare comm %p real=%p hash=0x%016lx cudaDev=%d termination=%s", synthComm,
++          realComm, params->commHash, params->cudaDev, checkpointTerminationString(termination));
++    if (isActive && termination == checkpoint_termination_destroy) {
+       NCCLCHECK(resolveRealFunction("ncclCommFinalize", &real_finalize));
+       NCCLCHECK(real_finalize(realComm));
+     }
+@@ -478,7 +528,7 @@ extern "C" ncclResult_t ncclCheckpointPrepare(void) {
+     return ncclSuccess;
+   }));
+ 
+-  TRACE(NCCL_CHECKPOINT, "prepare ready for destroys");
++  TRACE(NCCL_CHECKPOINT, "prepare ready for communicator termination");
+   NCCLCHECK(g_commHandles.forEachHandle([&](ncclComm_t synthComm, const CommHandleEntry* entry) {
+     if (!commNeedsRestore(entry)) return ncclSuccess;
+     bool isActive = commIsActiveForUser(entry);
+@@ -487,9 +537,18 @@ extern "C" ncclResult_t ncclCheckpointPrepare(void) {
+     }
+     ncclComm_t realComm = synthComm;
+     NCCLCHECK(g_commHandles.toReal(synthComm, &realComm));
+-    TRACE(NCCL_CHECKPOINT, "prepare destroy comm %p real=%p", synthComm, realComm);
+-    NCCLCHECK(resolveRealFunction("ncclCommDestroy", &real_destroy));
+-    ret = real_destroy(realComm);
++    TRACE(NCCL_CHECKPOINT, "prepare %s comm %p real=%p",
++          checkpointTerminationString(termination), synthComm, realComm);
++    if (termination == checkpoint_termination_abort_sync) {
++      NCCLCHECK(resolveRealFunction("ncclCheckpointCommAbortSync", &real_abort_sync));
++      ret = real_abort_sync(realComm);
++    } else if (termination == checkpoint_termination_abort) {
++      NCCLCHECK(resolveRealFunction("ncclCommAbort", &real_abort));
++      ret = real_abort(realComm);
++    } else {
++      NCCLCHECK(resolveRealFunction("ncclCommDestroy", &real_destroy));
++      ret = real_destroy(realComm);
++    }
+     assert(ret != ncclInProgress);
+     if (ret == ncclSuccess) g_commHandles.remap(synthComm, nullptr);
+     NCCLCHECK(ret);
+@@ -506,6 +565,9 @@ extern "C" ncclResult_t ncclCheckpointRestore(void) {
+   }
+ 
+   INFO(NCCL_CHECKPOINT, "starting restore for %d communicator(s)", g_CommCheckpointCount);
++  // The capture boundary clears source-host network discovery. Rebuild it on
++  // every restored rank before rank zero creates a new bootstrap UID.
++  NCCLCHECK(checkpointNetworkInit());
+   KVStoreClient kv;
+   if (!kv.connect_from_env()) {
+     WARN("ncclCheckpointRestore: failed to connect to KVS; set NCCL_CHECKPOINT_KVS_PATH");
+diff --git a/src/init.cc b/src/init.cc
+index 0c4554b89344f83dd46747ef412178687934fcf0..096c59690ab5955d98619dec08590c655b2c1fd8 100644
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -3063,6 +3063,36 @@ fail:
+   goto exit;
+ }
+ 
++NCCL_API(ncclResult_t, ncclCheckpointNetworkReset);
++ncclResult_t ncclCheckpointNetworkReset() {
++  NCCLCHECK(bootstrapNetCheckpointReset());
++  NCCLCHECK(ncclNetSocketCheckpointReset());
++  NCCLCHECK(ncclCheckpointIbReset());
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointNetworkInit);
++ncclResult_t ncclCheckpointNetworkInit() {
++  return bootstrapNetInit();
++}
++
++// Checkpoint-only synchronous abort. Unlike the public ncclCommAbort API,
++// this does not return while commReclaim is still running on an async thread.
++// The checkpoint shim calls it for every communicator in the process, so the
++// final local communicator reclaims the shared resources for the full group.
++NCCL_API(ncclResult_t, ncclCheckpointCommAbortSync, ncclComm_t comm);
++ncclResult_t ncclCheckpointCommAbortSync(ncclComm_t comm) {
++  if (comm == NULL) return ncclSuccess;
++
++  NCCLCHECK(setCommAbortFlags(comm, 1));
++  comm->destroyFlag = 1;
++  (void)ncclCommEnsureReady(comm);
++
++  struct ncclCommFinalizeAsyncJob job;
++  job.comm = comm;
++  return commReclaim((struct ncclAsyncJob*)&job);
++}
++
+ static void childCommCleanupJob(void* job) {
+   struct ncclCommInitRankAsyncJob* initJob = (struct ncclCommInitRankAsyncJob*)job;
+   if (initJob->excludeRanksList) free(initJob->excludeRanksList);

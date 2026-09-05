@@ -1,0 +1,43 @@
+version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[manifest]
+members = [
+    "coldsnap-core",
+    "coldsnap-development",
+    "coldsnap-sglang",
+    "coldsnap-vllm",
+]
+
+[[package]]
+name = "coldsnap-core"
+version = "0.3.20"
+source = { editable = "integrations/core" }
+
+[[package]]
+name = "coldsnap-development"
+version = "0.3.20"
+source = { virtual = "." }
+
+[[package]]
+name = "coldsnap-sglang"
+version = "0.3.4"
+source = { editable = "integrations/sglang" }
+dependencies = [
+    { name = "coldsnap-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "coldsnap-core", editable = "integrations/core" }]
+
+[[package]]
+name = "coldsnap-vllm"
+version = "0.5.9"
+source = { editable = "integrations/vllm" }
+dependencies = [
+    { name = "coldsnap-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "coldsnap-core", editable = "integrations/core" }]

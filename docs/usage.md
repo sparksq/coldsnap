@@ -513,8 +513,8 @@ work and do not count it as serving-startup timing. The manager acquires the
 matching ColdSnap controller tools and creates the host-provider automatically;
 the manual controller/provider setup above is for direct API callers.
 
-The development Sparkrun plugin adds explicit SGLang `materialize` support on
-n580 and n610 (not present in the published plugin v0.1.1 tag). It generates a
+Sparkrun plugin 0.1.2 adds explicit SGLang `materialize` support on
+n580 and n610 using ColdSnap 0.3.20. It generates a
 fresh local capture using the existing capture-time pack writer, verifies a
 native restore, stops the verification workload, then makes the paired local
 capsule and native payload available to subsequent normal `sparkrun run` calls.

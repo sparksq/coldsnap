@@ -94,11 +94,12 @@ restore reports success, while `off` disables it. SGLang defaults to `off` and
 rejects `async` or `required` because its integration does not yet implement
 the canonical model-payload writer; an already available native SGLang payload
 can still be staged and restored. This restriction concerns ordinary recovery
-restores, not explicit preparation: the development Sparkrun plugin can build
+restores, not explicit preparation: Sparkrun plugin 0.1.2 can build
 a complete SGLang local capture through its existing capture-time writer,
 verify it, and use that capture's paired pack and replay metadata. It neither
 rewrites the source descriptor nor splices a new pack into an old capsule.
-The published plugin v0.1.1 predates this explicit SGLang command support.
+This explicit SGLang command uses ColdSnap 0.3.20; plugin v0.1.1 predates its
+support in the manager.
 
 The cache lives at
 `<remote-state-root>/model-payloads/sha256/<digest>.pack`; only the worker that

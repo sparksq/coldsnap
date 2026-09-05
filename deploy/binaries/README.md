@@ -19,12 +19,29 @@ uses Docker Hub OIDC connection `14f6b5b4-89d1-444f-911b-98df94b7ac9d` for the
 [OIDC setup](https://docs.docker.com/enterprise/security/oidc-connections/create-manage/)
 requires `docker/login-action` 4.5.0 or newer. The workflow pins 4.6.0 by commit.
 
-The Docker connection must permit pushes to `scitrera/coldsnap-binaries` from
-`sparksq/coldsnap`. Allow the `refs/heads/main` subject for manual backfills and
-the relevant `refs/tags/v*` subjects for automatic release-tag pushes. The OIDC
-subject comes from the workflow's ref, not the source tag checked out by a
-manual run. A rejected connection fails the workflow; it no longer silently
-skips publication when token secrets are absent.
+The Docker connection must grant read/write access to
+`scitrera/coldsnap-binaries`. This freshly created GitHub repository uses the
+[immutable-ID subject format](https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/).
+Its subject rules are:
+
+```text
+repo:sparksq@317042314/coldsnap@1357825449:ref:refs/heads/main
+repo:sparksq@317042314/coldsnap@1357825449:ref:refs/tags/v*
+```
+
+The first permits manual backfills from `main`; the second permits release-tag
+pushes. A legacy rule such as `repo:sparksq/coldsnap:ref:refs/heads/main` does not
+match this repository. Confirm the current prefix with:
+
+```bash
+gh api repos/sparksq/coldsnap/actions/oidc/customization/sub --jq .sub_claim_prefix
+```
+
+The OIDC subject comes from the workflow's ref, not the source tag checked out
+by a manual run. If Docker reports `access_denied`, inspect the connection's
+Failures table and verify its activation, subject rules, and resource scopes.
+A rejected connection fails the workflow; it no longer silently skips
+publication when token secrets are absent.
 
 ## Publish or backfill a release
 

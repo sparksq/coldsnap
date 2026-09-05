@@ -10,7 +10,14 @@ ColdSnap artifact format 9 separates stable model bytes from snapshot-specific
 runtime state. This avoids storing essentially the same large allocation image
 once per NVIDIA driver, capture, or capsule.
 
-For every execution worker, capture produces:
+The extent layout below describes vLLM's canonical writer. SGLang instead
+exports semantic model components during capture and packs them with a
+component-offset index in its native manifest. Its pack and replay metadata
+must remain paired with that capture; a fresh SGLang capture is not assumed to
+reproduce an older capture's payload digest. Both engines declare
+content-addressed per-worker model-payload objects in the artifact inventory.
+
+For every vLLM execution worker, capture produces:
 
 - `model-weights.pack`: model-owned byte ranges with deterministic 4 KiB zero
   padding between ranges for direct I/O. Extents are ordered by their SHA-256
@@ -86,7 +93,12 @@ node-local cache in the background. `required` performs the same work before
 restore reports success, while `off` disables it. SGLang defaults to `off` and
 rejects `async` or `required` because its integration does not yet implement
 the canonical model-payload writer; an already available native SGLang payload
-can still be staged and restored.
+can still be staged and restored. This restriction concerns ordinary recovery
+restores, not explicit preparation: the development Sparkrun plugin can build
+a complete SGLang local capture through its existing capture-time writer,
+verify it, and use that capture's paired pack and replay metadata. It neither
+rewrites the source descriptor nor splices a new pack into an old capsule.
+The published plugin v0.1.1 predates this explicit SGLang command support.
 
 The cache lives at
 `<remote-state-root>/model-payloads/sha256/<digest>.pack`; only the worker that

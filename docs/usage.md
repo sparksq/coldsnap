@@ -374,10 +374,11 @@ node-local native read-through cache:
   content-addressed payload and validation record are complete;
 - `off` performs recovery without populating the native cache.
 
-SGLang currently defaults to `off` and rejects explicit `async` or `required`
-materialization because its plugin does not yet implement the canonical
-model-payload writer. Native SGLang restore remains supported when payloads
-were captured locally or published separately.
+For this **restore-time read-through policy**, SGLang defaults to `off` and
+rejects explicit `async` or `required`: its integration does not implement that
+recovery-time writer. This is distinct from capture-time native pack generation
+and the explicit Sparkrun preparation command described below. Native SGLang
+restore supports packs captured locally or published separately.
 
 Materialization requires the committed artifact to declare its native replay
 provider and content-addressed per-worker model-payload inventory. Artifacts
@@ -511,6 +512,27 @@ overlays. It can include a disposable verification restore, so allow for that
 work and do not count it as serving-startup timing. The manager acquires the
 matching ColdSnap controller tools and creates the host-provider automatically;
 the manual controller/provider setup above is for direct API callers.
+
+The development Sparkrun plugin adds explicit SGLang `materialize` support on
+n580 and n610 (not present in the published plugin v0.1.1 tag). It generates a
+fresh local capture using the existing capture-time pack writer, verifies a
+native restore, stops the verification workload, then makes the paired local
+capsule and native payload available to subsequent normal `sparkrun run` calls.
+The source descriptor is not rewritten, and normal recovery restores retain
+materialization `off`; no asynchronous/write-behind writer is involved.
+
+For SGLang, both materialization options default to `required` after resolving
+`auto`. `--native-weights off --residual-overlay required` creates and verifies
+recovery-only local runtime state. Requesting only native weights still creates
+their matching capsule/replay metadata; newly captured packs are never assumed
+interchangeable with an older capture's pack. SGLang's capture boundary is
+unchanged—this is not vLLM's n580 pre-worker-import optimization.
+
+The local artifact is selected only for the matching source, driver version,
+hardware and rank-ordered hosts. Explicit restore `--artifact` bypasses local
+selection. Repeating `materialize` verifies the existing local result without
+recapturing. Allow enough disk space for capture and verification, and expect
+capture to replace any existing deployment of the same recipe.
 
 ### Capture your own recipe
 

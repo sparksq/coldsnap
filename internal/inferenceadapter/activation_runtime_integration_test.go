@@ -102,7 +102,7 @@ func TestActivationRuntimeCrossArchitectureIntegration(t *testing.T) {
 		output, err := remote.RunCombined(ctx, host, "docker", "run", "--rm", "--pull", "never", "--platform", "linux/"+architecture, "--network", "none",
 			"--mount", "type=bind,src="+binding.HostPath+",dst="+binding.ContainerPath+",readonly",
 			"--entrypoint", binding.ContainerPath, image, "tcp-probe")
-		if err == nil || !strings.Contains(string(output), "--images-dir must be a clean absolute path") {
+		if err == nil || !strings.Contains(string(output)+err.Error(), "--images-dir must be a clean absolute path") {
 			t.Fatalf("target helper did not execute correctly: %s err=%v", output, err)
 		}
 		t.Logf("%s: target identity, native payload verification, and container-mounted CRIU helper passed", engine)

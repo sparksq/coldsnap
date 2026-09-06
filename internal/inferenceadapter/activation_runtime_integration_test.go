@@ -69,7 +69,7 @@ func TestActivationRuntimeCrossArchitectureIntegration(t *testing.T) {
 		if _, err := adapter.prepareActivationRuntime(ctx, request); err != nil {
 			t.Fatal(err)
 		}
-		verified, err := adapter.runPayloadVerifier(ctx, host, payload, payload+".json", "sha256:"+hex.EncodeToString(hash[:]), int64(len(data)), "")
+		verified, err := adapter.runPayloadVerifier(ctx, host, payload, payload+".coldsnap-validation.json", "sha256:"+hex.EncodeToString(hash[:]), int64(len(data)), "")
 		if err != nil {
 			t.Fatal(err)
 		}

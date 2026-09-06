@@ -237,6 +237,34 @@ small pack through the manager provider and mount it read-only at the stable
 entrypoint paths. This preserves existing compatible capsule digests and lets
 future capsules omit duplicated controller scripts.
 
+Since ColdSnap 0.3.21, activation preparation checks the ELF architecture of
+both remotely executed helpers against every target host before staging them.
+It also runs the staged payload verifier's `version --json` on each target and
+requires its version and commit to match the running adapter. This happens
+before capture or restore workloads launch.
+
+For a Linux x64 controller managing ARM64 targets, keep the controller and its
+operation adapters as AMD64 executables. Supply ARM64 helpers from the **same
+ColdSnap release and commit** using these local paths:
+
+```bash
+export COLDSNAP_TARGET_PAYLOAD_VERIFIER=/path/to/arm64/coldsnap-vllm-adapter
+export COLDSNAP_TARGET_CRIU_RPC=/path/to/arm64/coldsnap-criu-rpc
+```
+
+Use `coldsnap-sglang-adapter` as the target verifier for SGLang. Both variables
+must be set together. Without them, same-architecture installations continue
+using the local adapter and CRIU helper. A mismatch now fails early rather than
+mounting an incompatible binary over the workload image's helper. The target
+verifier runs on the host; the CRIU helper is mounted into the workload. Do not
+replace `COLDSNAP_VLLM_ADAPTER` or `COLDSNAP_SGLANG_ADAPTER` with target binaries:
+those operation adapters must execute on the control node.
+
+Sparkrun ColdSnap plugin 0.1.4 resolves the target release bundle and binds these
+paths automatically. One common Linux target CPU architecture is required per
+operation; the controller architecture may differ. Existing capsules need not
+be rebuilt for this activation-layer fix.
+
 Capture the initialized service:
 
 ```bash

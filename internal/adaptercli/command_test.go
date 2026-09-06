@@ -7,17 +7,40 @@ package adaptercli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/sparksq/coldsnap/internal/buildinfo"
 	"github.com/sparksq/coldsnap/internal/hostops"
 	"github.com/sparksq/coldsnap/internal/snapshot"
 )
 
 type outputRoutingAdapter struct {
 	progress io.Writer
+}
+
+func TestVersionJSONNeedsNoRequestOrRemoteProvider(t *testing.T) {
+	for _, engine := range []string{"vllm", "sglang"} {
+		var stdout, stderr bytes.Buffer
+		err := Execute(context.Background(), Config{
+			Command: "coldsnap-" + engine + "-adapter", Engine: engine,
+			Operations: []string{"capture"}, DefaultTimeout: time.Minute,
+			NewAdapter: func(hostops.Remote, string, time.Duration, io.Writer) Adapter {
+				t.Fatal("identity query created an adapter")
+				return nil
+			},
+		}, []string{"version", "--json"}, strings.NewReader("invalid request"), &stdout, &stderr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var identity buildinfo.Info
+		if err := json.Unmarshal(stdout.Bytes(), &identity); err != nil || identity != buildinfo.Current() || stderr.Len() != 0 {
+			t.Fatalf("identity=%+v err=%v stderr=%s", identity, err, stderr.String())
+		}
+	}
 }
 
 func (adapter outputRoutingAdapter) Run(context.Context, snapshot.Request) error {

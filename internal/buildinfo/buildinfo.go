@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-var Version = "0.3.20"
+var Version = "0.3.21"
 var Commit = ""
 
 type Info struct {

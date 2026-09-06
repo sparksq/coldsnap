@@ -7,21 +7,28 @@ package inferenceadapter
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/sparksq/coldsnap/internal/buildinfo"
 	"github.com/sparksq/coldsnap/internal/snapshot"
 	"github.com/sparksq/coldsnap/internal/snapshotdriver"
 	activationruntime "github.com/sparksq/coldsnap/runtime/engine"
 )
 
 type activationRuntimeRemote struct {
+	platforms   map[string]string
+	identity    []byte
 	mutex       sync.Mutex
 	files       map[string][]byte
 	inputWrites int
@@ -148,6 +155,15 @@ func (remote *activationRuntimeRemote) key(host, path string) string { return ho
 func (remote *activationRuntimeRemote) Run(
 	_ context.Context, host string, arguments ...string,
 ) ([]byte, error) {
+	if slices.Equal(arguments, []string{"uname", "-sm"}) && remote.platforms != nil {
+		return []byte(remote.platforms[host]), nil
+	}
+	if len(arguments) == 3 && arguments[1] == "version" && remote.identity != nil {
+		return remote.identity, nil
+	}
+	if result, ok := activationProbeFixture(arguments); ok {
+		return result, nil
+	}
 	remote.mutex.Lock()
 	defer remote.mutex.Unlock()
 	if remote.files == nil {
@@ -178,6 +194,125 @@ func (remote *activationRuntimeRemote) Run(
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("unexpected command: %v", arguments)
+	}
+}
+
+func activationProbeFixture(arguments []string) ([]byte, bool) {
+	if slices.Equal(arguments, []string{"uname", "-sm"}) {
+		machine := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}[runtime.GOARCH]
+		return []byte("Linux " + machine + "\n"), true
+	}
+	if len(arguments) == 3 && slices.Equal(arguments[1:], []string{"version", "--json"}) {
+		data, _ := json.Marshal(buildinfo.Current())
+		return data, true
+	}
+	return nil, false
+}
+
+func targetELFFixture(machine uint16) []byte {
+	data := make([]byte, 64)
+	copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	binary.LittleEndian.PutUint16(data[16:], 2)
+	binary.LittleEndian.PutUint16(data[18:], machine)
+	binary.LittleEndian.PutUint32(data[20:], 1)
+	binary.LittleEndian.PutUint16(data[52:], 64)
+	return data
+}
+
+func configureNativeActivationTools(t *testing.T) {
+	t.Helper()
+	machine := map[string]uint16{"amd64": 62, "arm64": 183}[runtime.GOARCH]
+	directory := t.TempDir()
+	for _, name := range []string{"verifier", "helper"} {
+		if err := os.WriteFile(filepath.Join(directory, name), targetELFFixture(machine), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv(targetVerifierEnvironment, filepath.Join(directory, "verifier"))
+	t.Setenv(targetCRIURPCEnvironment, filepath.Join(directory, "helper"))
+}
+
+func TestActivationTargetOverridesReplaceBothControllerExecutables(t *testing.T) {
+	directory := t.TempDir()
+	verifier := filepath.Join(directory, "verifier")
+	helper := filepath.Join(directory, "helper")
+	for _, path := range []string{verifier, helper} {
+		if err := os.WriteFile(path, targetELFFixture(183), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv(targetVerifierEnvironment, verifier)
+	t.Setenv(targetCRIURPCEnvironment, helper)
+	pack, err := activationRuntimePack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, item := range pack.Files {
+		if item.Name == activationruntime.PayloadVerifierFile || item.Name == "coldsnap-criu-rpc" {
+			architecture, err := activationBinaryArchitecture(item.Data)
+			if err != nil || architecture != "aarch64" {
+				t.Fatalf("%s architecture=%s err=%v", item.Name, architecture, err)
+			}
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("target executable count=%d", count)
+	}
+	t.Setenv(targetCRIURPCEnvironment, "")
+	if _, err := activationRuntimePack(); err == nil {
+		t.Fatal("partial target override accepted")
+	}
+}
+
+func TestActivationRejectsForeignELFBeforeStaging(t *testing.T) {
+	foreign := uint16(183)
+	if runtime.GOARCH == "arm64" {
+		foreign = 62
+	}
+	directory := t.TempDir()
+	for _, name := range []string{"verifier", "helper"} {
+		if err := os.WriteFile(filepath.Join(directory, name), targetELFFixture(foreign), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv(targetVerifierEnvironment, filepath.Join(directory, "verifier"))
+	t.Setenv(targetCRIURPCEnvironment, filepath.Join(directory, "helper"))
+	remote := &activationRuntimeRemote{}
+	_, err := (Adapter{Remote: remote, StateRoot: directory}).prepareActivationRuntime(context.Background(), validRequest(2))
+	if err == nil || !strings.Contains(err.Error(), "supply release-matched target tools") || remote.inputWrites != 0 {
+		t.Fatalf("err=%v writes=%d", err, remote.inputWrites)
+	}
+}
+
+func TestActivationBinaryRejectsInvalidELF(t *testing.T) {
+	for _, data := range [][]byte{nil, []byte("#!/bin/sh\nexit 0\n"), targetELFFixture(40)} {
+		if _, err := activationBinaryArchitecture(data); err == nil {
+			t.Fatal("invalid ELF accepted")
+		}
+	}
+}
+
+func TestActivationAdmitsAllHostsBeforeStaging(t *testing.T) {
+	configureNativeActivationTools(t)
+	native := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}[runtime.GOARCH]
+	foreign := map[string]string{"amd64": "aarch64", "arm64": "x86_64"}[runtime.GOARCH]
+	remote := &activationRuntimeRemote{platforms: map[string]string{"node-0": "Linux " + native, "node-1": "Linux " + foreign}}
+	_, err := (Adapter{Remote: remote, StateRoot: t.TempDir()}).prepareActivationRuntime(context.Background(), validRequest(2))
+	if err == nil || remote.inputWrites != 0 {
+		t.Fatalf("err=%v writes=%d", err, remote.inputWrites)
+	}
+}
+
+func TestActivationRejectsWrongReleaseIdentity(t *testing.T) {
+	configureNativeActivationTools(t)
+	for _, identity := range []string{`{"version":"0.0.1","commit":"wrong"}`, "not JSON"} {
+		remote := &activationRuntimeRemote{identity: []byte(identity)}
+		_, err := (Adapter{Remote: remote, StateRoot: t.TempDir()}).prepareActivationRuntime(context.Background(), validRequest(1))
+		if err == nil || !strings.Contains(err.Error(), "identity") {
+			t.Fatalf("err=%v", err)
+		}
 	}
 }
 
@@ -214,6 +349,7 @@ func (*activationRuntimeRemote) Upload(context.Context, string, []string, string
 }
 
 func TestPrepareActivationRuntimeStagesOncePerHostAndReusesDigest(t *testing.T) {
+	configureNativeActivationTools(t)
 	remote := &activationRuntimeRemote{}
 	request := validRequest(2)
 	adapter := fixtureAdapter(Adapter{Remote: remote, StateRoot: "/cache/coldsnap"})

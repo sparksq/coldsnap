@@ -5,8 +5,10 @@
 package inferenceadapter
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -16,6 +18,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/sparksq/coldsnap/internal/buildinfo"
 	"github.com/sparksq/coldsnap/internal/hostops"
 	"github.com/sparksq/coldsnap/internal/operationtiming"
 	"github.com/sparksq/coldsnap/internal/snapshot"
@@ -25,6 +28,8 @@ import (
 
 const activationRuntimeDirectory = "activation-runtime"
 const criuRPCEnvironment = "COLDSNAP_CRIU_RPC"
+const targetVerifierEnvironment = "COLDSNAP_TARGET_PAYLOAD_VERIFIER"
+const targetCRIURPCEnvironment = "COLDSNAP_TARGET_CRIU_RPC"
 
 type activationRuntimeBinding struct {
 	HostPath      string
@@ -69,6 +74,14 @@ func activationRuntimePack() (activationruntime.Pack, error) {
 	if err != nil {
 		return activationruntime.Pack{}, fmt.Errorf("resolve release-matched payload verifier: %w", err)
 	}
+	targetVerifier := strings.TrimSpace(os.Getenv(targetVerifierEnvironment))
+	targetCRIURPC := strings.TrimSpace(os.Getenv(targetCRIURPCEnvironment))
+	if (targetVerifier == "") != (targetCRIURPC == "") {
+		return activationruntime.Pack{}, errors.New("target tools require both COLDSNAP_TARGET_PAYLOAD_VERIFIER and COLDSNAP_TARGET_CRIU_RPC")
+	}
+	if targetVerifier != "" {
+		executable = targetVerifier
+	}
 	verifierInformation, err := os.Stat(executable)
 	if err != nil {
 		return activationruntime.Pack{}, fmt.Errorf("inspect release-matched payload verifier: %w", err)
@@ -84,6 +97,9 @@ func activationRuntimePack() (activationruntime.Pack, error) {
 		return activationruntime.Pack{}, errors.New("release-matched payload verifier is empty")
 	}
 	path := strings.TrimSpace(os.Getenv(criuRPCEnvironment))
+	if targetCRIURPC != "" {
+		path = targetCRIURPC
+	}
 	if path == "" {
 		executable, err := os.Executable()
 		if err == nil {
@@ -160,18 +176,90 @@ func (adapter Adapter) prepareActivationRuntime(
 		}
 	}
 	slices.Sort(hosts)
+	// Admit every target before copying anything. Controller-native binaries
+	// must never shadow target-native executables in a workload image.
+	for _, host := range hosts {
+		if err := adapter.verifyActivationArchitecture(ctx, host, pack); err != nil {
+			return "", err
+		}
+	}
 	root := activationRuntimeRoot(adapter.StateRoot, pack)
 	err = parallelStrings(hosts, func(host string) error {
 		return operationtiming.Measure(ctx, "activation_runtime.stage", map[string]string{
 			"host": host, "sha256": pack.SHA256,
 		}, func(hostContext context.Context) error {
-			return adapter.stageActivationRuntimeHost(hostContext, host, request.ID, root, pack)
+			if err := adapter.stageActivationRuntimeHost(hostContext, host, request.ID, root, pack); err != nil {
+				return err
+			}
+			return adapter.verifyActivationIdentity(hostContext, host, pack)
 		})
 	})
 	if err != nil {
 		return "", err
 	}
 	return pack.SHA256, nil
+}
+
+func activationBinaryArchitecture(data []byte) (string, error) {
+	file, err := elf.NewFile(bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("invalid ELF executable: %w", err)
+	}
+	defer file.Close()
+	if file.Class != elf.ELFCLASS64 || file.Data != elf.ELFDATA2LSB || (file.Type != elf.ET_EXEC && file.Type != elf.ET_DYN) {
+		return "", errors.New("expected a 64-bit little-endian Linux ELF executable")
+	}
+	switch file.Machine {
+	case elf.EM_X86_64:
+		return "x86_64", nil
+	case elf.EM_AARCH64:
+		return "aarch64", nil
+	default:
+		return "", fmt.Errorf("unsupported ELF machine %s", file.Machine)
+	}
+}
+
+func (adapter Adapter) verifyActivationArchitecture(ctx context.Context, host string, pack activationruntime.Pack) error {
+	output, err := adapter.Remote.Run(ctx, host, "uname", "-sm")
+	if err != nil {
+		return fmt.Errorf("probe activation target platform on %s: %w", host, err)
+	}
+	platform := strings.Fields(string(output))
+	if len(platform) != 2 || platform[0] != "Linux" || (platform[1] != "x86_64" && platform[1] != "aarch64") {
+		return fmt.Errorf("unsupported activation target platform on %s: %q", host, strings.TrimSpace(string(output)))
+	}
+	for _, item := range pack.Files {
+		if item.Name != activationruntime.PayloadVerifierFile && item.Name != "coldsnap-criu-rpc" {
+			continue
+		}
+		architecture, err := activationBinaryArchitecture(item.Data)
+		if err != nil {
+			return fmt.Errorf("activation helper %s: %w", item.Name, err)
+		}
+		if architecture != platform[1] {
+			return fmt.Errorf("activation helper %s is %s but target %s is %s; supply release-matched target tools with COLDSNAP_TARGET_PAYLOAD_VERIFIER and COLDSNAP_TARGET_CRIU_RPC", item.Name, architecture, host, platform[1])
+		}
+	}
+	return nil
+}
+
+func (adapter Adapter) verifyActivationIdentity(ctx context.Context, host string, pack activationruntime.Pack) error {
+	verifier, err := payloadVerifierActivationPath(adapter.StateRoot, pack)
+	if err != nil {
+		return err
+	}
+	output, err := adapter.Remote.Run(ctx, host, verifier, "version", "--json")
+	if err != nil {
+		return fmt.Errorf("verify activation helper identity on %s: %w", host, err)
+	}
+	var identity buildinfo.Info
+	if err := json.Unmarshal(output, &identity); err != nil {
+		return fmt.Errorf("decode activation helper identity on %s: %w", host, err)
+	}
+	if expected := buildinfo.Current(); identity != expected {
+		return fmt.Errorf("activation helper on %s has identity %+v, expected %+v", host, identity, expected)
+	}
+	return nil
 }
 
 func (adapter Adapter) stageActivationRuntimeHost(

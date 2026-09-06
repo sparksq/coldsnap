@@ -2496,6 +2496,9 @@ type nativePublicationRemote struct {
 func (remote *nativePublicationRemote) Run(
 	_ context.Context, host string, arguments ...string,
 ) ([]byte, error) {
+	if result, ok := activationProbeFixture(arguments); ok {
+		return result, nil
+	}
 	remote.mutex.Lock()
 	defer remote.mutex.Unlock()
 	remote.calls = append(remote.calls, slices.Clone(arguments))
@@ -2560,6 +2563,7 @@ func (remote *nativePublicationRemote) RunInput(
 }
 
 func TestPublishNativePromotesVerifiedCaptureLocalPacks(t *testing.T) {
+	configureNativeActivationTools(t)
 	request := validRequest(2)
 	request.Operation = "publish-native"
 	request.Policy.Weights.Native = snapshot.NativePolicy{Repository: "org/native-packs", Revision: "main"}

@@ -8,6 +8,7 @@ package adaptercli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/sparksq/coldsnap/internal/buildinfo"
 	"github.com/sparksq/coldsnap/internal/fsutil"
 	"github.com/sparksq/coldsnap/internal/hostops"
 	"github.com/sparksq/coldsnap/internal/hostprovider"
@@ -57,6 +59,9 @@ func Execute(
 ) error {
 	if err := validateConfig(config); err != nil {
 		return err
+	}
+	if slices.Equal(arguments, []string{"version", "--json"}) {
+		return json.NewEncoder(stdout).Encode(buildinfo.Current())
 	}
 	// payload-verify is an internal, engine-neutral worker helper rather than
 	// an adapter lifecycle operation. Both adapter binaries expose the exact

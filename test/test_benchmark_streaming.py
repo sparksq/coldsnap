@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import sys
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import SimpleNamespace, ModuleType
+from unittest.mock import Mock, patch
 
 
 BENCHMARKS = Path(__file__).resolve().parents[1] / "benchmarks" / "harnesses"
@@ -26,6 +28,51 @@ import sparkrun_restore_ttft as restore_ttft  # noqa: E402
 
 
 class BenchmarkStreamingTest(unittest.TestCase):
+    def test_rank0_acceptance_reuses_receipt_without_any_inference(self) -> None:
+        args = SimpleNamespace(rank0_source="acceptance", timeout=1, docker_host="head", prompt="Reply OK", expected="OK")
+        start = restore_ttft._rfc3339_ns("2026-09-06T12:00:00Z")
+        acceptance = {
+            "format": 1, "observer": "rank0", "measurement": "rank0-acceptance-v1", "response_validated": True,
+            "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(), "max_tokens": 64, "temperature": 0,
+            "first_token_unix_ns": start + 3_000_000_000, "first_token_field": "content",
+            "readiness": {"port_open_unix_ns": start + 1_000_000_000, "http_ready_unix_ns": start + 2_000_000_000},
+        }
+        report = {"rank": 0, "post_restore_response": {
+            "choices": [{"message": {"content": "OK"}}], "coldsnap_acceptance": acceptance,
+        }}
+        with patch.object(restore_ttft, "_remote", side_effect=[json.dumps(report), "2026-09-06T12:00:00Z"]) as remote, \
+             patch.object(restore_ttft, "_stream") as stream:
+            result = restore_ttft._rank0(args, "current", start)
+        self.assertEqual(result["container_to_first_token_seconds"], 3)
+        self.assertEqual(result["container_to_health_seconds"], 2)
+        self.assertEqual(result["container_to_port_open_seconds"], 1)
+        self.assertEqual(remote.call_count, 2)
+        stream.assert_not_called()
+        for field, invalid in (("prompt_sha256", "wrong"), ("max_tokens", 128), ("response_validated", False)):
+            saved = acceptance[field]
+            acceptance[field] = invalid
+            with patch.object(restore_ttft, "_remote", return_value=json.dumps(report)), self.assertRaises(RuntimeError):
+                restore_ttft._rank0(args, "current", start)
+            acceptance[field] = saved
+        with patch.object(restore_ttft, "_remote", side_effect=[json.dumps(report), "2026-09-06T12:00:01Z"]), \
+             self.assertRaisesRegex(RuntimeError, "restarted"):
+            restore_ttft._rank0(args, "current", start)
+
+    def test_rank0_baseline_uses_upstream_full_validation_probe(self) -> None:
+        args = SimpleNamespace(rank0_source="inference", timeout=1, docker_host="head", prompt="Reply OK", expected="OK", api_base="http://head:8000")
+        module = ModuleType("sparkrun.orchestration.startup")
+        module.run_probe = Mock(return_value={
+            "measurement": "sparkrun-rank0-v1", "container_started_unix_ns": 1_000_000_000,
+            "first_token_unix_ns": 4_000_000_000, "first_token_field": "reasoning",
+            "response_validated": True,
+        })
+        with patch.dict(sys.modules, {"sparkrun.orchestration.startup": module}):
+            result = restore_ttft._rank0(args, "current", 1_000_000_000)
+        self.assertEqual(module.run_probe.call_count, 1)
+        self.assertEqual(module.run_probe.call_args.args[1]["expected"], "OK")
+        self.assertEqual(result["container_to_first_token_seconds"], 3)
+        self.assertEqual(result["measurement"], "sparkrun-rank0-v1")
+
     def test_post_launch_ttft_observer_selects_newest_existing_container(self) -> None:
         args = SimpleNamespace(timeout=1.0, docker_host="host")
         rows = [("old", "rank-0-old"), ("new", "rank-0-new")]

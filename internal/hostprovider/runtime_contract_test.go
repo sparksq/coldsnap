@@ -60,6 +60,16 @@ func TestManagerRuntimeCrossLanguageContract(t *testing.T) {
 	if inspection.Workload.ID != run.Value || !inspection.Workload.Running || inspection.Workload.Labels["sparkrun.cluster_id"] != "runtime-contract" {
 		t.Fatalf("workload=%#v", inspection.Workload)
 	}
+	if inspection.Workload.StartedAt != "" {
+		t.Fatal("default inspection leaked an opt-in field to legacy clients")
+	}
+	started, err := remote.Runtime(ctx, host, hostops.RuntimeRequest{Action: hostops.RuntimeWorkloadInspect, Name: name, IncludeStartTime: true})
+	if err != nil || started.Workload == nil {
+		t.Fatalf("startup inspect=%#v err=%v", started, err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, started.Workload.StartedAt); err != nil {
+		t.Fatalf("invalid container started_at: %v", err)
+	}
 	payload := []byte("binary\x00input\n")
 	execution, err := remote.Runtime(ctx, host, hostops.RuntimeRequest{Action: hostops.RuntimeWorkloadExec, Name: name, Execution: &hostops.Execution{Command: []string{"cat"}, Input: payload}})
 	if err != nil || !bytes.Equal(execution.Output, payload) {

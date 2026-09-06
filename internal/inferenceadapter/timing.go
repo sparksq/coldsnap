@@ -41,6 +41,9 @@ type runtimeTimingReport struct {
 	EngineCheckpointRestore     *float64                         `json:"engine_checkpoint_restore_seconds"`
 	HibernateStates             map[string]runtimeHibernateState `json:"hibernate_states"`
 	Timeline                    []runtimeTimingMark              `json:"timeline"`
+	PostRestoreResponse         struct {
+		Acceptance *streamAcceptanceTiming `json:"coldsnap_acceptance"`
+	} `json:"post_restore_response"`
 }
 
 type runtimeCaptureTimingReport struct {
@@ -149,9 +152,6 @@ func (adapter Adapter) collectRestoreTimingReports(
 	containers []string,
 ) error {
 	collector := operationtiming.FromContext(ctx)
-	if collector == nil {
-		return nil
-	}
 	parent := operationtiming.ParentID(ctx)
 	return parallelUnits(request.Launch.Units, func(unit snapshot.LaunchUnit) error {
 		if unit.Index >= len(containers) || containers[unit.Index] == "" {
@@ -171,10 +171,20 @@ func (adapter Adapter) collectRestoreTimingReports(
 		if !strings.HasPrefix(report.Kind, "coldsnap-") || !strings.Contains(report.Kind, "restore") || report.Rank < 0 {
 			return fmt.Errorf("unit %s restore timing report identity is invalid", unit.ID)
 		}
-		return importRuntimeRestoreTiming(
-			collector, parent, unit, request.Launch.Engine,
-			request.Launch.Execution.UnitWorkers(unit.ID), report,
-		)
+		if collector != nil {
+			if err := importRuntimeRestoreTiming(
+				collector, parent, unit, request.Launch.Engine,
+				request.Launch.Execution.UnitWorkers(unit.ID), report,
+			); err != nil {
+				return err
+			}
+		}
+		if unit.Index == 0 && lifecycleActivationState(request) != "warm" {
+			if err := adapter.collectStartupTTFT(ctx, request, unit, containers[unit.Index], report); err != nil {
+				fmt.Fprintf(adapter.Output, "ColdSnap startup TTFT: unavailable (%v)\n", err)
+			}
+		}
+		return nil
 	})
 }
 

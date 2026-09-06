@@ -1544,7 +1544,8 @@ def main() -> int:
         raise ValueError("deferred network unlock requires leave-stopped and TCP address mapping")
     args.artifact_root.mkdir(parents=True, exist_ok=True)
     try:
-        report = capture(args) if args.mode == "capture" else restore(args)
+        with service_runtime.StartupReadiness(args):
+            report = capture(args) if args.mode == "capture" else restore(args)
     except BaseException as error:
         report = {
             "format": 1,

@@ -55,8 +55,35 @@ benchmarks/harnesses/run_driver_ttft_matrix.sh \
 The seven-argument matrix form accepts four explicit recipe paths instead;
 set `COLDSNAP_SNAPSHOT_DRIVER` when overriding manager driver selection.
 `COLDSNAP_BINARY` can select a locally built controller. Prepare and verify
-the immutable capture before measuring restore. Host and observer clocks must
-be synchronized because Docker start and token observation use different hosts.
+the immutable capture before measuring restore. For the default external
+observer, host and observer clocks must be synchronized because Docker start
+and token observation use different hosts.
+
+### Rank-0-local startup measurements (development)
+
+Set `COLDSNAP_TTFT_MEASUREMENT=rank0` on either sample or matrix invocation to
+select same-host TTR/TTFT. This requires the matching development ColdSnap
+controller, canonical plugin, and upstream Sparkrun `develop-next` implementation.
+The interpreter selected by `SPARKRUN_PYTHON` must include that upstream probe.
+
+For normal launches, the harness runs Sparkrun's head-local streaming readiness
+probe with the qualification prompt and exact-response validation. For native
+and recovery restores it reads the existing rank-0 acceptance report and
+validates the prompt hash, sampling settings, final reply, and container start.
+It never sends a second ColdSnap inference request. Both local paths use
+temperature zero and a 64-token maximum. The sample launch uses `--no-follow`,
+so the normal launch does not also start a background readiness probe.
+
+Results include Docker-start-to-port-open, Docker-start-to-HTTP-health (when
+observed), and Docker-start-to-first-text durations. Keep the recorded
+measurement profile: `rank0-acceptance-v1` identifies ColdSnap's acceptance;
+`sparkrun-rank0-v1` identifies the normal launch probe. The default
+`COLDSNAP_TTFT_MEASUREMENT=external` retains the old external observer and
+128-token maximum, now explicitly labelled `external-stream-v1`.
+
+Do not combine external and rank-local samples or relabel old marketing
+numbers. Run a fresh matched matrix when changing profiles. See
+[timing boundaries and limitations](../../docs/startup-timing.md).
 
 ## Local diagnostics
 

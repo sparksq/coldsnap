@@ -31,17 +31,18 @@ const (
 )
 
 type RuntimeRequest struct {
-	Action      string        `json:"action"`
-	Image       string        `json:"image,omitempty"`
-	Source      string        `json:"source,omitempty"`
-	Target      string        `json:"target,omitempty"`
-	Name        string        `json:"name,omitempty"`
-	Build       *ImageBuild   `json:"build,omitempty"`
-	Workload    *WorkloadSpec `json:"workload,omitempty"`
-	Execution   *Execution    `json:"execution,omitempty"`
-	Path        string        `json:"path,omitempty"`
-	Destination string        `json:"destination,omitempty"`
-	Tail        int           `json:"tail,omitempty"`
+	Action           string        `json:"action"`
+	Image            string        `json:"image,omitempty"`
+	Source           string        `json:"source,omitempty"`
+	Target           string        `json:"target,omitempty"`
+	Name             string        `json:"name,omitempty"`
+	Build            *ImageBuild   `json:"build,omitempty"`
+	Workload         *WorkloadSpec `json:"workload,omitempty"`
+	Execution        *Execution    `json:"execution,omitempty"`
+	Path             string        `json:"path,omitempty"`
+	Destination      string        `json:"destination,omitempty"`
+	Tail             int           `json:"tail,omitempty"`
+	IncludeStartTime bool          `json:"include_start_time,omitempty"`
 }
 
 type RuntimeResponse struct {
@@ -112,13 +113,16 @@ type Execution struct {
 type WorkloadInfo struct {
 	// ID is an opaque, stable workload instance identity. Managers resolve the
 	// logical request name across sessions, and report serving-process state.
-	ID       string            `json:"id"`
-	Image    string            `json:"image,omitempty"`
-	State    string            `json:"state,omitempty"`
-	ExitCode int               `json:"exit_code,omitempty"`
-	Running  bool              `json:"running,omitempty"`
-	Paused   bool              `json:"paused,omitempty"`
-	Labels   map[string]string `json:"labels,omitempty"`
+	ID string `json:"id"`
+	// StartedAt is optional RFC3339Nano on the workload host's wall clock.
+	// It must be the actual serving-container start, never inspection time.
+	StartedAt string            `json:"started_at,omitempty"`
+	Image     string            `json:"image,omitempty"`
+	State     string            `json:"state,omitempty"`
+	ExitCode  int               `json:"exit_code,omitempty"`
+	Running   bool              `json:"running,omitempty"`
+	Paused    bool              `json:"paused,omitempty"`
+	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 // RuntimeError carries machine-readable failure classification across the manager boundary.

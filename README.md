@@ -154,6 +154,10 @@ The external TTFT observer measures Docker `State.StartedAt` through the first
 non-empty streamed model token and validates the completed response. Artifact
 preparation and verification before container start are separate phases.
 
+Development source also supports [rank-0-local startup TTR and TTFT](docs/startup-timing.md),
+reusing ColdSnap's streaming acceptance check. The harness can select that
+profile for matched new runs; historical external measurements are unchanged.
+
 Historical results and raw logs are maintained privately outside this source
 repository. Performance depends on the exact engine, model, driver, topology,
 storage, and cache state; rerun the matched cases for each release candidate.

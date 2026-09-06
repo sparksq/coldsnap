@@ -27,6 +27,10 @@ else
 fi
 coldsnap=${COLDSNAP_BINARY:-}
 snapshot_driver=${COLDSNAP_SNAPSHOT_DRIVER:-}
+measurement=${COLDSNAP_TTFT_MEASUREMENT:-external}
+case "$measurement" in external|rank0) ;; *) echo "unsupported measurement: $measurement" >&2; exit 2 ;; esac
+rank0_source=acceptance
+if [ "$mode" = vanilla ]; then rank0_source=inference; fi
 harness_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 observer=$harness_dir/sparkrun_restore_ttft.py
 
@@ -65,7 +69,8 @@ echo "[$sample] clear page cache on $cluster"
 "$sparkrun" setup clear-cache --cluster "$cluster" || exit $?
 
 rm -f -- "$ready_file"
-python3 "$observer" \
+"$sparkrun_python" "$observer" \
+  --measurement "$measurement" --rank0-source "$rank0_source" \
   --docker-host "$head_host" \
   --intent-id "$intent_id" \
   --api-base "http://$head_host:8000" \
@@ -136,4 +141,4 @@ fi
 # engine import, hydration, compilation, profiling, graph, and API warmup.
 "$sparkrun" logs "$recipe" --cluster "$cluster" --all-sources >"$runtime_log" 2>&1 || true
 
-python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); print("[%s] Docker-to-first-token %.6f s; health %.6f s" % (sys.argv[2], value["container_to_first_token_seconds"], value["container_to_health_seconds"]))' "$result" "$sample"
+"$sparkrun_python" -c 'import json,sys; value=json.load(open(sys.argv[1])); print("[%s] %s: Docker-to-first-token %.6f s; health %s s" % (sys.argv[2], value.get("measurement", "external-stream-v1"), value["container_to_first_token_seconds"], value.get("container_to_health_seconds", "unavailable")))' "$result" "$sample"

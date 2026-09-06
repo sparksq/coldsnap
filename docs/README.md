@@ -24,6 +24,7 @@ runtime integrations.
 
 - [Supported configuration and defaults](configuration.md)
 - [Recovery-aware operation and capsules](recovery-aware-operations.md)
+- [Startup readiness, TTR, and TTFT measurements](startup-timing.md)
 - [Build and binary distribution](distribution.md)
 - [vLLM integration](vllm-plugin.md)
 - [SGLang integration](sglang-plugin.md)

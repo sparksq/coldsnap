@@ -92,6 +92,14 @@ specification requirements, identity mapping, and failure codes. Controller
 capabilities advertise `manager-runtime-v1`; a provider lacking `runtime-v1`
 is rejected before engine operations. There is no adapter-side Docker fallback.
 
+For startup measurement, `workload-inspect` accepts optional
+`include_start_time: true`. The manager then includes the serving container's
+actual RFC3339Nano Docker `State.StartedAt` as `runtime.workload.started_at`.
+Ordinary inspection omits this field to remain compatible with older strict
+decoders. Do not synthesize a start timestamp from the inspection time. Missing
+support makes startup timing unavailable; it does not invalidate an otherwise
+successful restore. See [startup timing](startup-timing.md).
+
 Runtime responses carry the typed result under `runtime`. Failures may include
 `error_code` alongside `error`: `not_found` for image/workload absence,
 `path_not_found` for a missing path inside an existing workload, or

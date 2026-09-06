@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import subprocess
@@ -27,6 +28,9 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--expected", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--measurement", choices=("external", "rank0"), default="external")
+    parser.add_argument("--rank0-source", choices=("acceptance", "inference"), default="acceptance",
+                        help="Reuse ColdSnap acceptance or probe a normal launch through Sparkrun")
     parser.add_argument(
         "--ready-file",
         type=Path,
@@ -64,7 +68,7 @@ def _remote(host: str, *arguments: str) -> str:
 
 
 def _rfc3339_ns(value: str) -> int:
-    date, fractional = value.removesuffix("Z").split(".", 1)
+    date, _, fractional = value.removesuffix("Z").partition(".")
     seconds = int(datetime.strptime(date, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC).timestamp())
     return seconds * 1_000_000_000 + int((fractional + "000000000")[:9])
 
@@ -198,6 +202,70 @@ def _stream(args: argparse.Namespace) -> dict[str, object]:
     raise TimeoutError("stream did not produce a non-empty token")
 
 
+def _rank0(args: argparse.Namespace, container_id: str, started_ns: int) -> dict[str, object]:
+    """Reuse the built-in probe; never issue another ColdSnap inference request."""
+    if args.rank0_source == "inference":
+        from urllib.parse import urlsplit
+        from sparkrun.orchestration.startup import run_probe
+
+        url = urlsplit(args.api_base)
+        observation = run_probe(args.docker_host, {
+            "container": container_id, "address": url.hostname, "port": url.port or 8000,
+            "port_timeout_s": args.timeout, "health_timeout_s": args.timeout,
+            "inference_timeout_s": args.timeout, "prompt": args.prompt, "expected": args.expected,
+        })
+        if observation["container_started_unix_ns"] != started_ns:
+            raise RuntimeError("measured container restarted during observation")
+        observation["exact_response"] = observation.get("response_validated") is True
+    else:
+        deadline = time.monotonic() + args.timeout
+        while True:
+            try:
+                payload = _remote(args.docker_host, "docker", "exec", container_id,
+                                  "cat", "/opt/coldsnap/capsule/restore-ready.json")
+                report = json.loads(payload)
+                break
+            except subprocess.CalledProcessError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("rank-0 acceptance receipt was not published") from None
+                running = _remote(args.docker_host, "docker", "inspect", "--format", "{{.State.Running}}", container_id)
+                if running != "true":
+                    raise RuntimeError("rank-0 container exited before acceptance") from None
+                time.sleep(0.1)
+        response = report.get("post_restore_response") or {}
+        acceptance = response.get("coldsnap_acceptance") or {}
+        if report.get("rank") != 0 or acceptance.get("format") != 1 or acceptance.get("observer") != "rank0" or acceptance.get("measurement") != "rank0-acceptance-v1" or acceptance.get("response_validated") is not True:
+            raise RuntimeError("runtime has no validated rank-0 streaming acceptance; upgrade ColdSnap")
+        if acceptance.get("prompt_sha256") != hashlib.sha256(args.prompt.encode()).hexdigest():
+            raise RuntimeError("acceptance prompt does not match the qualification prompt")
+        if acceptance.get("max_tokens") != 64 or acceptance.get("temperature") != 0:
+            raise RuntimeError("acceptance sampling settings do not match rank-0 qualification")
+        timestamp = _remote(args.docker_host, "docker", "inspect", "--format", "{{.State.StartedAt}}", container_id)
+        if _rfc3339_ns(timestamp) != started_ns:
+            raise RuntimeError("measured container restarted during observation")
+        exact = response["choices"][0]["message"]["content"].strip() == args.expected
+        observation = {
+            **acceptance, **acceptance.get("readiness", {}),
+            "container_id": container_id, "container_started_unix_ns": started_ns,
+            "exact_response": exact, "inference_ready": True,
+            "content": response["choices"][0]["message"]["content"],
+        }
+    first = observation["first_token_unix_ns"]
+    if type(first) is not int or first < started_ns or observation.get("first_token_field") not in ("content", "reasoning", "reasoning_content") or not observation["exact_response"]:
+        raise RuntimeError("invalid or unsuccessful rank-0 observation")
+    observation.update(format=1, kind="coldsnap-sparkrun-rank0-startup-observation",
+                       first_token_observed_unix_ns=first,
+                       container_to_first_token_seconds=(first - started_ns) / 1e9)
+    for source, target in (("port_open_unix_ns", "container_to_port_open_seconds"),
+                           ("http_ready_unix_ns", "container_to_health_seconds")):
+        timestamp = observation.get(source)
+        if timestamp is not None:
+            if type(timestamp) is not int or timestamp < started_ns:
+                raise RuntimeError("invalid rank-0 readiness timestamp")
+            observation[target] = (timestamp - started_ns) / 1e9
+    return observation
+
+
 def main() -> int:
     args = _arguments()
     observer_started_ns = time.time_ns()
@@ -222,6 +290,13 @@ def main() -> int:
     container_id, container_name, container_started_ns = _wait_container(
         args, existing_container_ids
     )
+    if args.measurement == "rank0":
+        result = _rank0(args, container_id, container_started_ns)
+        result["container_name"] = container_name
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(result, indent=2))
+        return 0
     health_ns = _wait_health(args)
     stream = _stream(args)
     first_token_ns = int(stream["first_token_observed_unix_ns"])
@@ -229,6 +304,7 @@ def main() -> int:
     result = {
         "format": 1,
         "kind": "coldsnap-sparkrun-restore-ttft-observation",
+        "measurement": "external-stream-v1",
         "observer_started_unix_ns": observer_started_ns,
         "container_id": container_id,
         "container_name": container_name,

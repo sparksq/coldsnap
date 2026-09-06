@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -16,6 +17,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -503,21 +505,194 @@ def _coordinator_wait(coordinator: CoordinatorClient, key: str, timeout: float) 
                 raise
 
 
+def _port_is_listening(port: int) -> bool:
+    """Use the same local TCP LISTEN boundary as Sparkrun, without connecting."""
+    for name in ("tcp", "tcp6"):
+        try:
+            rows = (Path("/proc/net") / name).read_text().splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        for row in rows:
+            fields = row.split()
+            if len(fields) >= 4 and fields[3] == "0A" and fields[1].rsplit(":", 1)[-1] == f"{port:04X}":
+                return True
+    return False
+
+
+def _service_url(args: argparse.Namespace, path: str) -> str:
+    address = args.master_address
+    if ":" in address and not address.startswith("["):
+        address = f"[{address}]"
+    return f"http://{address}:{args.http_port}{path}"
+
+
+def _local_http_open(request: Any, *, timeout: float):
+    # These are same-host observations, never traffic for an environment proxy.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=timeout)
+
+
+class StartupReadiness:
+    """Advisory rank-0 TCP/HTTP observers, active before restore work starts.
+
+    These probes never gate restore or issue inference. Successful observations
+    use the host wall clock, like Docker StartedAt; absence is not zero latency.
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.stop = threading.Event()
+        self.lock = threading.Lock()
+        self.observed: dict[str, int] = {"observer_started_unix_ns": time.time_ns()}
+        self.deadline = time.monotonic() + args.timeout
+        self.threads: list[threading.Thread] = []
+
+    def __enter__(self):
+        if self.args.mode == "restore" and self.args.rank == 0 and self.args.activation_state == "running":
+            self.args.startup_readiness = self
+            for kind in ("port_open", "http_ready"):
+                thread = threading.Thread(target=self._observe, args=(kind,), daemon=True, name=f"coldsnap-{kind}")
+                self.threads.append(thread)
+                thread.start()
+        return self
+
+    def _observe(self, kind: str) -> None:
+        while not self.stop.is_set() and time.monotonic() < self.deadline:
+            try:
+                if kind == "port_open":
+                    if not _port_is_listening(self.args.http_port):
+                        raise OSError("port is not listening")
+                else:
+                    url = _service_url(self.args, "/health")
+                    with _local_http_open(url, timeout=0.25) as response:
+                        if response.status != 200:
+                            raise OSError("health is not ready")
+                observed = time.time_ns()
+                with self.lock:
+                    self.observed[kind + "_unix_ns"] = observed
+                return
+            except (OSError, urllib.error.URLError):
+                self.stop.wait(0.05)
+
+    def snapshot(self) -> dict[str, int]:
+        with self.lock:
+            return dict(self.observed)
+
+    def __exit__(self, *_exc):
+        self.stop.set()
+        for thread in self.threads:
+            thread.join(timeout=0.5)
+
+
+def _stream_events(response: Any, deadline: float):
+    """Read bounded SSE events, rejecting truncated or oversized responses."""
+    data: list[str] = []
+    event_bytes = total_bytes = 0
+    while True:
+        if time.perf_counter() >= deadline:
+            raise TimeoutError("acceptance stream exceeded its deadline")
+        raw = response.readline(65537)
+        if not raw:
+            raise RuntimeError("acceptance stream ended before [DONE]")
+        total_bytes += len(raw)
+        event_bytes += len(raw)
+        if len(raw) > 65536 or event_bytes > 65536 or total_bytes > 1024 * 1024:
+            raise RuntimeError("acceptance stream exceeds its size limit")
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if data:
+                yield "\n".join(data)
+            data = []
+            event_bytes = 0
+        elif line.startswith("data:"):
+            data.append(line[5:].removeprefix(" "))
+
+
 def _infer(args: argparse.Namespace) -> dict[str, Any]:
-    response = _request(
-        args,
-        "POST",
-        "/v1/chat/completions",
-        {
-            "model": args.model,
-            "messages": [{"role": "user", "content": args.prompt}],
-            "max_tokens": 64,
-            "temperature": 0,
-        },
+    """One streaming acceptance request: timestamp first text, validate all text.
+
+    This runs on rank 0. A first token alone never opens the readiness barrier:
+    callers receive timing only after the complete stream passes acceptance.
+    Failed attempts (including retained-graph retries) cannot leak a TTFT.
+    """
+    payload = {
+        "model": args.model,
+        "messages": [{"role": "user", "content": args.prompt}],
+        "max_tokens": 64,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    request = urllib.request.Request(
+        _service_url(args, "/v1/chat/completions"),
+        data=json.dumps(payload).encode(), method="POST",
+        headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
     )
-    actual = str(response["choices"][0]["message"]["content"]).strip()
+    started = time.perf_counter()
+    started_unix_ns = time.time_ns()
+    first_token_ns = first_token_elapsed = None
+    first_token_field = ""
+    pieces: dict[str, list[str]] = {"content": [], "reasoning": [], "reasoning_content": []}
+    response: dict[str, Any] = {}
+    finish_reason = None
+    with _local_http_open(request, timeout=args.timeout) as stream:
+        for data in _stream_events(stream, started + args.timeout):
+            observed_ns, elapsed = time.time_ns(), time.perf_counter() - started
+            if data == "[DONE]":
+                break
+            chunk = json.loads(data)
+            if not isinstance(chunk, dict) or "error" in chunk:
+                raise RuntimeError("acceptance stream returned an error or invalid event")
+            for key in ("id", "model", "created", "usage"):
+                if key in chunk:
+                    response[key] = chunk[key]
+            choices = chunk.get("choices", [])
+            if not isinstance(choices, list) or len(choices) > 1:
+                raise RuntimeError("acceptance stream returned invalid choices")
+            if not choices:
+                continue
+            choice = choices[0]
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                raise RuntimeError("acceptance stream returned an invalid choice")
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                raise RuntimeError("acceptance stream returned an invalid delta")
+            for field in pieces:
+                text = delta.get(field)
+                if text is not None and not isinstance(text, str):
+                    raise RuntimeError("acceptance stream returned non-text output")
+                if text:
+                    pieces[field].append(text)
+                    if first_token_ns is None:
+                        first_token_ns, first_token_elapsed = observed_ns, elapsed
+                        first_token_field = field
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice["finish_reason"]
+    if first_token_ns is None or not isinstance(finish_reason, str) or not finish_reason:
+        raise RuntimeError("acceptance stream has no non-empty token or finish reason")
+    message = {field: "".join(values) for field, values in pieces.items()}
+    actual = message["content"].strip()
     if actual != args.expected:
         raise RuntimeError(f"response mismatch: expected={args.expected!r} actual={actual!r}")
+    response["object"] = "chat.completion"
+    response["choices"] = [{"index": 0, "message": {"role": "assistant", **message}, "finish_reason": finish_reason}]
+    response["coldsnap_acceptance"] = {
+        "format": 1,
+        "measurement": "rank0-acceptance-v1",
+        "observer": "rank0",
+        "request_started_unix_ns": started_unix_ns,
+        "first_token_unix_ns": first_token_ns,
+        "first_token_field": first_token_field,
+        "request_ttft_seconds": first_token_elapsed,
+        "response_seconds": time.perf_counter() - started,
+        "response_validated": True,
+        "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(),
+        "max_tokens": payload["max_tokens"],
+        "temperature": payload["temperature"],
+    }
+    readiness = getattr(args, "startup_readiness", None)
+    if readiness is not None:
+        response["coldsnap_acceptance"]["readiness"] = readiness.snapshot()
+        readiness.stop.set()
     return response
 
 

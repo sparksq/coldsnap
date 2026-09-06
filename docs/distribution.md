@@ -9,15 +9,13 @@ SPDX-License-Identifier: AGPL-3.0-only
 ColdSnap has two deliberately separate build products. They solve different
 problems and must not be treated as one install.
 
-The manager plugin is a separate project:
-[sparkrun-coldsnap-plugin](https://github.com/sparksq/sparkrun-coldsnap-plugin).
-Its version and Sparkrun's vendored plugin pin are not controlled by this
-repository's `versions.yaml`. Verify the host/plugin pair with
-`sparkrun coldsnap --version`; see [manager setup](usage.md#install-and-verify-the-manager-plugin).
+Manager packaging and tool acquisition are separate from the controller release.
+See [Sparkrun plugin internals](sparkrun-integration.md#controller-acquisition)
+for the reference plugin implementation.
 
 ## Controller release binaries
 
-Sparkrun runs the engine-neutral `coldsnap` controller on its control machine.
+The manager runs the engine-neutral `coldsnap` controller on its control machine.
 That executable delegates engine operations to matching
 `coldsnap-vllm-adapter` and `coldsnap-sglang-adapter` binaries. None needs CUDA
 or engine Python packages on the controller.
@@ -76,12 +74,6 @@ The generator owns version checking and Go publication. Docker binary-bundle
 and NCCL payload workflows are maintained directly in this repository and
 checked with `actionlint`.
 
-Sparkrun resolves the four executables as one indivisible tool set. It first
-tries the GitHub release archives and their `checksums.txt`, then the matching
-Docker Hub binary-bundle image, and finally a source-pinned Docker build. Every
-path records and rechecks the extracted binary hashes and verifies
-`coldsnap version --json` before use. A private GitHub repository is supported
-through `GH_TOKEN`, `GITHUB_TOKEN`, or an existing `gh auth login` session.
 Docker Hub publication requires the repository secrets `DOCKERHUB_USERNAME`
 and `DOCKERHUB_TOKEN` (or accessible organization secrets). Without them, the
 optional binary-bundle workflow warns and skips publication; GitHub binary
@@ -131,9 +123,8 @@ engine image containing CRIU, CUDA checkpoint tooling, the ColdSnap engine
 plugin, native hydration libraries, the qualified NCCL provider, the
 coordinator, and the rank entrypoint.
 
-Sparkrun's `coldsnap` builder selects `deploy/vllm/Dockerfile` or
-`deploy/sglang/Dockerfile` from the materialized recipe runtime. Both are
-multi-stage:
+`deploy/vllm/Dockerfile` and `deploy/sglang/Dockerfile` build runtime images
+for their respective engines. Both are multi-stage:
 
 1. Go programs are compiled in a Go builder stage.
 2. CRIU and the GPL-2.0-only n580 reset plugin are copied from a digest-pinned
@@ -161,7 +152,7 @@ using SGLang-specific launch and lifecycle policy.
 
 ## Compatibility rule
 
-The controller and adapter are one release unit. Sparkrun must never combine a
+The controller and adapter are one release unit. A manager must never combine a
 controller from one release with an adapter from another. The adapter's
 activation runtime must match the selected snapshot-driver ABI. Runtime/capsule
 compatibility remains separately enforced by the artifact schema, engine

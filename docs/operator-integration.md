@@ -6,8 +6,8 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Operator integration contract
 
-ColdSnap's public CLI is primarily a controller primitive for Sparkrun, a
-future Kubernetes operator, or another placement-aware orchestrator. Human
+ColdSnap's public CLI is a controller primitive for placement-aware
+orchestrators and integrations. Human
 users normally use the orchestration layer's commands. Integrations should use
 strict request and receipt JSON and must not parse progress messages.
 
@@ -187,13 +187,12 @@ deployment requirement.
 ## Kubernetes direction and current boundary
 
 The engine adapter now uses a typed manager runtime rather than constructing
-Docker commands. Docker is the reference backend in the standalone Sparkrun
-plugin. A Kubernetes manager still needs node-side CRIU/CUDA integration and
+Docker commands. Docker is the current reference manager backend. A Kubernetes manager still needs node-side CRIU/CUDA integration and
 hardware qualification, not just a Pod API mapping. See the
 [runtime-neutral manager contract](runtime-neutral-managers.md).
 
-The request, artifact, receipt, and timing-event formats do not depend on
-Sparkrun and can be stored in CRD status or an external object store. A
+The request, artifact, receipt, and timing-event formats are manager-neutral
+and can be stored in CRD status or an external object store. A
 Kubernetes controller can therefore reconcile the same prepare, replace,
 restore, sleep, wake, and status
 operations without changing engine or storage formats. It may implement the

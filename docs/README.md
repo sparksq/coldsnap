@@ -6,14 +6,26 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # ColdSnap documentation
 
-Start with [basic usage](usage.md), covering the direct controller interface
-and the [Sparkrun manager path](usage.md#sparkrun-usage).
+For normal community use, start with the [Sparkrun setup and quickstart](https://coldsnap.sh/docs/getting-started/).
+
+## Sparkrun advanced usage
+
+- [Sparkrun reference](sparkrun-usage.md)
+- [Recipe policy and weights](sparkrun-recipes.md)
+- [Plugin internals](sparkrun-integration.md)
+
+## ColdSnap controller and engines
+
+Start with [controller usage and requests](usage.md). These documents cover
+ColdSnap itself for developers implementing engines, managers, or detailed
+runtime integrations.
 
 ## Current operation
 
 - [Supported configuration and defaults](configuration.md)
 - [Recovery-aware operation and capsules](recovery-aware-operations.md)
 - [Build and binary distribution](distribution.md)
+- [vLLM integration](vllm-plugin.md)
 - [SGLang integration](sglang-plugin.md)
 
 ## Current architecture and contracts

@@ -70,7 +70,7 @@ Artifact objects use typed owners:
 | `group/<id>` | Future collective-group state | One per ordered rank namespace |
 
 This prevents two costly mistakes: duplicating a unit capsule for every local
-GPU, and downloading every worker's model payload to every host. Sparkrun
+GPU, and downloading every worker's model payload to every host. The manager
 resolves each worker through its owning unit and stages that pack only on the
 unit's destination host.
 

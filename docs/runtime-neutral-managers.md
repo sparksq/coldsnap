@@ -6,7 +6,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Runtime-neutral manager boundary
 
-Status: introduced in ColdSnap 0.3.20 with Sparkrun ColdSnap plugin 0.1.1.
+Status: introduced in ColdSnap 0.3.20.
 This is a manager-interface refactor, not a Kubernetes
 operator or a claim of Kubernetes qualification. Existing Qwen/vLLM TP2
 capsules have passed focused GPU restore checks on both snapshot drivers and
@@ -21,7 +21,7 @@ archived; the limitations below distinguish those checks from broader support.
 | Shared Go inference adapter | Capture/restore sequence, admission, stable unit/worker topology, required workload specs, readiness, live lifecycle | Docker argv or Kubernetes calls |
 | Go capsule builder | Driver-specific capsule contents, model-payload exclusion, license inputs, immutable OCI identities | Executing a particular container engine/build CLI |
 | Manager host provider | Authorized node operations, typed runtime dispatch, credentials, operation lifetime | Engine-specific CUDA/NCCL restore logic |
-| Sparkrun Docker runtime backend | Docker CLI translation, credentialed registry operations, image building, workload execution/inspection/copy/logs/removal | Snapshot format or driver semantics |
+| Reference Docker runtime backend | Docker CLI translation, credentialed registry operations, image building, workload execution/inspection/copy/logs/removal | Snapshot format or driver semantics |
 | In-image Python/native code | CRIU, CUDA, NCCL, weight hydration, engine integration | Manager transport or container engine |
 
 ColdSnap now sends `hostops.RuntimeRequest` rather than Docker commands for
@@ -31,15 +31,13 @@ capsule construction, and publication. Both engines and both snapshot drivers
 use this boundary. `internal/hostops/runtime.go` defines it;
 `internal/hostprovider` carries it over the authenticated manager socket.
 
-The standalone plugin implements `DockerManagerRuntime` and injects it through
-`ColdSnapHostProvider.runtime_factory`. An alternate manager can implement the
-wire contract directly in any language. The Python plugin is the reference
-implementation, not a ColdSnap dependency. Its Hugging Face helpers also use
-the runtime backend; credentials travel on stdin, not in workload metadata.
+A manager may implement the wire contract in any language. Its runtime backend
+realizes image and workload operations and handles authenticated helpers. The
+[reference plugin implementation](sparkrun-integration.md#runtime-backend-and-workload-identity)
+is documented separately from this contract.
 
-ColdSnap emits neutral `io.sparksq.coldsnap.*` identity labels. Sparkrun adds
-its own `sparkrun.*` labels from the authorized operation's workload metadata,
-preserving normal Sparkrun status/log/stop integration. Workload names are
+ColdSnap emits neutral `io.sparksq.coldsnap.*` identity labels. A manager may
+add its own labels from authorized workload metadata. Workload names are
 logical manager keys; returned IDs may be opaque handles. Managers must resolve
 logical names across separate operations, not only inside one provider session.
 
@@ -49,7 +47,7 @@ The format-1 host-provider envelope adds `operation: runtime` with a nested
 `runtime` request. Adapters require `runtime-v1` before any host mutation.
 `coldsnap capabilities` advertises `manager-runtime-v1`. Older providers are
 rejected; the engine adapter has no internal Docker fallback. Upgrade the
-manager plugin to 0.1.1 when adopting controller 0.3.20.
+provider to implement `runtime-v1` before adopting controller 0.3.20.
 
 | Action | Important fields / result |
 | --- | --- |
@@ -64,8 +62,8 @@ manager plugin to 0.1.1 when adopting controller 0.3.20.
 | `workload-copy-from` | Logical `name`, absolute in-workload `path`, absolute node-local `destination` |
 | `workload-remove` | Stop/remove exact logical `name`; already absent succeeds |
 
-See the Go types and plugin `runtime_contract.py` for the exhaustive schema.
-The plugin rejects unknown fields, wrong types, malformed base64, invalid paths,
+See `internal/hostops/runtime.go` for the exhaustive schema.
+The provider must reject unknown fields, wrong types, malformed base64, invalid paths,
 and unsupported requirements before execution. Binary fields use standard
 base64; argv remains an array, with no implicit shell evaluation. Detached
 launch requires a name and prohibits stdin/combined diagnostic output so the
@@ -128,10 +126,9 @@ workloads receive the neutral labels; previously running workloads are not
 relabeled automatically when upgrading. Restore the workload with the new
 manager/controller pair before using its live lifecycle operations.
 
-Docker remains the only implemented production runtime backend. Sparkrun's
-manager-side image-prep builder, descriptor/binary OCI acquisition, deletion,
-and cache helpers still contain Docker-specific code. They are not used by a
-future independent Kubernetes manager. The core capsule builder still specifies
+Docker remains the only implemented production runtime backend. Its
+[reference manager implementation](sparkrun-integration.md) does not constrain
+an independent Kubernetes manager. The core capsule builder still specifies
 a Dockerfile/BuildKit-compatible build frontend: the manager may delegate this
 to a build service rather than a node Docker daemon. A test-only argv renderer preserves
 older regression assertions and is not linked into controller/adapter binaries.
@@ -159,16 +156,8 @@ contract/unit tests as performance evidence.
 
 ## Verification scope
 
-- Full root-module Go tests and shared engine/driver workload-spec tests.
-- Full standalone plugin tests, including malformed requests and authority checks.
-- Go → authenticated Unix socket → Python manager → real local Docker:
-  inspect, launch, exec with binary stdin, logs, typed missing-path error, cleanup.
-- Real local image build, inspect, workload file copy, and exact test-resource cleanup.
-- Real Qwen/vLLM TP2 n580/n610 native/recovery restore, exact streamed response,
-  normal Sparkrun logs/status/stop, and cache-cleared Docker-to-first-token measurements.
-
-The local smoke tests use a cached BusyBox image, no GPUs, no registry pushes,
-and generated test-only names. Enable them through `COLDSNAP_SOURCE_ROOT`,
-`COLDSNAP_GO`, and `COLDSNAP_TEST_DOCKER_IMAGE`; otherwise they skip explicitly.
-The GPU qualification stopped only its own measured test workloads and left
-pre-existing coordinator-only containers untouched.
+The root-module Go tests cover the shared engine/driver workload specifications
+and the controller's runtime boundary. Provider implementations also need
+authority, malformed-request, image/workload, and cancellation tests against
+their actual backend. The [reference plugin verification](sparkrun-integration.md#verification)
+records the Docker and GPU scenarios exercised by that implementation.

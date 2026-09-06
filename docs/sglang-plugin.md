@@ -25,7 +25,7 @@ is recreated in both modes.
 | `coldsnap-sglang` Python plugin | Registers final model storages, integrates SGLang memory regions, and places NCCL prepare/restore at the release/resume boundary. |
 | `coldsnap-sglang-adapter` | Validates requests and artifacts, prepares capsules and weight providers, and drives capture, restore, publish, and lifecycle operations. |
 | Adapter-supplied `coldsnap-engine-rank-n580` / `coldsnap-engine-rank-n610` | Run the driver-qualified node-local process transition and engine-specific HTTP activation sequence from a read-only, content-addressed mount. |
-| Sparkrun ColdSnap plugin | Detects hardware, prepares the derived image, distributes models and capsules, supplies host operations, and owns user-facing workflow. |
+| Placement manager | Supplies hardware and placement, stages images and payloads, and exposes authorized host operations. |
 
 Both Go adapter commands reuse engine-neutral orchestration under
 `internal/inferenceadapter`, with thin vLLM and SGLang entrypoints selecting
@@ -100,11 +100,10 @@ reusing the target model path.
 ## Image construction
 
 `deploy/sglang/Dockerfile` derives a ColdSnap-enabled image from a digest-pinned
-SGLang image. It installs the SGLang plugin, controller binaries, CRIU/CUDA
+SGLang image. It installs the SGLang plugin, in-container runtime binaries, CRIU/CUDA
 tools, native hydration support, and one immutable qualified NCCL provider.
 
-Sparkrun's `builder: coldsnap` selects `deploy/sglang/Dockerfile` when the
-materialized runtime is SGLang. The derived image advertises
+The derived image advertises
 `io.sparksq.coldsnap.runtime=sglang-cuda-criu-v1` and support for `n580` and `n610`.
 
 ## Configuration
@@ -136,9 +135,5 @@ go test ./cmd/coldsnap-sglang-adapter ./internal/snapshot \
   ./internal/inferenceadapter
 ```
 
-The target-only publish-ready TP2 recipe is
-`coldsnap-recipes/qwen3.8-27b-fp8-coldsnap-tp2-sglang.yaml`; the separately qualified
-speculative recipe is
-`coldsnap-recipes/qwen3.8-27b-nvfp4-dspark-coldsnap-tp2-sglang.yaml` in the companion
-[sparkrun-recipes](https://github.com/sparksq/sparkrun-recipes) repository,
-exposed through the plugin's `@coldsnap` registry.
+For recipe selection and local materialization, use the
+[Sparkrun recipe guide](sparkrun-recipes.md#materialization-by-engine).

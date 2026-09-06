@@ -15,7 +15,7 @@ manager capability, compatibility boundary, and remaining qualification work.
 
 ColdSnap is a layered snapshot system, not a single daemon:
 
-- a placement manager such as Sparkrun owns user intent, scheduling, hardware
+- a placement manager owns user intent, scheduling, hardware
   discovery, image/model staging, credentials, replacement ordering, and the
   transport used to reach GPU hosts;
 - the Go `coldsnap` controller owns strict operation contracts, receipts, and
@@ -46,7 +46,7 @@ required.
 
 | Term | Meaning |
 | --- | --- |
-| Manager | Placement-aware caller such as Sparkrun or a future Kubernetes operator. |
+| Manager | Placement-aware caller that implements the manager host-provider contract. |
 | Controller | The engine-neutral Go `coldsnap` executable. |
 | Engine adapter | A separate Go executable, `coldsnap-vllm-adapter` or `coldsnap-sglang-adapter`, that implements engine-selected distributed operations over shared orchestration. |
 | Snapshot process driver | The `n580` or `n610` Go orchestration and driver contract. This is not the runtime coordinator. |
@@ -77,7 +77,7 @@ flowchart TB
     User[User or automation]
 
     subgraph Manager[Placement manager - Python today]
-        SR[Sparkrun recipe, CLI, scheduler]
+        SR[Workload configuration and scheduler]
         ES[ColdSnap execution strategy]
         HP[Operation-scoped host provider]
         STAGE[Image, activation runtime, model, capsule, and payload staging]
@@ -116,7 +116,7 @@ flowchart TB
 There are two distinct control protocols:
 
 1. The manager host-provider protocol carries controller-to-host operations
-   over a private local Unix socket. Sparkrun implements the server and
+   over a private local Unix socket. The manager implements the server and
    ColdSnap implements the client. The manager decides how those operations
    reach a node.
 2. The CSKV coordinator protocol is a short-lived, authenticated TCP service
@@ -128,49 +128,13 @@ through host files, Docker/OCI, the Hugging Face Hub, or manager staging.
 
 ## Ownership by implementation language
 
-### Sparkrun: Python manager and user-facing surface
+### Placement manager
 
-The first-party Sparkrun plugin is the normal user interface. Its authoritative
-sources live under `src/sparkrun/plugins/coldsnap/` in the separate
-[sparkrun-coldsnap-plugin repository](https://github.com/sparksq/sparkrun-coldsnap-plugin).
-Sparkrun distributions vendor a pinned plugin snapshot, recorded by
-`vendor/coldsnap.lock` and packaged `VENDORED.toml` metadata. It owns:
-
-- the top-level `coldsnap:` recipe item and its typed validation;
-- `sparkrun coldsnap capture|publish-native|publish|materialize|restore|warm|sleep|wake|status|native-status|delete`;
-- selection of the ColdSnap execution strategy for ordinary `sparkrun run`;
-- cluster placement, topology construction, hardware probing, and selection of
-  the newest snapshot driver supported by every placed host;
-- the ColdSnap image builder on top of an exact digest-pinned engine image;
-- shared image preparation and distribution;
-- per-worker native-payload staging only onto the worker's owning host, full
-  first-use verification, cached validation evidence, and safe full-hash
-  revalidation when that evidence becomes stale;
-- pinned Hugging Face snapshot preparation only when recovery is selected;
-- identity-derived descriptor storage, atomic generation promotion, and
-  retention of the configured last N generations;
-- prepare-before-evict ordering through the reusable execution-strategy hooks;
-- canonical Sparkrun container names, labels, log paths, status, and stop
-  behavior after restore;
-- registry and Hugging Face credential ownership; and
-- the operation-scoped host-provider server.
-
-The provider uses Sparkrun's `HostSession` abstraction. That session may use
-SSH today, but this is a Sparkrun transport choice rather than an SSH call made
-by the ColdSnap adapter. The same provider protocol can sit over a Kubernetes
-node API, `exec`, a DaemonSet, or another manager transport.
-
-Sparkrun intentionally omits most policy defaults from a recipe. It sends only
-typed overrides and lets the selected ColdSnap driver resolve its own defaults.
-It does, however, own communication variables, offline-mode variables, and
-placement-specific values because those come from the live cluster plan.
-
-Remote storage policy is cluster-local rather than recipe identity. A cluster
-may set `sparkrun_cache_dir`; ColdSnap inherits its `coldsnap` child unless
-`plugins.coldsnap.state_root` overrides it. `plugins.coldsnap.io.recovery_read`
-can override filesystem-aware recovery `auto` for a qualified site. The
-existing cluster `cache_dir` remains the Hugging Face/model cache and is not
-overloaded for either purpose.
+The manager owns placement, host discovery, image and model staging, credentials,
+workload identity, and prepare-before-replace ordering. It supplies an
+operation-scoped host-provider and a complete strict request. It may be
+implemented in any language. Plugin-specific behavior belongs in the
+[Sparkrun plugin internals](sparkrun-integration.md).
 
 ### Go: contracts and distributed process orchestration
 
@@ -238,8 +202,7 @@ snapshot driver does not add a new coordination protocol or service.
 ### Container privilege and host ownership
 
 ColdSnap deliberately separates manager identity from checkpoint privilege.
-Sparkrun normally runs serving containers as the invoking unprivileged user.
-A ColdSnap rank container is the exception: its small controller remains root
+Its rank container controller remains root
 and privileged because CRIU, PID-tree inspection, CUDA checkpoint, device
 reset, and restored namespace construction require those capabilities. This
 does not make root the owner of ColdSnap's persistent host state.
@@ -250,8 +213,7 @@ binds only each exact ColdSnap-managed writable path and restores its ownership
 recursively to that UID/GID without changing captured mode bits. The same
 normalization covers capture roots, per-unit runtime-cache staging, cache-seed
 copies, failure diagnostics, and model-payload materialization, including
-failure and cancellation paths. Sparkrun retains an equivalent exact-path
-cleanup fallback for an interrupted or older adapter.
+failure and cancellation paths.
 
 Pinned Hugging Face snapshots and manager-resolved local model inputs are
 mounted read-only for manager-driven ColdSnap operations. The long-running
@@ -337,7 +299,7 @@ stored.
 Native-payload construction remains engine-owned because only the engine
 integration knows which live allocations and tensor layouts are model bytes.
 Admission is engine-neutral: both adapter binaries expose the same internal Go
-`payload-verify` operation from `internal/payloadvalidation`. Sparkrun stages
+`payload-verify` operation from `internal/payloadvalidation`. The manager stages
 the selected, architecture-matched adapter on each data-owning host and invokes
 that verifier for early admission; the Go adapter invokes the same staged
 binary again immediately before use. The helper alone defines full hashing,
@@ -367,8 +329,8 @@ requires a new capture.
 sequenceDiagram
     autonumber
     actor User
-    participant SR as Sparkrun
-    participant HP as Sparkrun host provider
+    participant SR as Placement manager
+    participant HP as Manager host provider
     participant C as coldsnap Go controller
     participant A as Engine adapter
     participant D as Docker on unit hosts
@@ -376,7 +338,7 @@ sequenceDiagram
     participant V as Engine plus ColdSnap plugin
     participant L as CRIU CUDA NCCL
 
-    User->>SR: sparkrun coldsnap capture recipe
+    User->>SR: Capture workload configuration
     SR->>SR: Resolve placement and probe all hosts
     SR->>SR: Select n580 or n610
     SR->>SR: Build and distribute digest-pinned runtime image
@@ -407,9 +369,9 @@ sequenceDiagram
 Capture never pushes capsules or native payloads. Publication is a separate
 promotion after acceptance.
 
-## Restore through `sparkrun run`
+## Restore sequence
 
-The prepare-only boundary is deliberately before normal Sparkrun replacement.
+The prepare-only boundary is deliberately before manager workload replacement.
 A missing capsule, incompatible host, invalid payload, or unavailable recovery
 snapshot must fail while the existing workload is still intact.
 
@@ -417,8 +379,8 @@ snapshot must fail while the existing workload is still intact.
 sequenceDiagram
     autonumber
     actor User
-    participant SR as Sparkrun execution strategy
-    participant HP as Sparkrun host provider
+    participant SR as Placement manager
+    participant HP as Manager host provider
     participant C as coldsnap Go controller
     participant A as Engine adapter
     participant D as Docker on unit hosts
@@ -426,7 +388,7 @@ sequenceDiagram
     participant V as Engine plus ColdSnap plugin
     participant K as CSKV coordinator
 
-    User->>SR: sparkrun run recipe with top-level coldsnap
+    User->>SR: Restore workload
     SR->>SR: Place units, probe hardware, and select one driver
     SR->>SR: Resolve local or OCI committed descriptor
     alt Verified native payloads available
@@ -468,10 +430,10 @@ sequenceDiagram
     V->>V: Remap and zero discarded KV
     V->>V: Run health and exact-response validation
     R-->>A: Publish restore-ready evidence
-    A->>HP: Expose canonical Sparkrun log path and lifecycle state
+    A->>HP: Expose manager log path and lifecycle state
     HP->>D: Execute exact container argv
     A-->>SR: Restore succeeded
-    SR-->>User: Normal Sparkrun workload identity
+    SR-->>User: Manager workload identity
 ```
 
 The portable TCP admission probe runs after the coordinator has claimed its
@@ -510,8 +472,8 @@ different compatibility and distribution scopes.
 sequenceDiagram
     autonumber
     actor User
-    participant SR as Sparkrun
-    participant HP as Sparkrun host provider
+    participant SR as Placement manager
+    participant HP as Manager host provider
     participant C as coldsnap Go controller
     participant A as vLLM Go adapter
     participant N as Capture unit host
@@ -519,7 +481,7 @@ sequenceDiagram
     participant HF as Hugging Face Hub
 
     alt Publish capsules
-        User->>SR: sparkrun coldsnap publish
+        User->>SR: Publish capsules
         SR->>C: Published-artifact request
         C->>A: Dispatch publish
         A->>HP: Verify local capsule on original unit host
@@ -528,7 +490,7 @@ sequenceDiagram
         A->>A: Commit descriptor with per-unit immutable OCI digests
         SR->>OCI: Publish small descriptor as OCI artifact
     else Publish native model payloads
-        User->>SR: sparkrun coldsnap publish-native
+        User->>SR: Publish native payloads
         SR->>C: Native-publication request
         C->>A: Dispatch publish-native
         A->>HP: Rehash each capture-local worker payload
@@ -543,7 +505,7 @@ sequenceDiagram
     SR-->>User: Promote new local descriptor generation
 ```
 
-Registry and Hub credentials remain in Sparkrun. They are not installed on the
+Registry and Hub credentials remain in the manager. They are not installed on the
 GPU hosts and are not serialized into requests or artifacts.
 
 ## Live sleep and wake
@@ -556,13 +518,13 @@ fixed memory floor stay resident.
 sequenceDiagram
     autonumber
     actor User
-    participant SR as Sparkrun
+    participant SR as Placement manager
     participant C as coldsnap and vLLM adapter
-    participant HP as Sparkrun host provider
+    participant HP as Manager host provider
     participant D as Active unit containers
     participant V as vLLM ColdSnap backend
 
-    User->>SR: sparkrun coldsnap sleep recipe
+    User->>SR: Sleep workload
     SR->>C: Strict sleep request for exact workload cluster
     C->>HP: Inspect labels, capture ID, and current state
     HP->>D: Execute exact container argv
@@ -572,7 +534,7 @@ sequenceDiagram
     V->>V: Unload weights and graphs, then discard KV payload
     V-->>C: Per-unit evidence
     C-->>SR: Durable sleeping report
-    User->>SR: sparkrun coldsnap wake recipe
+    User->>SR: Wake workload
     SR->>C: Strict wake request
     C->>HP: Request collective wake and hydration
     HP->>D: Execute lifecycle helper
@@ -614,8 +576,7 @@ private Unix socket. The adapter requires the socket and operation-scoped token
 for every lifecycle request. It has no SSH flags, SSH client, host discovery,
 node-agent client, or alternate provider selection.
 
-Sparkrun may use SSH inside its own `HostSession`; a Kubernetes operator may
-use exec or a DaemonSet. Those choices terminate at the manager-provider
+A manager may use SSH, a node API, exec, or a DaemonSet. Those choices terminate at the manager-provider
 boundary and never enter requests or artifacts. Rank coordination separately
 uses authenticated CSKV over TCP.
 
@@ -649,9 +610,8 @@ controllers, and benchmark reports are retained outside the public source tree.
 - Qwen TP2 native and recovery restores are qualified for vLLM and SGLang on
   n580 and n610. DeepSeek V4 Flash 0731 TP2 native and recovery are qualified
   for vLLM on both drivers. Broader topology coverage remains future work.
-- `sparkrun coldsnap delete` scopes local cleanup to the rendered recipe and
-  driver. Reachability-aware deletion of shared published native objects
-  remains future manager/distribution work.
+- Reachability-aware deletion of shared published native objects remains
+  future manager/distribution work.
 - A Kubernetes operator can use the current request/artifact/receipt and
   manager-provider protocols, but the node-agent-backed provider and
   reconciliation layer are not implemented yet.

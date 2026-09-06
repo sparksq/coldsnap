@@ -6,8 +6,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Manager host-provider protocol
 
-ColdSnap request execution is transport-neutral. A placement manager such as
-Sparkrun opens an operation-scoped host session through its own cluster
+ColdSnap request execution is transport-neutral. A placement manager opens an operation-scoped host session through its own cluster
 transport and exposes that session to the engine adapter over a local Unix
 socket. A future Kubernetes operator can implement the same protocol with a
 node API, exec subresource, or DaemonSet. ColdSnap 0.3.20 adds typed runtime
@@ -79,11 +78,10 @@ non-private socket, or response identity mismatch. Capabilities are
 operation-scoped: engine adapters require `exec` and `runtime-v1`; publication adds
 only the registry or Hugging Face capabilities it actually consumes.
 
-Credentials stay with the manager. Sparkrun removes Hugging Face tokens from
-the ColdSnap child environment and sends them only as stdin to the short-lived
-helper process performing the authenticated operation. Docker credentials are
-likewise supplied by the controller-side Docker client; they are not installed
-on cluster nodes.
+Registry and Hugging Face credentials stay with the manager. Its authenticated
+helpers must receive them through private, operation-scoped channels. These credentials must not
+enter ColdSnap child environments, workload metadata, or persistent GPU-host
+configuration. See the [reference credential handling](sparkrun-integration.md#credentials-and-host-storage).
 
 ## Typed runtime boundary
 

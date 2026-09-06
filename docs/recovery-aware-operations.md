@@ -67,89 +67,7 @@ barriers, NCCL checkpoint restore, recovery hydration, and the exact acceptance
 response. The capture boundary reported zero remaining NCCL IB devices, MRs,
 network references, and PD references.
 
-## Sparkrun recipes
-
-Sparkrun's ColdSnap plugin owns a top-level `coldsnap:` recipe item. The plugin
-parses, validates, and exports that item; it is not stored under `metadata` and
-does not leak into a runtime's unknown configuration fields.
-
-```yaml
-recipe_version: "2"
-model: Qwen/Qwen3.5-0.8B
-model_revision: <immutable-model-commit>
-runtime: vllm-distributed
-container: org/coldsnap-vllm@sha256:<image-digest>
-defaults:
-  tensor_parallel: 2
-
-coldsnap:
-  capsule:
-    repository: ghcr.io/example/qwen-coldsnap-capsules
-```
-
-This intentionally shows the useful minimum. The omitted process, weights,
-cache, and validation fields use the canonical defaults. Local artifact paths
-are managed by Sparkrun from the intent and recipe fingerprint. Publication
-also packages the small descriptor JSON as OCI in the capsule repository. A
-portable recipe may pin the returned reference explicitly:
-
-```yaml
-coldsnap:
-  artifact:
-    reference: oci://ghcr.io/example/qwen-coldsnap-capsules@sha256:<descriptor-digest>
-  capsule:
-    repository: ghcr.io/example/qwen-coldsnap-capsules
-```
-
-Without an explicit reference, the capture controller uses its promoted local
-generation and another controller falls back to the stable OCI descriptor tag
-derived from the capsule repository and recipe fingerprint.
-
-Sparkrun materializes its resolved placement and vLLM launch commands directly;
-there is no second ColdSnap profile file. Before a restore, it downloads and
-fully SHA-256 verifies worker packs concurrently on their owning unit hosts when
-no valid validation record exists. That first staging pass writes a versioned
-sidecar. Unchanged later restores validate the record plus device, inode, size,
-and mtime without rereading the large files. Missing or stale evidence is
-repaired by a full SHA-256 pass; ctime is diagnostic only. ColdSnap independently
-matches the record's digest to the committed artifact before choosing the
-provider.
-
-```bash
-sparkrun coldsnap capture recipe.yaml --cluster two-node
-sparkrun coldsnap publish-native recipe.yaml --cluster two-node \
-  --hf-repo example/qwen-native
-sparkrun coldsnap publish recipe.yaml --cluster two-node
-sparkrun coldsnap restore recipe.yaml --cluster two-node
-sparkrun coldsnap native-status recipe.yaml --cluster two-node
-sparkrun coldsnap restore recipe.yaml --cluster two-node --dry-run
-sparkrun run recipe.yaml --cluster two-node
-```
-
-The explicit restore remains a diagnostic/manual surface. Normal
-`sparkrun run` treats the presence of `coldsnap:` as recipe-local opt-in to the
-restore strategy. It fails before replacement when there is no committed
-local or OCI artifact. For `auto`, Sparkrun first stages optional model payloads, then
-invokes `coldsnap restore --prepare-only` to strictly validate the artifact and
-ensure its digest-pinned unit capsules are resident. Verified model payloads
-supersede normal model preparation; when they are unavailable, Sparkrun next
-prepares the pinned Hugging Face snapshot for safetensors recovery. Only a
-successful receipt can cross Sparkrun's later eviction hook and activate.
-
-An optional top-level request `workload` identity lets an orchestrator supply
-its canonical cluster, intent, recipe, runtime, model, and served-model values.
-The vLLM adapter then names restored containers `<cluster_id>_node_<unit-index>` and
-adds normal Sparkrun lifecycle labels. Direct ColdSnap requests may omit it.
-
-`--dry-run` renders the operation through the current recipe integration. Live
-capture, publication, and restore use the installed engine adapter:
-`coldsnap-vllm-adapter`/`COLDSNAP_VLLM_ADAPTER` or
-`coldsnap-sglang-adapter`/`COLDSNAP_SGLANG_ADAPTER`. The shared adapter is
-topology-neutral: it derives launch units, workers, ordered groups, services,
-hosts, device assignments, image identity, model identity, commands, and
-mounts entirely from the request. B12x
-behavior remains behind the vLLM plugin's storage-adapter extension points;
-the adapter contains no DS4F model cases.
+## Capture and publication
 
 Capture performs an exact validation request, writes a recovery residual and
 replay plan, optionally writes one model-only payload per worker while the CUDA
@@ -222,10 +140,9 @@ that pack selects the pinned safetensors replay plan. The serving unit performs 
 post-restore validation request before the adapter reports success.
 
 The adapter requires the manager host provider for host Docker and filesystem
-operations. Sparkrun serves that provider over a private
-operation-scoped Unix socket and may use SSH underneath its own cluster
-transport; ColdSnap itself sees only the provider contract. Any other caller
-must implement the same manager-provider protocol and generate the strict request consumed by
+operations. The manager serves that provider over a private
+operation-scoped Unix socket; ColdSnap sees only the provider contract. Every
+caller must implement that protocol and generate the strict request consumed by
 `coldsnap capture|publish-native|publish|restore|sleep|wake|status --request-json`.
 The native coordinator traffic used by restored ranks is authenticated CSKV.
 A future node service or Kubernetes provider can replace the manager's current
@@ -233,9 +150,9 @@ host transport without changing request or artifact formats.
 
 ## Runtime and capsule construction
 
-Build a ColdSnap-enabled vLLM base with `make vllm-runtime-image`, or use
-Sparkrun's `coldsnap` builder with a digest-pinned vLLM or SGLang recipe image.
-Both paths assemble the qualified CRIU, Go CRIU, CUDA checkpoint, and NCCL
+Build a ColdSnap-enabled base with `make vllm-runtime-image` or
+`make sglang-runtime-image` and a digest-pinned engine image.
+Both targets assemble the qualified CRIU, Go CRIU, CUDA checkpoint, and NCCL
 runtime inputs. See [`deploy/vllm/README.md`](../deploy/vllm/README.md) and
 [`deploy/sglang/README.md`](../deploy/sglang/README.md). The resulting image
 carries the capture-sensitive ColdSnap runtime. The matching engine adapter

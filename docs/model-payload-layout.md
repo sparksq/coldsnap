@@ -56,7 +56,7 @@ through the recovery-aware loader. Both paths therefore classify model-owned
 bytes from loader behavior rather than parameter names or driver-specific
 addresses.
 
-`coldsnap publish-native` and `sparkrun coldsnap publish-native` publish these
+`coldsnap publish-native` publishes these
 model payload objects. The command name describes the native restore provider;
 it does not mean the published object includes driver residual state.
 
@@ -94,12 +94,10 @@ restore reports success, while `off` disables it. SGLang defaults to `off` and
 rejects `async` or `required` because its integration does not yet implement
 the canonical model-payload writer; an already available native SGLang payload
 can still be staged and restored. This restriction concerns ordinary recovery
-restores, not explicit preparation: Sparkrun plugin 0.1.2 can build
-a complete SGLang local capture through its existing capture-time writer,
-verify it, and use that capture's paired pack and replay metadata. It neither
-rewrites the source descriptor nor splices a new pack into an old capsule.
-This explicit SGLang command uses ColdSnap 0.3.20; plugin v0.1.1 predates its
-support in the manager.
+restores, not explicit preparation: a fresh SGLang capture can use its
+capture-time writer to produce a paired pack and replay metadata. A new pack
+must not be spliced into an unrelated older capsule. The manager's explicit
+preparation workflow is documented in the [Sparkrun recipe guide](sparkrun-recipes.md#materialization-by-engine).
 
 The cache lives at
 `<remote-state-root>/model-payloads/sha256/<digest>.pack`; only the worker that
@@ -120,7 +118,7 @@ in the vLLM integration must be recaptured once; after that, missing published
 model payloads can be reconstructed from safetensors on any compatible node.
 
 The engine integration owns construction because it has the live allocation
-map. The shared Go payload verifier owns admission. Sparkrun and the Go adapter
+map. The shared Go payload verifier owns admission. The manager and Go adapter
 both invoke the same release-matched verifier on the data-owning host, so the
 full SHA-256, stable identity fields, and validation-record acceptance rules do
 not drift between manager and controller implementations.
@@ -134,19 +132,15 @@ capture. A manager can treat an explicit native-materialization operation as a
 one-time opportunity to capture target-local residual state after the shared
 model payload is present.
 
-Sparkrun compares the resulting artifact with the portable descriptor. The
-model-payload objects must have the same owner, role, size, and SHA-256; they
-remain shared and are never copied into the overlay. If the capsule and replay
-objects are also identical, the temporary capture is discarded. Otherwise,
-Sparkrun stores a local overlay descriptor bound to the portable descriptor,
-snapshot driver, rank-ordered manager host identities, accelerator inventory,
-and exact installed NVIDIA driver versions. Ordinary restore selects it only on
-the same matching target that owns the local capsule images. Missing, stale, or
-invalid overlay metadata falls back to the portable artifact.
+An overlay must preserve the portable descriptor's model-payload owner, role,
+size, and SHA-256. Its residuals and capsule remain target-local and must not be
+treated as portable merely because the model bytes match. A manager that caches
+overlays must bind them to the source descriptor, snapshot driver, ordered
+placement, accelerator inventory, and exact installed driver versions, and
+fall back to the portable artifact when those bindings no longer match.
 
-This is an acceleration cache, not a new portable publication. Its target-local
-capsules and residual maps can change after a driver/runtime update and are
-removed with the recipe's local ColdSnap artifacts.
+The reference implementation's selection and storage rules are documented in
+[Sparkrun plugin internals](sparkrun-integration.md#target-local-residual-overlays).
 
 ## Sharing boundary
 

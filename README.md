@@ -97,7 +97,7 @@ Choose a recipe qualified for your hardware and placement. `materialize`
 prepares published artifacts and may perform a verification restore; it is not
 a startup benchmark. To create your own capsule instead, use
 `sparkrun coldsnap capture recipe.yaml --cluster two-node` with a fully pinned
-recipe as described in [basic usage](docs/usage.md#sparkrun-usage).
+recipe as described in [Sparkrun reference](docs/sparkrun-usage.md).
 
 `sparkrun run` automatically chooses the ColdSnap execution strategy, prepares and
 verifies capsules and optional native payloads, and replaces the serving workload

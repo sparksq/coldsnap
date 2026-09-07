@@ -213,6 +213,9 @@ jobs:
           digest="$(python3 -c 'import json; print(json.load(open("macos-layout/index.json"))["manifests"][0]["digest"])')"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           for blob in macos-layout/blobs/sha256/*; do
+            # Register manifests through the manifest API, never as blobs:
+            # some registries otherwise report a false-positive manifest HEAD.
+            [ "${blob##*/}" = "${digest#sha256:}" ] && continue
             oras blob push "$BINARY_IMAGE" "$blob"
           done
           oras manifest push "$BINARY_IMAGE@$digest" "macos-layout/blobs/sha256/${digest#sha256:}"

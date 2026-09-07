@@ -180,6 +180,12 @@ class BinaryBundleWorkflowTest(unittest.TestCase):
         for expected in ("macos-15-intel", "runner: macos-15", "go test -count=1 ./...", "--os darwin"):
             self.assertIn(expected, native)
 
+    def test_macos_manifest_is_registered_only_through_manifest_api(self):
+        workflow = (ROOT / ".github/workflows/build-docker.yml").read_text()
+        skip = '[ "${blob##*/}" = "${digest#sha256:}" ] && continue'
+        self.assertLess(workflow.index(skip), workflow.index('oras blob push "$BINARY_IMAGE" "$blob"'))
+        self.assertIn('oras manifest push "$BINARY_IMAGE@$digest"', workflow)
+
 
 class MacOSBundleTest(unittest.TestCase):
     def test_package_platform_identity_inventory_and_repeatability(self):

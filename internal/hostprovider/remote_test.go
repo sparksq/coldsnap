@@ -7,12 +7,14 @@ package hostprovider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sparksq/coldsnap/internal/hostops"
 )
@@ -24,6 +26,8 @@ type providerHarness struct {
 	session  string
 	mutex    sync.Mutex
 	requests []Request
+	blocked  chan struct{}
+	release  chan struct{}
 }
 
 func newProviderHarness(t *testing.T) *providerHarness {
@@ -40,8 +44,12 @@ func newProviderHarness(t *testing.T) *providerHarness {
 	if err := os.Chmod(socket, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	harness := &providerHarness{t: t, listener: listener, token: "secret", session: "operation-1"}
+	harness := &providerHarness{
+		t: t, listener: listener, token: "secret", session: "operation-1",
+		blocked: make(chan struct{}, 1), release: make(chan struct{}),
+	}
 	t.Cleanup(func() { _ = listener.Close() })
+	t.Cleanup(func() { close(harness.release) })
 	go harness.serve()
 	return harness
 }
@@ -66,6 +74,11 @@ func (harness *providerHarness) handle(connection net.Conn) {
 	harness.mutex.Lock()
 	harness.requests = append(harness.requests, request)
 	harness.mutex.Unlock()
+	if slices.Contains(request.Arguments, "blocked") || (request.Runtime != nil && request.Runtime.Image == "registry/blocked") {
+		harness.blocked <- struct{}{}
+		<-harness.release
+		return
+	}
 	response := Response{Format: ProtocolFormat, ID: request.ID, OK: true}
 	if request.Token != harness.token || request.Session != harness.session {
 		response.OK, response.Error = false, "unauthorized provider session"
@@ -120,6 +133,58 @@ func TestManagerProviderPreservesArgumentsInputAndFailures(t *testing.T) {
 	if request.Host != "node-a" || !slices.Equal(request.Arguments, []string{"command", "space separated", "*.json"}) ||
 		string(request.Input) != "payload\n" {
 		t.Fatalf("provider request = %#v", request)
+	}
+}
+
+func TestProviderCancellation(t *testing.T) {
+	for _, mode := range []string{"exec", "pull", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			harness := newProviderHarness(t)
+			remote := harness.remote(t)
+			parent := context.Background()
+			if mode == "deadline" {
+				var stop context.CancelFunc
+				parent, stop = context.WithTimeout(parent, time.Minute)
+				defer stop()
+			}
+			ctx, cancel := context.WithCancel(parent)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				if mode == "exec" {
+					_, err = remote.Run(ctx, "node-a", "blocked")
+				} else {
+					_, err = remote.Runtime(ctx, "node-a", hostops.RuntimeRequest{
+						Action: hostops.RuntimeImagePull, Image: "registry/blocked",
+					})
+				}
+				done <- err
+			}()
+			select {
+			case <-harness.blocked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("provider did not receive the request")
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancelled request returned %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("provider read did not stop on cancellation")
+			}
+			// Cancellation must only close this call, not the provider needed
+			// for subsequent operation-owned cleanup.
+			cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			defer stop()
+			if _, err := remote.Runtime(cleanup, "node-a", hostops.RuntimeRequest{
+				Action: hostops.RuntimeWorkloadRemove, Name: "operation-owned",
+			}); err != nil {
+				t.Fatalf("cleanup after cancellation: %v", err)
+			}
+		})
 	}
 }
 

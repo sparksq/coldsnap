@@ -69,9 +69,17 @@ channel.
 
 ## Lifetime and failure behavior
 
-Provider calls may be concurrent. Cancelling the ColdSnap process must close
-the provider and terminate provider-owned child sessions so long-running image
-or file operations are not orphaned. The provider must fail closed for an
+Provider calls may be concurrent. Cancelling a call closes its individual
+connection and interrupts the client's blocked I/O; it does not close the
+provider or imply that a remote mutation was rolled back. Keep the provider
+and transport available until the controller and adapter finish operation-owned
+cleanup, then close the provider and terminate provider-owned child sessions
+so long-running image or file clients are not orphaned. Closing those clients
+does not guarantee that a remote runtime daemon immediately stops a transfer.
+See [cancellation and coordinator ownership](operator-integration.md#cancellation-and-coordinator-ownership)
+for release compatibility and forced termination.
+
+The provider must fail closed for an
 unknown capability, mismatched token/session, unrecognized host, malformed
 binary encoding, unknown JSON field, trailing message, oversized message,
 non-private socket, or response identity mismatch. Capabilities are

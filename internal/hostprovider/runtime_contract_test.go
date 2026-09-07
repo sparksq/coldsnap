@@ -9,11 +9,38 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/signal"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/sparksq/coldsnap/internal/hostops"
 )
+
+// The plugin runs this child while its provider deliberately holds an image
+// pull open. SIGTERM must interrupt the call and still allow fresh cleanup RPCs.
+func TestManagerPullCancellationContract(t *testing.T) {
+	if os.Getenv("COLDSNAP_TEST_CANCEL_PULL") != "1" {
+		t.Skip("requires the Python manager cancellation test")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	remote, err := New(ctx, os.Getenv("COLDSNAP_HOST_PROVIDER_SOCKET"), os.Getenv("COLDSNAP_HOST_PROVIDER_TOKEN"), "operation-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = remote.Runtime(ctx, "node-a", hostops.RuntimeRequest{
+		Action: hostops.RuntimeImagePull, Image: "registry/blocked",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted pull returned %v", err)
+	}
+	cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer stop()
+	if _, err := remote.Run(cleanup, "node-a", "cleanup"); err != nil {
+		t.Fatalf("cleanup after interrupted pull: %v", err)
+	}
+}
 
 // The Python provider suite drives this against both a recording backend and
 // an opt-in local Docker backend, exercising the actual wire contract.

@@ -252,16 +252,24 @@ func (remote *Remote) call(ctx context.Context, request Request) (Response, erro
 		return Response{}, fmt.Errorf("connect host provider: %w", err)
 	}
 	defer connection.Close()
+	// DialContext only observes cancellation while connecting. Interrupt an
+	// in-flight read/write as well (for example a long manager-owned image
+	// pull), without closing the provider needed by fresh cleanup contexts.
+	stopCancellation := context.AfterFunc(ctx, func() { _ = connection.Close() })
+	defer stopCancellation()
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = connection.SetDeadline(deadline)
 	}
 	if _, err := connection.Write(append(payload, '\n')); err != nil {
-		return Response{}, fmt.Errorf("send host provider request: %w", err)
+		return Response{}, fmt.Errorf("send host provider request: %w", errors.Join(ctx.Err(), err))
 	}
 	if unix, ok := connection.(*net.UnixConn); ok {
 		_ = unix.CloseWrite()
 	}
 	reply, err := io.ReadAll(io.LimitReader(connection, maximumMessageSize+1))
+	if ctx.Err() != nil {
+		return Response{}, fmt.Errorf("read host provider response: %w", ctx.Err())
+	}
 	if err != nil {
 		return Response{}, fmt.Errorf("read host provider response: %w", err)
 	}

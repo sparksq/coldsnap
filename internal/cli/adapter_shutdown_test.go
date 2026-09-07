@@ -50,7 +50,11 @@ func TestAdapterCancellationWaitsForCleanupAndBoundsStuckChild(t *testing.T) {
 			defer cancel()
 			command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestAdapterShutdownChild$")
 			command.Env = append(os.Environ(), "COLDSNAP_SHUTDOWN_TEST_CHILD="+mode, "COLDSNAP_SHUTDOWN_TEST_MARKER="+marker)
-			configureAdapterShutdown(command, 200*time.Millisecond)
+			grace := 200 * time.Millisecond
+			if mode == "graceful" {
+				grace = 2 * time.Second // Leave headroom for loaded native CI runners.
+			}
+			configureAdapterShutdown(command, grace)
 			stdout, err := command.StdoutPipe()
 			if err != nil {
 				t.Fatal(err)

@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: 2026 Scitrera LLC
+# SPDX-FileCopyrightText: 2026 Fox Engine Ltd
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Repository-owned: native controller qualification, not a GPU/runtime build.
+name: macOS controllers
+on:
+  push:
+    branches: ['main', 'feature/**', 'release/**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: macos-15-intel}
+          - {arch: arm64, runner: macos-15}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: Native controller tests and cancellation cleanup
+        env:
+          TMPDIR: /tmp
+        run: |
+          go vet ./...
+          go test -count=1 ./...
+      - name: Build, package and execute native controllers
+        env:
+          ARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/update-versions.py --print-version coldsnap)"
+          commit="$(git rev-parse HEAD)"
+          bundle="$RUNNER_TEMP/bundle"
+          mkdir -p "$bundle"
+          flags="-s -w -buildid= -X github.com/sparksq/coldsnap/internal/buildinfo.Version=$version -X github.com/sparksq/coldsnap/internal/buildinfo.Commit=$commit"
+          go build -trimpath -ldflags "$flags" -o "$bundle/" ./cmd/coldsnap ./cmd/coldsnap-vllm-adapter ./cmd/coldsnap-sglang-adapter
+          python3 scripts/package-macos-bundle.py "$bundle" "$RUNNER_TEMP/macos-layout" \
+            --version "$version" --commit "$commit" --arch "$ARCH"
+          python3 scripts/verify-binary-bundle.py "$bundle" \
+            --version "$version" --commit "$commit" --arch "$ARCH" --os darwin
+          "$bundle/coldsnap-vllm-adapter" version --json
+          "$bundle/coldsnap-sglang-adapter" version --json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-binary-layout-${{ matrix.arch }}
+          path: ${{ runner.temp }}/macos-layout/
+          if-no-files-found: error
+          retention-days: 7

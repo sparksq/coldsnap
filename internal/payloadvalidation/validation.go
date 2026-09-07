@@ -256,10 +256,11 @@ func identities(stat os.FileInfo) (ContentIdentity, DiagnosticIdentity, error) {
 	if !ok {
 		return ContentIdentity{}, DiagnosticIdentity{}, errors.New("model payload stat identity is unavailable")
 	}
+	mtime, ctime := statTimes(raw)
 	return ContentIdentity{
-			Device: uint64(raw.Dev), Inode: raw.Ino, Size: raw.Size, MTimeNS: raw.Mtim.Nano(),
+			Device: uint64(raw.Dev), Inode: raw.Ino, Size: raw.Size, MTimeNS: mtime,
 		}, DiagnosticIdentity{
-			CTimeNS: raw.Ctim.Nano(), UID: raw.Uid, GID: raw.Gid, Mode: uint32(stat.Mode().Perm()),
+			CTimeNS: ctime, UID: raw.Uid, GID: raw.Gid, Mode: uint32(stat.Mode().Perm()),
 		}, nil
 }
 

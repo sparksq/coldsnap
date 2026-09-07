@@ -47,7 +47,7 @@ ci:
     lint: none
     test_args: "-count=1"
     verify_tag_version: coldsnap
-    binary_platforms: [linux/amd64, linux/arm64]
+    binary_platforms: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64]
     binaries:
       - name: coldsnap
         project: coldsnap
@@ -66,6 +66,7 @@ ci:
         extra_files: [LICENSE, THIRD_PARTY_NOTICES.md]
       - name: coldsnap-criu-rpc
         project: coldsnap-criu-rpc
+        platforms: [linux/amd64, linux/arm64]
         package: .
         ldflags: -s -w -buildid=
         extra_files: [LICENSE, THIRD_PARTY_NOTICES.md]

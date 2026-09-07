@@ -150,10 +150,10 @@ class BinaryBundleWorkflowTest(unittest.TestCase):
         self.assertNotIn("DOCKERHUB_USERNAME", workflow)
         self.assertNotIn("publish_dockerhub", workflow)
         self.assertNotIn("packages: write", workflow)
-        self.assertEqual(workflow.count("id-token: write"), 2)
-        self.assertEqual(workflow.count("DOCKERHUB_OIDC_CONNECTIONID:"), 2)
-        self.assertEqual(workflow.count("14f6b5b4-89d1-444f-911b-98df94b7ac9d"), 2)
-        for job in ("build", "publish"):
+        self.assertEqual(workflow.count("id-token: write"), 3)
+        self.assertEqual(workflow.count("DOCKERHUB_OIDC_CONNECTIONID:"), 3)
+        self.assertEqual(workflow.count("14f6b5b4-89d1-444f-911b-98df94b7ac9d"), 3)
+        for job in ("build", "macos-push", "publish"):
             block = re.split(r"\n  [a-z][a-z-]*:\n", workflow.split(f"\n  {job}:\n", 1)[1])[0]
             self.assertIn("id-token: write", block)
 
@@ -165,11 +165,50 @@ class BinaryBundleWorkflowTest(unittest.TestCase):
         self.assertNotIn("github.sha", workflow)
         self.assertIn("context: release-source", workflow)
         self.assertIn("python3 scripts/verify-binary-bundle.py", workflow)
-        self.assertIn("needs: [release-version, build]", workflow)
+        self.assertIn("needs: [release-version, build, macos-push]", workflow)
         self.assertIn("already exists; refusing to replace", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertNotIn("eval ", workflow)
         self.assertNotIn("value=latest", workflow)
+
+    def test_macos_is_native_tested_and_joins_same_release_index(self):
+        workflow = (ROOT / ".github/workflows/build-docker.yml").read_text()
+        self.assertIn("uses: ./.github/workflows/test-macos.yml", workflow)
+        self.assertIn('"$BINARY_IMAGE@$darwin_amd64" "$BINARY_IMAGE@$darwin_arm64"', workflow)
+        self.assertNotIn("coldsnap-binaries-macos", workflow)
+        native = (ROOT / ".github/workflows/test-macos.yml").read_text()
+        for expected in ("macos-15-intel", "runner: macos-15", "go test -count=1 ./...", "--os darwin"):
+            self.assertIn(expected, native)
+
+
+class MacOSBundleTest(unittest.TestCase):
+    def test_package_platform_identity_inventory_and_repeatability(self):
+        spec = importlib.util.spec_from_file_location("package_macos_bundle", ROOT / "scripts/package-macos-bundle.py")
+        package = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(package)
+        for arch in ("amd64", "arm64"):
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                for name in package.BINARIES:
+                    data = bytearray(32)
+                    data[:4] = b"\xcf\xfa\xed\xfe"
+                    data[4:8] = bundle.MACHO_CPUS[arch].to_bytes(4, "little")
+                    data[12:16] = (2).to_bytes(4, "little")
+                    (root / name).write_bytes(data)
+                options = dict(version="0.3.22", commit="a" * 40, arch=arch, source=ROOT)
+                digest = package.package(root, root / "layout-one", **options)
+                self.assertEqual(digest, package.package(root, root / "layout-two", **options))
+                bundle.verify(root, version="0.3.22", commit="a" * 40, arch=arch, os_name="darwin", execute=False)
+                index = json.loads((root / "layout-one/index.json").read_text())
+                self.assertEqual(index["manifests"][0]["platform"], {"os": "darwin", "architecture": arch})
+                manifest = json.loads((root / "manifest.json").read_text())
+                self.assertNotIn("coldsnap-criu-rpc", manifest["sha256"])
+                # A checksum match cannot disguise the other CPU's executable.
+                wrong = "arm64" if arch == "amd64" else "amd64"
+                manifest["platform"] = "darwin-" + wrong
+                (root / "manifest.json").write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, "Mach-O"):
+                    bundle.verify(root, version="0.3.22", commit="a" * 40, arch=wrong, os_name="darwin", execute=False)
 
 
 if __name__ == "__main__":

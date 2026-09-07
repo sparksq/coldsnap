@@ -160,6 +160,17 @@ existing output.
 
 ## Orchestrator responsibilities
 
+### Controller and target platforms
+
+The CLI and both engine adapters run on the manager's control node, using
+Linux or macOS binaries for that node's AMD64/ARM64 platform. Their authenticated
+Unix-socket provider and POSIX cancellation contract apply on both systems.
+GPU targets remain Linux. A manager on macOS must supply the release-matched
+Linux `COLDSNAP_TARGET_PAYLOAD_VERIFIER` and `COLDSNAP_TARGET_CRIU_RPC` files;
+same CPU architecture does not make a Mach-O controller usable as an ELF worker.
+The Sparkrun plugin acquires these independently. Native Windows requires a
+separate IPC/process-lifecycle port and is not supported.
+
 ### Cancellation and coordinator ownership
 
 The adapter owns its operation's short-lived coordinator and endpoint files.

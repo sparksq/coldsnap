@@ -75,6 +75,12 @@ whole placement, so heterogeneous hosts use one common snapshot method.
 
 ## Quick start
 
+Control nodes may run Linux or macOS on AMD64 or ARM64. The controller and
+engine adapters run natively on the control node; GPU workloads, CRIU, and
+remote payload verification still require qualified Linux targets. Native
+Windows controllers are not supported. See [controller binary bundles](deploy/binaries/README.md)
+for release assets and platform-aware OCI acquisition.
+
 The examples below require Sparkrun with the first-party
 [ColdSnap plugin](https://github.com/sparksq/sparkrun-coldsnap-plugin). The plugin
 is developed separately; a plain Sparkrun installation may not include this

@@ -191,14 +191,14 @@ The controller forwards cancellation to its adapter with SIGTERM, allowing up
 to four minutes for existing cleanup/ownership-repair budgets before forcing
 termination. The Sparkrun plugin places the controller tree in a separate
 process group, forwards manager cancellation, and waits up to five minutes
-before closing the provider. The plugin development revision adds an explicit
+before closing the provider. Plugin 0.1.6 adds an explicit
 escape hatch: a second Ctrl-C (or repeated SIGTERM) immediately forces the
 controller tree to terminate. Plugin 0.1.5 instead ignores repeated interrupts
 during its grace period. Forced termination is reported as **cleanup unconfirmed**,
 not success; unreachable hosts, SIGKILL, or manager crashes can still require
 manual recovery scoped to the exact operation-owned containers.
 
-The controller development revision also closes an individual host-provider
+ColdSnap 0.3.23 also closes an individual host-provider
 connection when its call context is cancelled, waking blocked reads/writes
 without shutting down the provider. Fresh, bounded cleanup contexts can still
 use it. ColdSnap 0.3.22 lacks this cancellation wakeup and can wait on a capsule

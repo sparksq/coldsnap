@@ -160,6 +160,37 @@ existing output.
 
 ## Orchestrator responsibilities
 
+### Cancellation and coordinator ownership
+
+The adapter owns its operation's short-lived coordinator and endpoint files.
+It cleans them up after successful use, after failed startup (including a lost
+launch reply or partial endpoint distribution), and when the operation is
+cancelled. Cleanup uses an uncancelled, bounded context and reports failures
+with the exact workload/endpoint and host. A cleanup failure makes the operation
+fail; an incompletely cleaned restore attempt is not automatically retried.
+Failed restore units and temporary capture units are also removed, while
+successful serving restores remain running. Reusable artifacts are retained.
+
+A manager must keep its host-provider server and transport session alive until
+the controller **and its adapter child** have finished remote cleanup. Closing
+the socket as soon as the manager receives an interrupt prevents even an
+uncancelled adapter cleanup context from reaching the target hosts.
+
+The controller forwards cancellation to its adapter with SIGTERM, allowing up
+to four minutes for existing cleanup/ownership-repair budgets before forcing
+termination. The Sparkrun plugin places the controller tree in a separate
+process group, forwards manager cancellation, and waits up to five minutes
+before closing the provider. Repeated SIGINT/SIGTERM during that bounded wait
+do not abort cleanup. A forced timeout is reported as **cleanup unconfirmed**,
+not success; unreachable hosts, SIGKILL, or manager crashes can still require
+manual recovery scoped to the exact operation-owned containers.
+
+These guarantees require the matching controller and plugin shutdown changes;
+an older controller's immediate adapter kill bypasses adapter cleanup. A normal
+Sparkrun serving-container stop is not a substitute for coordinator teardown.
+
+### Placement and lifecycle responsibilities
+
 ColdSnap does not own scheduling or global cluster state. The caller owns:
 
 - placement and stable launch-unit/worker identities;

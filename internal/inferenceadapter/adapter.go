@@ -445,7 +445,7 @@ func (adapter Adapter) configured(request snapshot.Request) (Adapter, error) {
 	return adapter, nil
 }
 
-func (adapter Adapter) captureN610(ctx context.Context, request snapshot.Request) error {
+func (adapter Adapter) captureN610(ctx context.Context, request snapshot.Request) (operationErr error) {
 	if err := operationtiming.Measure(ctx, "compatibility.verify_hosts", nil, func(phase context.Context) error {
 		return adapter.verifySnapshotDriverHosts(phase, request)
 	}); err != nil {
@@ -484,13 +484,15 @@ func (adapter Adapter) captureN610(ctx context.Context, request snapshot.Request
 	if err != nil {
 		return err
 	}
-	defer adapter.cleanupCoordinator(ctx, request, endpointPaths, coordinatorName)
+	defer func() {
+		operationErr = errors.Join(operationErr, adapter.cleanupCoordinator(ctx, request, endpointPaths, coordinatorName))
+	}()
 
 	roots := make([]string, len(request.Launch.Units))
 	containers := make([]string, len(request.Launch.Units))
 	ownershipNormalized := false
 	defer func() {
-		adapter.removeContainers(ctx, request, containers)
+		operationErr = errors.Join(operationErr, adapter.removeContainers(ctx, request, containers))
 		if !ownershipNormalized {
 			adapter.normalizeCapturePathOwnershipBestEffort(ctx, request, roots)
 		}
@@ -621,7 +623,7 @@ func (adapter Adapter) restore(ctx context.Context, request snapshot.Request) er
 			return nil
 		}
 		var transient *transientNCCLRestoreError
-		if attempt >= restoreNCCLRetryLimit || !errors.As(err, &transient) {
+		if attempt >= restoreNCCLRetryLimit || errors.Is(err, errCleanupIncomplete) || !errors.As(err, &transient) {
 			return err
 		}
 		fmt.Fprintf(
@@ -636,7 +638,7 @@ func (adapter Adapter) restore(ctx context.Context, request snapshot.Request) er
 	}
 }
 
-func (adapter Adapter) restoreAttempt(ctx context.Context, request snapshot.Request) error {
+func (adapter Adapter) restoreAttempt(ctx context.Context, request snapshot.Request) (operationErr error) {
 	prepared, err := operationtiming.MeasureValue(ctx, "restore.prepare", nil, func(phase context.Context) (restorePreparation, error) {
 		return adapter.prepareRestore(phase, request)
 	})
@@ -666,7 +668,16 @@ func (adapter Adapter) restoreAttempt(ctx context.Context, request snapshot.Requ
 	}
 	// The restored service no longer consults the coordinator after every rank
 	// has published restore-ready, so successful completion stops it below.
-	defer adapter.cleanupCoordinator(ctx, request, endpointPaths, coordinatorName)
+	containers := make([]string, len(request.Launch.Units))
+	defer func() {
+		cleanupErr := adapter.cleanupCoordinator(ctx, request, endpointPaths, coordinatorName)
+		if cleanupErr != nil && operationErr == nil {
+			// An activation whose cleanup failed must not be left serving after
+			// the manager receives a failed operation receipt.
+			cleanupErr = errors.Join(cleanupErr, adapter.removeContainers(ctx, request, containers))
+		}
+		operationErr = errors.Join(operationErr, cleanupErr)
+	}()
 	portShift := uint16(0)
 	if len(prepared.tcpAddressMap) != 0 {
 		portShift, err = operationtiming.MeasureValue(ctx, "network.port_select", nil, func(phase context.Context) (uint16, error) {
@@ -679,7 +690,6 @@ func (adapter Adapter) restoreAttempt(ctx context.Context, request snapshot.Requ
 		}
 	}
 	nativeByWorker := preparedPayloadsByWorker(selection.ModelPayloads)
-	containers := make([]string, len(request.Launch.Units))
 	if err := operationtiming.Measure(ctx, "units.launch", nil, func(phase context.Context) error {
 		return parallelUnits(request.Launch.Units, func(unit snapshot.LaunchUnit) error {
 			return operationtiming.Measure(phase, "unit.launch", map[string]string{
@@ -709,17 +719,17 @@ func (adapter Adapter) restoreAttempt(ctx context.Context, request snapshot.Requ
 				if err != nil {
 					return err
 				}
+				// A failed/cancelled RPC may still have created the container.
+				containers[unit.Index] = name
 				if _, err := adapter.runWorkload(unitContext, unit.Host, command, true); err != nil {
 					return fmt.Errorf("launch restore unit %s: %w", unit.ID, err)
 				}
-				containers[unit.Index] = name
 				return nil
 			})
 		})
 	}); err != nil {
 		adapter.collectFailureLogs(ctx, request, containers)
-		adapter.removeContainers(ctx, request, containers)
-		return err
+		return errors.Join(err, adapter.removeContainers(ctx, request, containers))
 	}
 	if err := operationtiming.Measure(ctx, "units.ready", nil, func(phase context.Context) error {
 		if err := adapter.waitRestore(phase, request, containers); err != nil {
@@ -731,24 +741,21 @@ func (adapter Adapter) restoreAttempt(ctx context.Context, request snapshot.Requ
 		return nil
 	}); err != nil {
 		adapter.collectFailureLogs(ctx, request, containers)
-		adapter.removeContainers(ctx, request, containers)
-		return err
+		return errors.Join(err, adapter.removeContainers(ctx, request, containers))
 	}
 	if prepared.materializationMode == "required" && lifecycleActivationState(request) != "warm" {
 		if err := operationtiming.Measure(ctx, "materialization.verify", nil, func(phase context.Context) error {
 			return adapter.verifyMaterializedModelPayloads(phase, request, prepared.materialize)
 		}); err != nil {
 			adapter.collectFailureLogs(ctx, request, containers)
-			adapter.removeContainers(ctx, request, containers)
-			return err
+			return errors.Join(err, adapter.removeContainers(ctx, request, containers))
 		}
 	}
 	if err := operationtiming.Measure(ctx, "workload.logs", nil, func(phase context.Context) error {
 		return adapter.exposeWorkloadLogs(phase, request, containers)
 	}); err != nil {
 		adapter.collectFailureLogs(ctx, request, containers)
-		adapter.removeContainers(ctx, request, containers)
-		return err
+		return errors.Join(err, adapter.removeContainers(ctx, request, containers))
 	}
 	state := lifecycleActivationState(request)
 	if artifact.Driver.ID == snapshotdriver.N580 {
@@ -756,16 +763,14 @@ func (adapter Adapter) restoreAttempt(ctx context.Context, request snapshot.Requ
 			return adapter.synchronizeRestoreLifecycleEvidence(phase, request, artifact, containers, state)
 		}); err != nil {
 			adapter.collectFailureLogs(ctx, request, containers)
-			adapter.removeContainers(ctx, request, containers)
-			return err
+			return errors.Join(err, adapter.removeContainers(ctx, request, containers))
 		}
 	}
 	if err := operationtiming.Measure(ctx, "lifecycle.persist", nil, func(phase context.Context) error {
 		return adapter.writeRestoreLifecycleState(phase, request, artifact, containers, state)
 	}); err != nil {
 		adapter.collectFailureLogs(ctx, request, containers)
-		adapter.removeContainers(ctx, request, containers)
-		return err
+		return errors.Join(err, adapter.removeContainers(ctx, request, containers))
 	}
 	if state == "warm" {
 		fmt.Fprintf(adapter.Output, "ColdSnap warm with %s weights pending hydration: %s\n", selection.Provider, selection.Reason)
@@ -1395,7 +1400,7 @@ func restoreContainerName(request snapshot.Request, rank int) string {
 
 func (adapter Adapter) startCoordinator(
 	ctx context.Context, request snapshot.Request, namespace, image string,
-) ([]string, string, error) {
+) (_ []string, _ string, operationErr error) {
 	rank0 := request.Launch.Units[0]
 	if image == "" {
 		image = rank0.Image
@@ -1406,7 +1411,9 @@ func (adapter Adapter) startCoordinator(
 	}
 	endpoint := filepath.Join(root, "coordinator.endpoint")
 	name := operationName(namespace, "coordinator")
-	_, _ = adapter.removeWorkload(ctx, rank0.Host, name)
+	if _, err := adapter.removeWorkload(ctx, rank0.Host, name); err != nil {
+		return nil, "", fmt.Errorf("remove prior operation coordinator %s on %s: %w", name, rank0.Host, err)
+	}
 	uid, err := adapter.Remote.Run(ctx, rank0.Host, "id", "-u")
 	if err != nil {
 		return nil, "", fmt.Errorf("resolve coordinator uid: %w", err)
@@ -1419,6 +1426,17 @@ func (adapter Adapter) startCoordinator(
 	if err != nil {
 		return nil, "", err
 	}
+	// Register every exact endpoint before launch/staging: either RPC can fail
+	// after its remote side effect, and callers only own a successful startup.
+	paths := make([]string, len(request.Launch.Units))
+	for _, rank := range request.Launch.Units {
+		paths[rank.Index] = endpoint
+	}
+	defer func() {
+		if operationErr != nil {
+			operationErr = errors.Join(operationErr, adapter.cleanupCoordinator(ctx, request, paths, name))
+		}
+	}()
 	spec := &hostops.WorkloadSpec{
 		Name: name, Image: image, Detached: true, Network: "host", User: user,
 		Mounts:     []hostops.Mount{{Source: root, Target: "/run/coldsnap"}},
@@ -1443,7 +1461,6 @@ func (adapter Adapter) startCoordinator(
 	if len(payload) == 0 {
 		return nil, "", errors.New("native ColdSnap coordinator did not publish its endpoint")
 	}
-	paths := make([]string, len(request.Launch.Units))
 	for _, rank := range request.Launch.Units {
 		peerRoot := filepath.Join(adapter.StateRoot, "operations", namespace)
 		peerEndpoint := filepath.Join(peerRoot, "coordinator.endpoint")
@@ -1479,46 +1496,66 @@ func (adapter Adapter) stopCoordinator(
 	request snapshot.Request,
 	endpointPaths []string,
 	name string,
-) {
+) error {
+	var failures []error
 	if name != "" {
-		_, _ = adapter.removeWorkload(ctx, request.Launch.Units[0].Host, name)
+		host := request.Launch.Units[0].Host
+		if _, err := adapter.removeWorkload(ctx, host, name); err != nil {
+			failures = append(failures, fmt.Errorf("remove coordinator %s on %s: %w", name, host, err))
+		}
 	}
 	seen := make(map[string]bool)
 	for _, rank := range request.Launch.Units {
+		if rank.Index >= len(endpointPaths) || endpointPaths[rank.Index] == "" {
+			continue
+		}
 		key := rank.Host + "\x00" + endpointPaths[rank.Index]
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		_, _ = adapter.Remote.Run(ctx, rank.Host, "rm", "-f", endpointPaths[rank.Index])
+		if _, err := adapter.Remote.Run(ctx, rank.Host, "rm", "-f", endpointPaths[rank.Index]); err != nil {
+			failures = append(failures, fmt.Errorf("remove coordinator endpoint %s on %s: %w", endpointPaths[rank.Index], rank.Host, err))
+		}
 	}
+	return errors.Join(failures...)
 }
+
+var errCleanupIncomplete = errors.New("ColdSnap operation cleanup incomplete")
 
 func (adapter Adapter) cleanupCoordinator(
 	parent context.Context,
 	request snapshot.Request,
 	endpointPaths []string,
 	name string,
-) {
+) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
 	defer cancel()
-	adapter.stopCoordinator(ctx, request, endpointPaths, name)
+	if err := adapter.stopCoordinator(ctx, request, endpointPaths, name); err != nil {
+		return errors.Join(errCleanupIncomplete, err)
+	}
+	return nil
 }
 
 func (adapter Adapter) removeContainers(
 	parent context.Context,
 	request snapshot.Request,
 	containers []string,
-) {
+) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
 	defer cancel()
-	_ = parallelUnits(request.Launch.Units, func(rank snapshot.LaunchUnit) error {
+	err := parallelUnits(request.Launch.Units, func(rank snapshot.LaunchUnit) error {
 		if containers[rank.Index] != "" {
-			_, _ = adapter.removeWorkload(
-				ctx, rank.Host, containers[rank.Index])
+			if _, err := adapter.removeWorkload(ctx, rank.Host, containers[rank.Index]); err != nil {
+				return fmt.Errorf("remove workload %s on %s: %w", containers[rank.Index], rank.Host, err)
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		return errors.Join(errCleanupIncomplete, err)
+	}
+	return nil
 }
 
 const containerManagedOwnershipRoot = "/run/coldsnap/managed-ownership"

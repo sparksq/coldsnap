@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/sparksq/coldsnap/internal/engineadapter"
@@ -107,6 +108,9 @@ func runEngineAdapter(ctx context.Context, request snapshot.Request, streams Str
 	timingPath := filepath.Join(timingRoot, "operation.json")
 	arguments = append(arguments, "--timing-json", timingPath)
 	command := exec.CommandContext(ctx, resolved, arguments...) // #nosec G204 -- resolved executable, fixed arguments.
+	// The adapter owns remote cleanup. CommandContext's default immediate Kill
+	// skips its defers and can strand the coordinator and serving containers.
+	configureAdapterShutdown(command, 4*time.Minute)
 	input, err := snapshot.Encode(request)
 	if err != nil {
 		operationErr = fmt.Errorf("encode ColdSnap request for engine adapter: %w", err)
@@ -160,8 +164,21 @@ func runEngineAdapter(ctx context.Context, request snapshot.Request, streams Str
 	return operationErr
 }
 
+func configureAdapterShutdown(command *exec.Cmd, grace time.Duration) {
+	command.Cancel = func() error { return command.Process.Signal(syscall.SIGTERM) }
+	// Bound a stuck adapter while allowing its existing remote cleanup budgets
+	// (including capture-path ownership repair) to finish before killing it.
+	command.WaitDelay = grace
+}
+
 func finishEngineAdapterRun(request snapshot.Request, runErr, timingErr error) error {
 	if runErr != nil {
+		var exitError *exec.ExitError
+		if errors.As(runErr, &exitError) {
+			if status, ok := exitError.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				runErr = fmt.Errorf("adapter terminated by signal; remote cleanup is unconfirmed: %w", runErr)
+			}
+		}
 		operationErr := fmt.Errorf("%s engine adapter: %w", request.Launch.Engine, runErr)
 		if timingErr != nil {
 			operationErr = fmt.Errorf("%v; read engine adapter timing: %w", operationErr, timingErr)

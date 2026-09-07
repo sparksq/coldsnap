@@ -25,7 +25,7 @@ import (
 // payload used by n610. Recovery restore follows vLLM's own loader, while a
 // staged native provider bootstraps the deterministic allocation layout and
 // hydrates this common payload through the capsule-local n580 address map.
-func (adapter Adapter) captureN580(ctx context.Context, request snapshot.Request) error {
+func (adapter Adapter) captureN580(ctx context.Context, request snapshot.Request) (operationErr error) {
 	for _, unit := range request.Launch.Units {
 		if !recoveryCapableCommand(adapter.engine(), unit.Command) {
 			return fmt.Errorf(
@@ -64,13 +64,15 @@ func (adapter Adapter) captureN580(ctx context.Context, request snapshot.Request
 	if err != nil {
 		return err
 	}
-	defer adapter.cleanupCoordinator(ctx, request, endpointPaths, coordinatorName)
+	defer func() {
+		operationErr = errors.Join(operationErr, adapter.cleanupCoordinator(ctx, request, endpointPaths, coordinatorName))
+	}()
 
 	roots := make([]string, len(request.Launch.Units))
 	containers := make([]string, len(request.Launch.Units))
 	ownershipNormalized := false
 	defer func() {
-		adapter.removeContainers(ctx, request, containers)
+		operationErr = errors.Join(operationErr, adapter.removeContainers(ctx, request, containers))
 		if !ownershipNormalized {
 			adapter.normalizeCapturePathOwnershipBestEffort(ctx, request, roots)
 		}

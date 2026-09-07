@@ -1131,9 +1131,6 @@ func modelPayloadMaterialization(
 
 func engineMaterializationMode(engine, requested string) (string, error) {
 	if requested == "" {
-		if engine == "vllm" {
-			return "async", nil
-		}
 		return "off", nil
 	}
 	if engine == "sglang" && requested != "off" {

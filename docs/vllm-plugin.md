@@ -84,9 +84,10 @@ content-addressed worker packs. Recovery remains available from the immutable
 Hugging Face model revision when an optional native pack is absent.
 
 `policy.weights.native.materialize` controls the recovery-time native cache:
-`async` is the vLLM default, `required` waits for a verified pack before restore
-success, and `off` disables that writer. The artifact must already declare the
-expected native payload inventory. This writes model payloads; it does not
+`off` is the default on both drivers and disables that writer without disabling
+use of existing native packs. Explicit `async` enables background generation;
+`required` waits for a verified pack before restore success. The artifact must
+already declare the expected native payload inventory. This writes model payloads; it does not
 rebuild the capsule or make residuals portable across incompatible runtimes.
 See [model payloads and residuals](model-payload-layout.md).
 

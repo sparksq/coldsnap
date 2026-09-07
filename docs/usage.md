@@ -391,11 +391,16 @@ also writes the authoritative operation receipt.
 When recovery is selected, `policy.weights.native.materialize` controls the
 node-local native read-through cache:
 
-- `async` (the vLLM default) returns the restored service after validation and writes
+- `off` (the default for both runtimes and both drivers) performs recovery
+  without populating the native cache;
+- `async` (explicit vLLM opt-in) returns the restored service after validation and writes
   each worker's native payload in the background;
 - `required` does not report restore success until every assigned worker's
-  content-addressed payload and validation record are complete;
-- `off` performs recovery without populating the native cache.
+  content-addressed payload and validation record are complete.
+
+Disabling generation does not prevent using already available, verified native
+packs. Explicit `sparkrun coldsnap materialize` remains a separate preparation
+operation; see [materialization by engine](sparkrun-recipes.md#materialization-by-engine).
 
 For this **restore-time read-through policy**, SGLang defaults to `off` and
 rejects explicit `async` or `required`: its integration does not implement that

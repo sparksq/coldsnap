@@ -28,7 +28,7 @@ var registered = map[string]Descriptor{
 		Engine: "vllm", Executable: "coldsnap-vllm-adapter", Environment: "COLDSNAP_VLLM_ADAPTER",
 		Operations:     []string{"capture", "publish", "publish-native", "restore", "sleep", "status", "wake"},
 		PrepareRestore: true, ControllerModel: "external-process",
-		NativeMaterialization: []string{"off", "async", "required"}, DefaultNativeMaterialization: "async",
+		NativeMaterialization: []string{"off", "async", "required"}, DefaultNativeMaterialization: "off",
 	},
 	"sglang": {
 		Engine: "sglang", Executable: "coldsnap-sglang-adapter", Environment: "COLDSNAP_SGLANG_ADAPTER",

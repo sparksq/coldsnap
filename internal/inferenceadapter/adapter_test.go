@@ -1137,12 +1137,40 @@ func TestAsyncModelPayloadMaterializationAllowsRecoveryOnlyArtifact(t *testing.T
 	}
 }
 
+func TestDefaultRestoreDoesNotGenerateNativePayloads(t *testing.T) {
+	artifact := snapshot.Artifact{Weights: snapshot.WeightProviders{
+		Native: &snapshot.NativeProvider{},
+		ModelPayloads: &snapshot.ModelPayloadProvider{Objects: []snapshot.Object{{
+			Role: "model-weight-payload", Path: modelPayloadObjectPath(testDigest),
+			Bytes: 100, SHA256: testDigest,
+		}}},
+	}}
+	for _, engine := range []string{"vllm", "sglang"} {
+		for _, provider := range []string{"recovery", "native"} {
+			t.Run(engine+"/"+provider, func(t *testing.T) {
+				mode, err := engineMaterializationMode(engine, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				objects, writeMode, err := modelPayloadMaterialization(
+					artifact, snapshot.Selection{Provider: provider}, mode,
+				)
+				if err != nil || objects != nil || writeMode != "" {
+					t.Fatalf("default materialization = %#v, %q, %v", objects, writeMode, err)
+				}
+			})
+		}
+	}
+}
+
 func TestEngineMaterializationCapabilitiesAreExplicit(t *testing.T) {
 	for _, test := range []struct {
 		engine, requested, expected string
 		wantError                   bool
 	}{
-		{engine: "vllm", requested: "", expected: "async"},
+		{engine: "vllm", requested: "", expected: "off"},
+		{engine: "vllm", requested: "off", expected: "off"},
+		{engine: "vllm", requested: "async", expected: "async"},
 		{engine: "vllm", requested: "required", expected: "required"},
 		{engine: "sglang", requested: "", expected: "off"},
 		{engine: "sglang", requested: "off", expected: "off"},

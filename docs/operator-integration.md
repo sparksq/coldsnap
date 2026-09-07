@@ -147,8 +147,10 @@ The supported controller sequence is:
 
 Engine-adapter capabilities also report `native_materialization` and
 `default_native_materialization`. vLLM currently supports `off`, `async`, and
-`required` with default `async`; SGLang supports only `off`. Managers should
-reject unsupported modes before launch and must still rely on the adapter's
+`required` with default `off`; SGLang supports only `off`. Both drivers use these
+defaults. Managers should explicitly request `off` for ordinary restores when
+compatibility with older controllers (which defaulted vLLM to `async`) is needed.
+Managers should reject unsupported modes before launch and must still rely on the adapter's
 capability check as the authoritative boundary.
 
 Capture, publication, and lifecycle requests use the same envelope. The

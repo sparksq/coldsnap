@@ -60,12 +60,18 @@ coldsnap: {}
 ```
 
 The minimal recipe inherits the ColdSnap defaults: `cuda-criu`, KV discard,
-asynchronous CUDA graphs, automatic native-payload preference with safetensors
-recovery, derived-cache seeding, and the model-independent validation prompt
+asynchronous CUDA graphs, driver/runtime-specific weight selection,
+native-weight generation `off`, derived-cache seeding, and the model-independent validation prompt
 `Reply with exactly: coldsnap-cuda-snapshot-ok` with expected response
 `coldsnap-cuda-snapshot-ok`. n610 selects retained NCCL graph execution by
 default; n580 selects graph recreation. Add a nested setting only when the
 recipe needs to deviate from those defaults.
+
+When no weight mode is specified, vLLM/n580 uses `recovery`; the other
+runtime/driver combinations use `auto` (verified native packs preferred, with
+safetensors recovery as fallback). Generation `off` does not prevent use of
+existing packs. See the [materialization matrix](sparkrun-recipes.md#materialization-by-engine)
+for explicit preparation versus ordinary launches.
 
 One deliberate manager default differs from direct requests: Sparkrun sets
 `coldsnap.compatibility.enforce_captured_driver_floor` to `false` unless the

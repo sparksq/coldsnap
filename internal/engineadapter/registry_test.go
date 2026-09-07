@@ -16,7 +16,7 @@ func TestRegistryIsStableAndReturnsCopies(t *testing.T) {
 	}
 	if len(descriptors[0].NativeMaterialization) != 1 || descriptors[0].NativeMaterialization[0] != "off" ||
 		descriptors[0].DefaultNativeMaterialization != "off" ||
-		len(descriptors[1].NativeMaterialization) != 3 || descriptors[1].DefaultNativeMaterialization != "async" {
+		len(descriptors[1].NativeMaterialization) != 3 || descriptors[1].DefaultNativeMaterialization != "off" {
 		t.Fatalf("native materialization capabilities = %#v", descriptors)
 	}
 	descriptors[1].Operations[0] = "mutated"

@@ -99,8 +99,10 @@ the adapter contains no DS4F model cases.
 
 ## Choose a weight provider
 
-The default `auto` policy prefers verified native packs and falls back to the
-pinned Hugging Face safetensors. Set `native` to require a compatible pack,
+When the recipe/command omits a weight mode, vLLM/n580 defaults to `recovery`;
+vLLM/n610 and SGLang on both drivers default to `auto`. The `auto` policy
+prefers verified native packs and falls back to the pinned Hugging Face
+safetensors. Set `native` to require a compatible pack,
 `recovery` to select safetensors, or `cache-only-auto` to check only the existing
 cache for optional native packs.
 
@@ -123,6 +125,24 @@ for pinned providers and descriptors.
 It is distinct from vLLM's optional native-cache writer during a recovery
 restore. The explicit command can prepare native weights and target-local
 residual state before later `sparkrun run` calls.
+
+| Runtime | Driver | Ordinary launch: native generation | Explicit materialize: native weights | Explicit materialize: residual/runtime state |
+| --- | --- | --- | --- | --- |
+| vLLM | n580 | `off` | `off` (optional) | `required`: target-local recovery residuals |
+| vLLM | n610 | `off` | `required` | `off`: reuse the existing capsule |
+| SGLang | n580 | `off` | `required` | `required`: matching capture/replay state |
+| SGLang | n610 | `off` | `required` | `required`: matching capture/replay state |
+
+Disabling generation does not disable staging or use of verified native packs.
+Ordinary launches reuse compatible materialized state without capturing fresh
+residuals. vLLM/n580 `auto` selects recovery when a recovery-only local overlay
+is selected; explicit `native` instead uses the portable capsule.
+
+`materialize` prepares or reuses assets, verifies them, stops its temporary
+serving workload, and exits. Ordinary `run`/`restore` stays serving. Existing
+assets remain available after materialization; repeated commands still stop
+their verification workload. Preparation can replace an overlapping deployment
+of the same recipe, so use available target hosts.
 
 The plugin's SGLang materialization support, introduced in 0.1.2, creates and
 verifies a complete local capture. Its native pack and replay metadata remain
@@ -147,6 +167,8 @@ an existing matching result. A restore with an explicit `--artifact` bypasses
 automatic local selection.
 
 During ordinary recovery restore, vLLM supports `--materialize-native off`,
-`async`, and `required`; its default is `async`. SGLang uses `off` and rejects
+`async`, and `required`; its default is `off` on both drivers. The plugin
+explicitly sends `off` unless overridden, including with older controllers.
+SGLang uses `off` and rejects
 `async` and `required` on that restore-time option. Use the explicit
 materialization command above to prepare SGLang packs instead.

@@ -86,13 +86,15 @@ pinned safetensors files.
 ### Recovery read-through cache
 
 A vLLM recovery restore may also produce the artifact's already-defined native
-model payload without rebuilding its capsule. vLLM defaults materialization to
-`async`: first-token readiness is governed by the recovery loader, then each
+model payload without rebuilding its capsule. Both runtimes default restore-time
+materialization to `off` on both drivers. With an explicit vLLM `async` opt-in,
+first-token readiness is governed by the recovery loader, then each
 worker copies its immutable resident model bytes into the content-addressed
 node-local cache in the background. `required` performs the same work before
-restore reports success, while `off` disables it. SGLang defaults to `off` and
+restore reports success, while `off` disables only generation, not consumption
+of verified native packs. SGLang supports only `off` and
 rejects `async` or `required` because its integration does not yet implement
-the canonical model-payload writer; an already available native SGLang payload
+the recovery-time model-payload writer; an already available native SGLang payload
 can still be staged and restored. This restriction concerns ordinary recovery
 restores, not explicit preparation: a fresh SGLang capture can use its
 capture-time writer to produce a paired pack and replay metadata. A new pack

@@ -6,7 +6,7 @@
 # Run: python scripts/update-versions.py --check
 # Run: python scripts/generate-ci-gha.py --check
 
-coldsnap: 0.3.21
+coldsnap: 0.3.22
 coldsnap-vllm: 0.5.9
 coldsnap-sglang: 0.3.4
 coldsnap-criu-rpc: 0.3.11

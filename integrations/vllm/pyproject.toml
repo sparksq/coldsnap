@@ -37,6 +37,7 @@ py-modules = [
   "coldsnap_torch_memory_saver",
   "coldsnap_vllm",
   "coldsnap_vllm_async_graphs",
+  "coldsnap_vllm_calibration",
   "coldsnap_vllm_checkpoint",
   "coldsnap_vllm_cuda_runtime",
   "coldsnap_vllm_deferred_api_warmup",

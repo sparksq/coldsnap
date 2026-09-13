@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping
 
 from coldsnap_import_hook import after_module_import
 from coldsnap_vllm import VllmContractError
+from coldsnap_vllm_calibration import calibration_status, reuse_calibration
 from coldsnap_vllm_shape_calibration import (
     calibrate_capture_shapes,
     shape_calibration_enabled,
@@ -269,6 +270,7 @@ def _worker_status(worker: Any) -> dict[str, Any]:
         "error": state.error,
         "capture_attempts": state.capture_attempts,
         "shape_calibration": getattr(worker, "_coldsnap_shape_calibration", None),
+        "adaptive_calibration": calibration_status(worker),
         "graph_resource_audit": audit,
     }
 
@@ -301,12 +303,8 @@ def _compile_eager_first(
     **kwargs: Any,
 ) -> Any:
     runner = _validate_worker(worker)
-    if getattr(runner, "adaptive_verification", None) is not None:
-        raise VllmContractError(
-            "Adaptive verification requires startup graph capture to initialize its "
-            "cost tables; set coldsnap.process.async_graphs=false "
-            f"({ASYNC_GRAPH_ENV}=0)"
-        )
+    if not reuse_calibration(worker):
+        return _compile_synchronously(worker, original, *args, **kwargs)
     runner_mode = _force_runner_eager(runner, True)
     state = WorkerGraphState("initializing", runner_mode)
     worker._coldsnap_async_graph_state = state
@@ -357,6 +355,31 @@ def _compile_eager_first(
     return result
 
 
+def _compile_synchronously(
+    worker: Any,
+    original: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """A collective cache miss uses vLLM's normal graph calibration path."""
+    runner = _validate_worker(worker)
+    state = WorkerGraphState("capturing", _force_runner_eager(runner, False), capture_attempts=1)
+    worker._coldsnap_async_graph_state = state
+    started = time.perf_counter()
+    try:
+        result = original(worker, *args, **kwargs)
+        # Normal capture already compiles the full graph envelope. A second
+        # shape-only pass would see needs_capture=False on the V2 runner.
+    except BaseException as error:
+        state.phase = "failed"
+        state.error = f"synchronous calibration failed: {error}"
+        raise
+    finally:
+        state.capture_seconds = time.perf_counter() - started
+    state.phase = "ready"
+    return result
+
+
 def _compile_retained_first(
     worker: Any,
     original: Callable[..., Any],
@@ -401,10 +424,16 @@ def _capture_worker_graphs(worker: Any) -> dict[str, Any]:
     state.capture_attempts += 1
     _force_runner_eager(runner, False)
     started = time.perf_counter()
+    adaptive = getattr(runner, "adaptive_verification", None)
+    previous_tables = getattr(adaptive, "cost_tables", None)
+    previous_limit = getattr(adaptive, "_cudagraph_limit", None)
     try:
         _refresh_worker_graph_pools(runner)
         graph_memory_delta_bytes = int(runner.capture_model())
     except BaseException as error:
+        if previous_tables is not None:
+            adaptive.cost_tables = previous_tables
+            adaptive._cudagraph_limit = previous_limit
         _force_runner_eager(runner, True)
         state.phase = "failed"
         state.capture_seconds = time.perf_counter() - started

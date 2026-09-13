@@ -332,7 +332,10 @@ def _calibrate_v2(runner: Any) -> dict[str, Any]:
     started = time.perf_counter()
     owner.capture = warmup_only
     try:
-        capture_model()
+        from coldsnap_vllm_calibration import preserve_calibration_during_shape_warmup
+
+        with preserve_calibration_during_shape_warmup(runner):
+            capture_model()
     finally:
         owner.capture = original
         # Eager-first capture must start from a clean manager. Retained-first

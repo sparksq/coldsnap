@@ -48,6 +48,7 @@ def register() -> None:
     from coldsnap_startup_plan import install_startup_plan_memory_fallback
     from coldsnap_vllm_deferred_api_warmup import install_deferred_api_warmup_hook
     from coldsnap_vllm_async_graphs import install_async_graph_capture_hooks
+    from coldsnap_vllm_calibration import install_calibration_hooks
     from coldsnap_vllm_deferred_warmup import install_deferred_warmup_hooks
     from coldsnap_vllm_cuda_runtime import install_cuda_epoch_runtime_hooks
     from coldsnap_vllm_graphs import install_graph_capture_hooks
@@ -65,6 +66,7 @@ def register() -> None:
     # engine-step hooks always finish warmup before capturing graphs.
     install_deferred_warmup_hooks()
     install_kv_capacity_guard()
+    install_calibration_hooks()
     install_async_graph_capture_hooks()
     install_startup_plan_memory_fallback()
     install_process_template_hook()

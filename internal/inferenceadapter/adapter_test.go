@@ -1272,6 +1272,7 @@ func TestRestoreRankCommandUsesArtifactCaptureIdentity(t *testing.T) {
 		"--tcp-address-map", "10.0.0.1=10.0.0.2",
 		"--tcp-port-shift", "4096",
 		"sha256:captured-base",
+		"COLDSNAP_SOURCE_RUNTIME_IMAGE=sha256:captured-base",
 	} {
 		if !slices.Contains(command, expected) {
 			t.Fatalf("portable restore command lacks %q: %#v", expected, command)

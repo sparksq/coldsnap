@@ -257,6 +257,30 @@ class V2ShapeCalibrationTest(unittest.TestCase):
         self.assertEqual(runner.cudagraph_manager.recorded, [])
         self.assertFalse(runner.cudagraph_manager._graphs_captured)
 
+    def test_v2_shape_warmup_preserves_adaptive_verification_tables(self) -> None:
+        runner = self._runner()
+        tables = object()
+        original = runner.capture_model
+        manager = SimpleNamespace(
+            cost_tables=tables,
+            _cudagraph_limit=36,
+            batches_to_profile=lambda sizes: self.fail("unexpected cost profiling"),
+            set_initial_cost_curves=lambda samples: self.fail("unexpected cost replacement"),
+        )
+        runner.adaptive_verification = manager
+        def capture():
+            result = original()
+            self.assertEqual(list(manager.batches_to_profile([])), [])
+            manager.set_initial_cost_curves([])
+            return result
+        runner.capture_model = capture
+        result = calibrate_capture_shapes(runner)
+        self.assertEqual(result["shapes"], 3)
+        self.assertIs(manager.cost_tables, tables)
+        self.assertEqual(manager._cudagraph_limit, 36)
+        with self.assertRaisesRegex(AssertionError, "unexpected cost profiling"):
+            manager.batches_to_profile([])
+
     def test_v2_accepts_new_positional_progress_api(self) -> None:
         class Manager(FakeCudaGraphManager):
             def capture(self, create_forward_fn, progress_bar_desc="Capturing"):

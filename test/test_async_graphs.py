@@ -109,11 +109,12 @@ class AsyncGraphCaptureTest(unittest.TestCase):
         self.assertEqual(runner.capture_calls, 1)
         self.assertFalse(runner.cudagraph_dispatcher._coldsnap_force_eager)
 
-    def test_adaptive_verification_rejects_deferral_before_mutating_runner(self) -> None:
+    def test_adaptive_cache_miss_calibrates_synchronously_and_reports_ready(self) -> None:
+        calls = []
         runner = SimpleNamespace(
             adaptive_verification=SimpleNamespace(cost_tables=None),
             cudagraph_dispatcher=self.Dispatcher(),
-            capture_model=lambda: 128,
+            capture_model=lambda: calls.append("capture"),
         )
         worker = SimpleNamespace(
             model_config=SimpleNamespace(enforce_eager=False),
@@ -121,12 +122,39 @@ class AsyncGraphCaptureTest(unittest.TestCase):
             compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL")),
             model_runner=runner,
         )
-        original_capture = runner.capture_model
-        with self.assertRaisesRegex(async_graphs.VllmContractError, "async_graphs=false"):
-            async_graphs._compile_eager_first(worker, lambda _: self.fail("unexpected warmup"))
-        self.assertIs(runner.capture_model, original_capture)
-        self.assertFalse(hasattr(worker, "_coldsnap_async_graph_state"))
-        self.assertFalse(hasattr(runner.cudagraph_dispatcher, "_coldsnap_force_eager"))
+        def compile(instance):
+            calls.append("warmup")
+            instance.model_runner.capture_model()
+            return "compiled"
+        with patch.object(async_graphs, "reuse_calibration", return_value=False):
+            self.assertEqual(async_graphs._compile_eager_first(worker, compile), "compiled")
+        self.assertEqual(calls, ["warmup", "capture"])
+        self.assertEqual(worker._coldsnap_async_graph_state.phase, "ready")
+        self.assertFalse(runner.cudagraph_dispatcher._coldsnap_force_eager)
+        self.assertEqual(async_graphs._capture_worker_graphs(worker)["phase"], "ready")
+        self.assertEqual(calls, ["warmup", "capture"])
+
+    def test_failed_recapture_preserves_reused_adaptive_tables(self) -> None:
+        tables = object()
+        adaptive = SimpleNamespace(cost_tables=tables, _cudagraph_limit=36)
+        def fail_capture():
+            adaptive.cost_tables = None
+            adaptive._cudagraph_limit = 0
+            raise RuntimeError("capture failed")
+        worker = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL")),
+            model_runner=SimpleNamespace(adaptive_verification=adaptive,
+                cudagraph_dispatcher=self.Dispatcher(), capture_model=fail_capture),
+            _coldsnap_async_graph_state=async_graphs.WorkerGraphState("eager", "dispatcher"),
+        )
+        with patch.object(async_graphs, "_refresh_worker_graph_pools"), self.assertLogs(async_graphs.logger, level="ERROR"):
+            status = async_graphs._capture_worker_graphs(worker)
+        self.assertEqual(status["phase"], "failed")
+        self.assertIs(adaptive.cost_tables, tables)
+        self.assertEqual(adaptive._cudagraph_limit, 36)
+        self.assertTrue(worker.model_runner.cudagraph_dispatcher._coldsnap_force_eager)
 
     def test_retained_policy_captures_normal_graphs_before_snapshot(self) -> None:
         class Runner:

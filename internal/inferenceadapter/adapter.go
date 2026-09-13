@@ -1748,6 +1748,7 @@ func (adapter Adapter) rankWorkloadSpec(
 		"COLDSNAP_LOAD_FORMAT":                              "coldsnap",
 		"COLDSNAP_MODEL_ID":                                 request.Launch.Model.ID,
 		"COLDSNAP_MODEL_REVISION":                           request.Launch.Model.Revision,
+		"COLDSNAP_SOURCE_RUNTIME_IMAGE":                     identityImage,
 		"COLDSNAP_NCCL_ACTIVE_RUNTIME_PATH":                 ncclActiveRuntimePath,
 		"COLDSNAP_NCCL_CHECKPOINT":                          "1",
 		"COLDSNAP_NCCL_REQUIRE_IB_RESET":                    "1",

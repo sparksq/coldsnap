@@ -10,8 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -28,12 +31,14 @@ type tcpProbeResult struct {
 }
 
 type tcpProbeOptions struct {
-	imagesDir       string
-	tcpAddressMap   repeatedString
-	tcpPortShift    uint
-	tcpPreservePort uint
-	tcpPortMap      string
-	allowEmptyMap   bool
+	imagesDir                string
+	tcpAddressMap            repeatedString
+	tcpPortShift             uint
+	tcpPreservePort          uint
+	tcpPortMap               string
+	allowEmptyMap            bool
+	listenEndpoints          repeatedString
+	generatedListenEndpoints repeatedString
 }
 
 func parseTCPProbeOptions(arguments []string) (tcpProbeOptions, error) {
@@ -70,6 +75,8 @@ func parseTCPProbeOptions(arguments []string) (tcpProbeOptions, error) {
 		false,
 		"allow an inventory with no mapped TCP endpoints",
 	)
+	flags.Var(&value.listenEndpoints, "tcp-listen-endpoint", "planned listener in IP:PORT form")
+	flags.Var(&value.generatedListenEndpoints, "tcp-generated-listen-endpoint", "planned listener that must also avoid the host ephemeral port range")
 	if err := flags.Parse(arguments); err != nil {
 		return tcpProbeOptions{}, err
 	}
@@ -94,7 +101,53 @@ func parseTCPProbeOptions(arguments []string) (tcpProbeOptions, error) {
 	if _, err := parseTCPPortMap(value.tcpPortMap); err != nil {
 		return tcpProbeOptions{}, err
 	}
+	if _, err := plannedTCPListeners(value); err != nil {
+		return tcpProbeOptions{}, err
+	}
 	return value, nil
+}
+
+// Context-free snapshots may precede the creation of engine listeners. Probe
+// those planned endpoints alongside the sockets actually present in files.img.
+func plannedTCPListeners(value tcpProbeOptions) ([]tcpBindEndpoint, error) {
+	var result []tcpBindEndpoint
+	for _, group := range []struct {
+		values    []string
+		generated bool
+	}{{value.listenEndpoints, false}, {value.generatedListenEndpoints, true}} {
+		for _, text := range group.values {
+			address, err := netip.ParseAddrPort(text)
+			if err != nil || address.Port() == 0 || address.Addr().Zone() != "" {
+				return nil, fmt.Errorf("invalid planned TCP listener %q", text)
+			}
+			family := uint32(unix.AF_INET)
+			if address.Addr().Is6() {
+				family = unix.AF_INET6
+			}
+			result = append(result, tcpBindEndpoint{
+				Family: family, Address: address.Addr(), Port: uint32(address.Port()),
+				State: 10, AvoidEphemeral: group.generated,
+			})
+		}
+	}
+	return result, nil
+}
+
+func ephemeralTCPPortRange() (uint32, uint32, error) {
+	data, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+	if err != nil {
+		return 0, 0, fmt.Errorf("read host ephemeral TCP port range: %w", err)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 {
+		return 0, 0, errors.New("invalid host ephemeral TCP port range")
+	}
+	first, firstErr := strconv.ParseUint(fields[0], 10, 16)
+	last, lastErr := strconv.ParseUint(fields[1], 10, 16)
+	if firstErr != nil || lastErr != nil || first == 0 || first > last {
+		return 0, 0, errors.New("invalid host ephemeral TCP port range")
+	}
+	return uint32(first), uint32(last), nil
 }
 
 func runTCPProbe(arguments []string, output io.Writer) error {
@@ -121,6 +174,11 @@ func runTCPProbe(arguments []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+	planned, err := plannedTCPListeners(value)
+	if err != nil {
+		return err
+	}
+	endpoints = append(endpoints, planned...)
 	probeErr := probeTCPBindEndpoints(endpoints)
 	if probeErr != nil && !errors.Is(probeErr, unix.EADDRINUSE) {
 		return probeErr

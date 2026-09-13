@@ -3174,6 +3174,33 @@ func (adapter Adapter) selectPortableTCPPortShift(
 				"--tcp-port-shift", strconv.Itoa(int(candidate))}
 			if image.Driver.ID == snapshotdriver.N580 {
 				command = append(command, "--tcp-allow-empty-map")
+				address, err := rankPlacementAddress(unit)
+				if err != nil {
+					return err
+				}
+				wildcard := netip.IPv4Unspecified()
+				if address.Is6() {
+					wildcard = netip.IPv6Unspecified()
+				}
+				http := uint16(httpPort(unit.Command))
+				masterPort := commandMasterPort(unit.Command)
+				if masterPort < int(portableTCPPortBase) {
+					return fmt.Errorf("unit %s rendezvous port must be unprivileged", unit.ID)
+				}
+				master := uint16(portableTCPPortBase + ((uint32(masterPort) - portableTCPPortBase + uint32(candidate)) % portableTCPPortCount))
+				if master == http {
+					collisionMutex.Lock()
+					collisions = append(collisions, fmt.Sprintf("unit %s: rendezvous port overlaps serving port %d", unit.ID, http))
+					collisionMutex.Unlock()
+					return nil
+				}
+				masterFlag := "--tcp-generated-listen-endpoint"
+				if fixedShift != 0 {
+					masterFlag = "--tcp-listen-endpoint"
+				}
+				command = append(command,
+					"--tcp-listen-endpoint", netip.AddrPortFrom(wildcard, http).String(),
+					masterFlag, netip.AddrPortFrom(wildcard, master).String())
 			}
 			if portMapping != "" {
 				command = append(command, "--tcp-port-map", portMapping)
@@ -3199,7 +3226,7 @@ func (adapter Adapter) selectPortableTCPPortShift(
 			}
 			minimumEndpoints := 1
 			if image.Driver.ID == snapshotdriver.N580 {
-				minimumEndpoints = 0
+				minimumEndpoints = 2
 			}
 			if err := json.Unmarshal(output, &receipt); err != nil ||
 				receipt.Format != 1 || receipt.Kind != "coldsnap-criu-tcp-port-probe" ||
@@ -3462,6 +3489,25 @@ func operationName(id, suffix string) string {
 		}
 	}
 	return strings.Trim(result.String(), ".-")
+}
+
+// Keep the master-port convention in sync with service_runtime._command_master_port.
+var masterPortArguments = []*regexp.Regexp{
+	regexp.MustCompile(`(?:^|[[:space:]])--master-port(?:[[:space:]]+|=)([0-9]+)(?:[[:space:]]|$)`),
+	regexp.MustCompile(`(?:^|[[:space:]])--dist-init-addr(?:[[:space:]]+|=)(?:\[[^]]+\]|[^[:space:]:]+):([0-9]+)(?:[[:space:]]|$)`),
+}
+
+func commandMasterPort(command []string) int {
+	payload := strings.Join(command, " ")
+	for _, pattern := range masterPortArguments {
+		match := pattern.FindStringSubmatch(payload)
+		if len(match) != 0 {
+			if port, err := strconv.Atoi(match[1]); err == nil && port > 0 && port < 65536 {
+				return port
+			}
+		}
+	}
+	return 25000
 }
 
 var portArgument = regexp.MustCompile(`(^|[[:space:]])--port(?:[[:space:]]+|=)(?:'([0-9]+)'|"([0-9]+)"|([0-9]+))`)

@@ -985,12 +985,13 @@ func rotatePortableTCPPort(port uint32, shift uint) uint32 {
 }
 
 type tcpBindEndpoint struct {
-	ID      uint32
-	Family  uint32
-	Address netip.Addr
-	Port    uint32
-	V6Only  bool
-	State   uint32
+	ID             uint32
+	Family         uint32
+	Address        netip.Addr
+	Port           uint32
+	V6Only         bool
+	State          uint32
+	AvoidEphemeral bool
 }
 
 func loadCRIUFilesImage(imagesDir string) (*crit.CriuImage, error) {
@@ -1114,6 +1115,15 @@ func rewriteTCPSocketEndpoints(
 
 func probeTCPBindEndpoints(endpoints []tcpBindEndpoint) error {
 	for _, endpoint := range endpoints {
+		if endpoint.AvoidEphemeral {
+			first, last, err := ephemeralTCPPortRange()
+			if err != nil {
+				return err
+			}
+			if endpoint.Port >= first && endpoint.Port <= last {
+				return fmt.Errorf("generated TCP listener %s:%d overlaps the host ephemeral range %d-%d: %w", endpoint.Address, endpoint.Port, first, last, unix.EADDRINUSE)
+			}
+		}
 		family := int(endpoint.Family)
 		if family != unix.AF_INET && family != unix.AF_INET6 {
 			return fmt.Errorf("TCP socket %d has unsupported address family %d", endpoint.ID, family)

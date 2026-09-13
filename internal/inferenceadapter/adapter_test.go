@@ -232,6 +232,7 @@ type tcpPortProbeRemote struct {
 	imagesDirs    []string
 	portMaps      []string
 	allowEmpty    []bool
+	commands      [][]string
 }
 
 func (remote *tcpPortProbeRemote) Run(
@@ -262,6 +263,7 @@ func (remote *tcpPortProbeRemote) Run(
 	}
 	shift := uint16(parsed)
 	remote.mutex.Lock()
+	remote.commands = append(remote.commands, slices.Clone(arguments))
 	remote.shifts = append(remote.shifts, shift)
 	remote.preserved = append(remote.preserved, slices.Contains(arguments, "--tcp-preserve-port"))
 	remote.imagesDirs = append(remote.imagesDirs, arguments[imagesIndex+1])

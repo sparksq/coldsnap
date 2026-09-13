@@ -297,13 +297,14 @@ def _calibrate_v2(runner: Any) -> dict[str, Any]:
     warmed: list[str] = []
     observed: dict[tuple[Any, ...], tuple[str, int]] = {}
     warmed_keys: set[tuple[Any, ...]] = set()
+    retained_graphs = bool(getattr(manager, "_graphs_captured", False))
 
     def warmup_only(
         self: Any,
         create_forward_fn: Any,
-        *,
-        channel_id: str,
         progress_bar_desc: str = "",
+        *,
+        channel_id: str | None = None,
     ) -> None:
         del channel_id, progress_bar_desc
         # vLLM captures PIECEWISE before FULL because PIECEWISE has the larger
@@ -334,10 +335,11 @@ def _calibrate_v2(runner: Any) -> dict[str, Any]:
         capture_model()
     finally:
         owner.capture = original
-        # Drop any state the pass left behind so the activation's real capture
-        # starts from a clean manager.
+        # Eager-first capture must start from a clean manager. Retained-first
+        # capture already owns live graphs and NCCL resources; calibration must
+        # preserve them for checkpoint and exact reattachment.
         clear = getattr(manager, "clear", None)
-        if callable(clear):
+        if not retained_graphs and callable(clear):
             clear()
 
     expected_keys = initial_keys | set(observed)

@@ -30,7 +30,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from coldsnap_core.hydration import HydrationExtent, NativeHydrator
 from coldsnap_vllm import prepare_synthetic_weight_source, register_model_loader
@@ -56,12 +56,8 @@ LOADER_IO_PROBE_BYTES_ENV = "COLDSNAP_RECOVERY_LOADER_IO_PROBE_BYTES"
 LOADER_IO_WEIGHT_EXPONENT_ENV = "COLDSNAP_RECOVERY_LOADER_IO_WEIGHT_EXPONENT"
 LOADER_TRANSPORT_PIPELINE_DEPTH_ENV = "COLDSNAP_RECOVERY_LOADER_TRANSPORT_PIPELINE_DEPTH"
 PROCESS_TEMPLATE_RESTORED_ENV = "COLDSNAP_PROCESS_TEMPLATE_RESTORED"
-MODEL_PAYLOAD_MATERIALIZATION_CONTROL_ENV = (
-    "COLDSNAP_MODEL_PAYLOAD_MATERIALIZATION_CONTROL"
-)
-DEFAULT_MODEL_PAYLOAD_MATERIALIZATION_CONTROL = (
-    "/run/coldsnap/model-payload-materialization.json"
-)
+MODEL_PAYLOAD_MATERIALIZATION_CONTROL_ENV = "COLDSNAP_MODEL_PAYLOAD_MATERIALIZATION_CONTROL"
+DEFAULT_MODEL_PAYLOAD_MATERIALIZATION_CONTROL = "/run/coldsnap/model-payload-materialization.json"
 DEFAULT_DERIVED_BUFFER_MAX_BYTES = 64 * 1024**2
 CHECKPOINT_DESTINATION_TENSOR_NAMES_ATTR = "_coldsnap_checkpoint_destination_tensor_names"
 CHECKPOINT_COPY_PLAN_ATTR = "_coldsnap_checkpoint_copy_plan"
@@ -116,6 +112,9 @@ B12X_MHC_RELOAD_DEPENDENCY_FIELDS = ("hc_attn_fn", "hc_ffn_fn")
 _RECOVERY_CONSUMER_STORAGE_ISOLATION: ContextVar[bool] = ContextVar(
     "coldsnap_recovery_consumer_storage_isolation",
     default=False,
+)
+_INITIAL_NATIVE_BOOTSTRAP: ContextVar[bool] = ContextVar(
+    "coldsnap_initial_native_bootstrap", default=False,
 )
 _ACTIVE_RECOVERY_SOURCE: ContextVar[Any | None] = ContextVar(
     "coldsnap_active_recovery_source",
@@ -682,6 +681,40 @@ def _capture_derived_buffers(model: Any) -> tuple[dict[str, Any], int]:
     return selected, total_bytes
 
 
+def _is_b12x_v41_expert(module: Any) -> bool:
+    # This lifecycle is model-owned rather than quant_method-owned. Qualify
+    # the concrete contract; an unrelated module's `prepared` is not enough.
+    return any(
+        cls.__module__ == "vllm.models.deepseek_v4_1.nvidia.b12x_moe"
+        and cls.__name__ == "B12xV41Experts"
+        for cls in type(module).__mro__
+    )
+
+
+def _is_b12x_layer_cached_expert(owner: Any) -> bool:
+    return any(
+        cls.__module__ == "vllm.model_executor.layers.fused_moe.b12x"
+        and cls.__name__ == "B12xExperts"
+        for cls in type(owner).__mro__
+    )
+
+
+def _b12x_prepared_experts(owner: Any) -> Any | None:
+    lookup = getattr(owner, "_lookup_prepared_experts", None)
+    if callable(lookup):
+        return lookup()
+    if _is_b12x_layer_cached_expert(owner):
+        # Newer vLLM replaced the lookup API with _prepared(), which raises
+        # before preparation rather than returning None.
+        if getattr(owner, "_prepared_experts", None) is None:
+            return None
+        lookup = getattr(owner, "_prepared", None)
+        if not callable(lookup):
+            raise RuntimeError("B12x prepared owner lacks its prepared accessor")
+        return lookup()
+    return None
+
+
 def _b12x_prepared_owners(
     model: Any,
 ) -> list[tuple[str, Any, Any, Any]]:
@@ -692,15 +725,27 @@ def _b12x_prepared_owners(
         return result
     seen: set[int] = set()
     for module_name, module in named_modules():
+        if _is_b12x_v41_expert(module):
+            prepared = getattr(module, "prepared", None)
+            if prepared is not None and id(module) not in seen:
+                if not callable(getattr(module, "finalize_weights", None)):
+                    raise RuntimeError("B12x V4.1 prepared owner lacks its finalizer")
+                seen.add(id(module))
+                result.append((module_name, module, module, prepared))
+            continue
         quant_method = getattr(module, "quant_method", None)
         moe_kernel = getattr(quant_method, "moe_kernel", None)
         fused_experts = getattr(moe_kernel, "fused_experts", None)
-        lookup = getattr(fused_experts, "_lookup_prepared_experts", None)
-        if not callable(lookup) or id(fused_experts) in seen:
+        if id(fused_experts) in seen:
             continue
-        prepared = lookup()
+        prepared = _b12x_prepared_experts(fused_experts)
         if prepared is None:
             continue
+        if (
+            _is_b12x_layer_cached_expert(fused_experts)
+            and getattr(module, "_b12x_prepared_experts", None) is not prepared
+        ):
+            raise RuntimeError("B12x layer and expert prepared owners disagree")
         seen.add(id(fused_experts))
         result.append((module_name, module, fused_experts, prepared))
     return result
@@ -852,8 +897,7 @@ class _B12xRecoveryStorageAdapter:
         self.direct_replay_finalized = False
         self.direct_replay_finalization_deferred = False
         self.direct_replay_prepared = None
-        self.owner._prepared_experts = None
-        self.owner._source_parameters_released = False
+        self._set_prepared(self.owner, None, released=False)
 
     def owns_layer(self, layer: Any) -> bool:
         return layer is self.layer
@@ -877,7 +921,36 @@ class _B12xRecoveryStorageAdapter:
         moe_kernel = getattr(quant_method, "moe_kernel", None)
         owner = getattr(moe_kernel, "fused_experts", None)
         lookup = getattr(owner, "_lookup_prepared_experts", None)
-        return owner if callable(lookup) else None
+        return owner if callable(lookup) or _is_b12x_layer_cached_expert(owner) else None
+
+    def _get_prepared(self, owner: Any) -> Any | None:
+        return _b12x_prepared_experts(owner)
+
+    def _set_prepared(self, owner: Any, prepared: Any, *, released: bool) -> None:
+        owner._prepared_experts = prepared
+        owner._source_parameters_released = released
+        if prepared is not None and _is_b12x_layer_cached_expert(owner):
+            self.layer._b12x_prepared_experts = prepared
+            self.layer.b12x_warmup_provider = owner
+        # When clearing the live owner for reload, keep the layer's cache. Its
+        # real finalizer uses that cache to copy packed results into captured
+        # storage instead of allocating replacement execution tensors.
+
+    def _sources_released(self, owner: Any) -> bool:
+        return bool(getattr(owner, "_source_parameters_released", False))
+
+    def _process_weights_after_loading(self, torch_module: Any) -> None:
+        quant_method = getattr(self.layer, "quant_method", None)
+        process = getattr(quant_method, "process_weights_after_loading", None)
+        if not callable(process):
+            raise RuntimeError(f"{self.name} has no vLLM quantization finalizer")
+        if hasattr(self.layer, "_already_called_process_weights_after_loading"):
+            delattr(self.layer, "_already_called_process_weights_after_loading")
+        with torch_module.no_grad():
+            process(self.layer)
+        update_tp = getattr(self.layer, "update_param_tp_status", None)
+        if callable(update_tp):
+            update_tp()
 
     def materialize_layer(self, torch_module: Any, info: Any) -> None:
         restore_metadata = getattr(info, "restore_metadata", None)
@@ -963,25 +1036,14 @@ class _B12xRecoveryStorageAdapter:
             return
         if self.direct_replay_finalization_deferred:
             return
-        quant_method = getattr(self.layer, "quant_method", None)
-        process = getattr(quant_method, "process_weights_after_loading", None)
-        if not callable(process):
-            raise RuntimeError(f"{self.name} has no vLLM quantization finalizer")
-        if hasattr(self.layer, "_already_called_process_weights_after_loading"):
-            delattr(self.layer, "_already_called_process_weights_after_loading")
-        with torch_module.no_grad():
-            process(self.layer)
-        update_tp = getattr(self.layer, "update_param_tp_status", None)
-        if callable(update_tp):
-            update_tp()
+        self._process_weights_after_loading(torch_module)
 
         owner = self._live_owner()
-        lookup = getattr(owner, "_lookup_prepared_experts", None)
-        prepared = lookup() if callable(lookup) else None
+        prepared = self._get_prepared(owner)
         if prepared is None:
             raise RuntimeError(f"{self.name} finalizer did not publish prepared weights")
         self._validate_stable_prepared(prepared)
-        if not bool(getattr(owner, "_source_parameters_released", False)):
+        if not self._sources_released(owner):
             raise RuntimeError(f"{self.name} finalizer did not release source parameters")
         self.direct_replay_prepared = prepared
         self.direct_replay_finalized = True
@@ -1010,8 +1072,7 @@ class _B12xRecoveryStorageAdapter:
             owner = self._live_owner()
             if owner is None:
                 raise RuntimeError(f"{self.name} lost its B12x prepared owner")
-            owner._prepared_experts = self.prepared
-            owner._source_parameters_released = True
+            self._set_prepared(owner, self.prepared, released=True)
 
     def finish_reload(self) -> None:
         if not self.materialized:
@@ -1019,8 +1080,7 @@ class _B12xRecoveryStorageAdapter:
         owner = self._live_owner()
         if owner is None:
             raise RuntimeError(f"{self.name} lost its B12x prepared owner")
-        lookup = getattr(owner, "_lookup_prepared_experts", None)
-        prepared = lookup() if callable(lookup) else None
+        prepared = self._get_prepared(owner)
         if prepared is None and self.direct_replay_complete:
             # A model-level finalizer may replace the modular owner even when
             # the layerwise quantizer had no work. Retain the finalized owner,
@@ -1030,13 +1090,12 @@ class _B12xRecoveryStorageAdapter:
                 if self.direct_replay_prepared is not None
                 else self.prepared
             )
-            owner._prepared_experts = retained
-            owner._source_parameters_released = True
+            self._set_prepared(owner, retained, released=True)
             prepared = retained
         if prepared is None:
             raise RuntimeError(f"{self.name} did not rebuild its prepared owner")
         self._validate_stable_prepared(prepared)
-        if not bool(getattr(owner, "_source_parameters_released", False)):
+        if not self._sources_released(owner):
             raise RuntimeError(f"{self.name} did not release its source parameters")
         self.captured_source_parameters = None
         self.direct_replay_complete = False
@@ -1054,8 +1113,7 @@ class _B12xRecoveryStorageAdapter:
             if owner is None or id(owner) in restored:
                 continue
             restored.add(id(owner))
-            owner._prepared_experts = self.prepared
-            owner._source_parameters_released = self.source_parameters_released
+            self._set_prepared(owner, self.prepared, released=self.source_parameters_released)
         if self.captured_source_parameters is not None:
             for source_name, parameter in self.captured_source_parameters.items():
                 setattr(self.layer, source_name, parameter)
@@ -1066,6 +1124,86 @@ class _B12xRecoveryStorageAdapter:
         self.direct_replay_prepared = None
 
 
+class _B12xV41RecoveryStorageAdapter(_B12xRecoveryStorageAdapter):
+    """Keep model-owned V4.1 prepared weights at their captured addresses.
+
+    vLLM finalizes these experts at the root model, after layerwise copyback.
+    Reload must prepare them before copying back the released (empty) source
+    Parameters. Reuse the image's finalizer, retaining its captured execution
+    plan and local-ID buffer because CUDA graphs still refer to those objects.
+    """
+
+    @property
+    def name(self) -> str:
+        return f"b12x-v41:{self.module_name or '<root>'}"
+
+    def _live_owner(self) -> Any:
+        return self.layer
+
+    def _get_prepared(self, owner: Any) -> Any | None:
+        return getattr(owner, "prepared", None)
+
+    def _set_prepared(self, owner: Any, prepared: Any, *, released: bool) -> None:
+        owner.prepared = prepared
+
+    def _sources_released(self, owner: Any) -> bool:
+        return all(
+            (parameter := getattr(owner, name, None)) is not None and int(parameter.numel()) == 0
+            for name, _prepared_name in B12X_SOURCE_STORAGE_FIELDS
+        )
+
+    def begin_reload(self) -> None:
+        self._captured_finalizer = self.layer.finalize_weights
+        self._had_instance_finalizer = "finalize_weights" in vars(self.layer)
+        self._captured_execution = {
+            name: getattr(self.layer, name) for name in ("plan", "local_ids")
+        }
+        super().begin_reload()
+
+        def finalize_weights(*args: Any, **kwargs: Any) -> None:
+            if self.layer.prepared is None and not self.materialized:
+                raise RuntimeError(f"{self.name} cannot finalize before source materialization")
+            try:
+                self._captured_finalizer(*args, **kwargs)
+                prepared = self.layer.prepared
+                if prepared is None:
+                    raise RuntimeError(f"{self.name} finalizer did not publish prepared weights")
+                self._validate_stable_prepared(prepared)
+                if not self._sources_released(self.layer):
+                    raise RuntimeError(f"{self.name} finalizer did not release source parameters")
+            finally:
+                for name, value in self._captured_execution.items():
+                    setattr(self.layer, name, value)
+
+        self.layer.finalize_weights = finalize_weights
+
+    def _process_weights_after_loading(self, torch_module: Any) -> None:
+        with torch_module.no_grad():
+            self.layer.finalize_weights()
+
+    def finalize_layer_reload(self, torch_module: Any, info: Any) -> None:
+        self._process_weights_after_loading(torch_module)
+
+    def _restore_finalizer(self) -> None:
+        if self._had_instance_finalizer:
+            self.layer.finalize_weights = self._captured_finalizer
+        else:
+            delattr(self.layer, "finalize_weights")
+
+    def finish_reload(self) -> None:
+        super().finish_reload()
+        self._restore_finalizer()
+
+    def abort_reload(self) -> None:
+        super().abort_reload()
+        for name, value in self._captured_execution.items():
+            setattr(self.layer, name, value)
+        # finish_reload may already have restored this method before another
+        # adapter fails. Restoration must be safe on that cleanup path too.
+        if "finalize_weights" in vars(self.layer) or self._had_instance_finalizer:
+            self._restore_finalizer()
+
+
 def _discover_b12x_recovery_storage(model: Any) -> list[Any]:
     """Return B12x adapters only for its transferred-storage lifecycle."""
     adapters: list[Any] = []
@@ -1073,14 +1211,25 @@ def _discover_b12x_recovery_storage(model: Any) -> list[Any]:
         plan = getattr(prepared, "plan", None)
         if not bool(getattr(plan, "discards_source_parameters", False)):
             continue
+        adapter_class = (
+            _B12xV41RecoveryStorageAdapter
+            if _is_b12x_v41_expert(module)
+            else _B12xRecoveryStorageAdapter
+        )
         adapters.append(
-            _B12xRecoveryStorageAdapter(
+            adapter_class(
                 module_name=module_name,
                 layer=module,
                 owner=owner,
                 prepared=prepared,
-                source_parameters_released=bool(
-                    getattr(owner, "_source_parameters_released", False)
+                source_parameters_released=(
+                    all(
+                        (parameter := getattr(module, name, None)) is not None
+                        and int(parameter.numel()) == 0
+                        for name, _prepared_name in B12X_SOURCE_STORAGE_FIELDS
+                    )
+                    if _is_b12x_v41_expert(module)
+                    else bool(getattr(owner, "_source_parameters_released", False))
                 ),
             )
         )
@@ -1536,6 +1685,53 @@ def _vllm_preloaded_tensor_skip(meta: Any, names: frozenset[str]) -> Iterator[No
 
 
 @contextmanager
+def _defer_recovery_model_finalizers(model: Any) -> Iterator[None]:
+    """Run qualified model-wide finalizers after vLLM restores live tensors.
+
+    New DSv4 load_weights calls its model-wide finalizer before vLLM's
+    finalize_layerwise_reload replaces meta parameters with captured storage.
+    In-place mHC refresh then tries copying from a meta tensor. Leaf quantizer
+    finalizers must still run online; only the architecture's root callback is
+    deferred until the normal reload has completed.
+    """
+    pending: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = []
+    patched: list[tuple[Any, bool, Any]] = []
+    name = "process_weights_after_loading"
+    try:
+        for _module_name, module in _named_module_items(model):
+            if not any(
+                base.__name__ == "DeepseekV4ForCausalLM"
+                and base.__module__ in {
+                    "vllm.models.deepseek_v4.nvidia.model",
+                    "vllm.models.deepseek_v4_1.nvidia.model",
+                }
+                for base in type(module).__mro__
+            ):
+                continue
+            original = getattr(module, name, None)
+            if not callable(original):
+                continue
+            local = vars(module)
+            patched.append((module, name in local, local.get(name)))
+
+            def defer(*args: Any, _original: Any = original, **kwargs: Any) -> None:
+                pending.append((_original, args, kwargs))
+
+            setattr(module, name, defer)
+        yield
+    finally:
+        for module, had_local, original_local in reversed(patched):
+            if had_local:
+                setattr(module, name, original_local)
+            else:
+                delattr(module, name)
+    # Exceptions from reload skip these calls, leaving the original failure
+    # intact. Original methods are restored before any callback executes.
+    for original, args, kwargs in pending:
+        original(*args, **kwargs)
+
+
+@contextmanager
 def _recovery_reload_storage(
     model: Any,
     *,
@@ -1554,6 +1750,12 @@ def _recovery_reload_storage(
     original_restore = getattr(layerwise, "restore_layer_on_meta", None)
     original_get_size = getattr(layerwise, "get_layer_size", None)
     original_wrap = getattr(layerwise, "_wrap_parameters_weight_loader", None)
+    original_copyback = getattr(layerwise, "_copy_and_restore_kernel_tensors", None)
+    finalize_adapters = [
+        adapter for adapter in adapters if callable(getattr(adapter, "finalize_layer_reload", None))
+    ]
+    if finalize_adapters and not callable(original_copyback):
+        raise RuntimeError("recovery storage requires vLLM layerwise copyback hook")
     if not all(
         callable(value)
         for value in (
@@ -1676,6 +1878,14 @@ def _recovery_reload_storage(
                         )
                 return original_materialize(layer, info)
 
+        def copyback_recovery_layer(layer: Any, info: Any) -> Any:
+            for adapter in finalize_adapters:
+                if adapter.owns_layer(layer):
+                    adapter.finalize_layer_reload(torch, info)
+            return original_copyback(layer, info)
+
+        if finalize_adapters:
+            layerwise._copy_and_restore_kernel_tensors = copyback_recovery_layer
         layerwise.restore_layer_on_meta = restore_recovery_layer
         layerwise.get_layer_size = recovery_layer_size
         layerwise._wrap_parameters_weight_loader = wrap_recovery_parameters
@@ -1691,6 +1901,8 @@ def _recovery_reload_storage(
         layerwise.restore_layer_on_meta = original_restore
         layerwise.get_layer_size = original_get_size
         layerwise._wrap_parameters_weight_loader = original_wrap
+        if finalize_adapters:
+            layerwise._copy_and_restore_kernel_tensors = original_copyback
         if not succeeded:
             for adapter in reversed(started):
                 adapter.abort_reload()
@@ -1702,6 +1914,7 @@ def _tensor_weight_layout(
     *,
     label: str,
     allow_outside_weight_pool: bool = False,
+    merge_adjacent: bool = True,
 ) -> list[tuple[int, int, str]]:
     """Resolve tensor bytes and placement-independent merged-range identities."""
     provider = getattr(backend, "memory_provider", None)
@@ -1750,7 +1963,7 @@ def _tensor_weight_layout(
         if (
             merged
             and allocation_pointer == merged[-1]["allocation_pointer"]
-            and start <= merged[-1]["end"]
+            and (start < merged[-1]["end"] or (merge_adjacent and start == merged[-1]["end"]))
         ):
             merged[-1]["end"] = max(int(merged[-1]["end"]), end)
             merged[-1]["members"].append((name, start, end))
@@ -1789,6 +2002,83 @@ def _model_weight_layout(model: Any, backend: Any) -> list[tuple[int, int, str]]
     )
 
 
+def _native_dense_storage_view(tensor: Any, *, name: str) -> Any:
+    """Expose all bytes of a dense permuted kernel tensor without a copy."""
+    if tensor.is_contiguous():
+        return tensor
+    expected_stride = 1
+    for stride, size in sorted(
+        (int(stride), int(size))
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        if size > 1
+    ):
+        if stride != expected_stride:
+            raise RuntimeError(f"native prepared tensor {name!r} must have dense storage")
+        expected_stride *= size
+    return tensor.as_strided((tensor.numel(),), (1,))
+
+
+def _v41_wo_a_native_tensors(model: Any) -> list[tuple[str, Any]]:
+    """Own the original FP8 prefill weights retained beside decoded BF16 WO-A.
+
+    The V4.1 grouped finalizer deletes the checkpoint scales and replaces the
+    registered weight with BF16. Its unregistered packed prefill representation
+    therefore needs its own native extents; the registered BF16 tensor alone
+    cannot restore both execution paths.
+    """
+    tensors = []
+    for name, module in _named_module_items(model):
+        method = getattr(module, "quant_method", None)
+        method_type = type(method)
+        if (
+            method_type.__module__ != "vllm.models.deepseek_v4_1.attention"
+            or method_type.__name__ != "_GroupedLinearMethod"
+        ):
+            continue
+        packed_weights = getattr(method, "prefill_weights", None)
+        if not isinstance(packed_weights, list):
+            raise RuntimeError(f"native WO-A prefill contract changed at {name!r}")
+        if type(method.original).__name__ == "B12xFP8LinearMethod" and len(packed_weights) != method.groups:
+            raise RuntimeError(f"native WO-A prefill groups changed at {name!r}")
+        for index, packed in enumerate(packed_weights):
+            for field in ("values", "scale_rows", "scale_mma", "values_tiled"):
+                tensor = getattr(packed.weight, field)
+                if tensor is None and field == "values_tiled":
+                    continue
+                key = f"{name}.wo_a_prefill.{index}.{field}"
+                if tensor is None:
+                    raise RuntimeError(f"native WO-A prefill tensor is absent: {key}")
+                tensors.append((key, _native_dense_storage_view(tensor, name=key)))
+    return tensors
+
+
+def _b12x_mxfp8_native_tensors(model: Any) -> list[tuple[str, Any]]:
+    """Retain dense MXFP8 storage after its registered sources are released.
+
+    This includes the runtime-quantized LM head. The B12x kernel executes from
+    its packed object after replacing weight and weight_scale with empty
+    Parameters, so named_parameters() alone cannot describe native weights.
+    """
+    tensors = []
+    for name, module in _named_module_items(model):
+        kernel = getattr(getattr(module, "quant_method", None), "kernel", None)
+        kernel_type = type(kernel)
+        if (
+            kernel_type.__module__ != "vllm.model_executor.kernels.linear.mxfp8.b12x"
+            or kernel_type.__name__ != "B12xMxfp8LinearKernel"
+        ):
+            continue
+        packed = getattr(module, "b12x_mxfp8_packed_weight", None)
+        weight = getattr(packed, "weight", None)
+        for field in ("values", "scale_rows", "scale_mma"):
+            tensor = getattr(weight, field, None)
+            key = f"{name}.b12x_mxfp8_packed_weight.{field}"
+            if tensor is None:
+                raise RuntimeError(f"native B12x MXFP8 packed tensor is absent: {key}")
+            tensors.append((key, _native_dense_storage_view(tensor, name=key)))
+    return tensors
+
+
 def _native_model_payload_layout(model: Any, backend: Any) -> list[tuple[int, int, str]]:
     """Resolve all model-owned state that a native wake must reproduce.
 
@@ -1800,6 +2090,8 @@ def _native_model_payload_layout(model: Any, backend: Any) -> list[tuple[int, in
     """
     tensors = list(model.named_parameters())
     tensors.extend(list(getattr(model, "named_buffers", lambda: ())()))
+    tensors.extend(_v41_wo_a_native_tensors(model))
+    tensors.extend(_b12x_mxfp8_native_tensors(model))
     for module_name, _module, _owner, prepared in _b12x_prepared_owners(model):
         prefix = module_name or "<root>"
         for field_name in B12X_PREPARED_WEIGHT_FIELDS:
@@ -1815,6 +2107,9 @@ def _native_model_payload_layout(model: Any, backend: Any) -> list[tuple[int, in
         backend,
         label="native model payload",
         allow_outside_weight_pool=True,
+        # Fresh processes can place neighboring tensors in different blocks.
+        # Merge aliases, but keep unrelated adjacent tensors independently keyed.
+        merge_adjacent=False,
     )
 
 
@@ -1977,9 +2272,10 @@ def _read_safetensors_header(path: Path) -> tuple[int, dict[str, Any]]:
 
 
 def _matches_prefix(name: str, prefixes: Sequence[str] | None) -> bool:
-    return prefixes is None or any(
-        name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes
-    )
+    # Match vLLM's literal checkpoint prefixes. DSpark uses "mtp.", which
+    # already includes its separator; appending another dot drops every draft
+    # tensor. An empty prefix collection means no filtering in vLLM.
+    return not prefixes or name.startswith(tuple(prefixes))
 
 
 def _descriptors(
@@ -2087,6 +2383,30 @@ def _validate_descriptor_size(torch_module: Any, descriptor: SafetensorDescripto
             f"header={descriptor.length} shape={expected}"
         )
     return dtype
+
+
+def _file_source_tensor(path: Path, descriptor: SafetensorDescriptor) -> Any:
+    """Carry vLLM's opted-in checkpoint range without materializing its bytes."""
+    import torch
+    try:
+        from vllm.model_executor.weight_transfer import FileTensorSource
+        from vllm.model_executor.model_loader.weight_utils import file_source_tensor
+    except ImportError as error:
+        raise RuntimeError("vLLM file-backed weights require FileTensorSource support") from error
+    dtype = _validate_descriptor_size(torch, descriptor)
+    return file_source_tensor(FileTensorSource(
+        path=os.path.abspath(path), offset=descriptor.file_offset,
+        shape=descriptor.shape, dtype=dtype,
+    ))
+
+
+def _yield_file_source(path: Path, descriptor: SafetensorDescriptor, prefix: str) -> Iterator[tuple[str, Any]]:
+    # Metadata has no source storage to observe or copy during recovery replay.
+    token = _ACTIVE_RECOVERY_SOURCE.set(None)
+    try:
+        yield prefix + descriptor.name, _file_source_tensor(path, descriptor)
+    finally:
+        _ACTIVE_RECOVERY_SOURCE.reset(token)
 
 
 def _distributed_context(torch_module: Any) -> tuple[Any | None, int, int]:
@@ -2372,7 +2692,8 @@ def _owner_layout(
 
 
 def _descriptor_batches(
-    descriptors: Sequence[SafetensorDescriptor], max_bytes: int
+    descriptors: Sequence[SafetensorDescriptor], max_bytes: int,
+    file_names: frozenset[str] = frozenset(),
 ) -> Iterator[tuple[int, int]]:
     """Partition descriptors without splitting a checkpoint tensor.
 
@@ -2385,6 +2706,12 @@ def _descriptor_batches(
     start = 0
     batch_bytes = 0
     for index, descriptor in enumerate(descriptors):
+        if descriptor.name in file_names:
+            if start < index:
+                yield start, index
+            yield index, index + 1
+            start, batch_bytes = index + 1, 0
+            continue
         if index > start and batch_bytes + descriptor.length > max_bytes:
             yield start, index
             start = index
@@ -4629,6 +4956,7 @@ def _mmap_weights_iterator(
     verify_bytes: int,
     logger: Any,
     started: float,
+    file_weight_filter: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple[str, Any]]:
     """Expose lazy CPU mmap tensors in publisher/model order.
 
@@ -4674,6 +5002,11 @@ def _mmap_weights_iterator(
                     continue
                 full_name = prefix + descriptor.name
                 if full_name in _RECOVERY_SKIP_SOURCE_NAMES.get():
+                    continue
+                if file_weight_filter is not None and file_weight_filter(descriptor.name):
+                    yield from _yield_file_source(path, descriptor, prefix)
+                    logical_bytes += descriptor.length
+                    tensor_count += 1
                     continue
                 tensor = source.get_tensor(descriptor.name)
                 actual_bytes = int(tensor.numel() * tensor.element_size())
@@ -4750,6 +5083,7 @@ def recovery_weights_iterator(
     prefix: str,
     weight_name_prefixes: Sequence[str] | None,
     local_expert_ids: set[int] | None = None,
+    file_weight_filter: Callable[[str], bool] | None = None,
 ) -> Iterator[tuple[str, Any]]:
     """Yield checkpoint tensors through the selected recovery transport."""
     global _last_metrics
@@ -4779,6 +5113,7 @@ def recovery_weights_iterator(
             verify_bytes=verify_bytes,
             logger=logger,
             started=started,
+            file_weight_filter=file_weight_filter,
         )
         return
     group, rank, world_size = _distributed_context(torch)
@@ -4848,12 +5183,17 @@ def recovery_weights_iterator(
         if duplicates:
             raise RuntimeError(f"duplicate selected safetensors tensor {duplicates[0]!r}")
         seen.update(item.name for item in descriptors)
-        owners = _owners(
-            descriptors,
-            world_size,
-            rotation=file_number % world_size,
-            physical_order=True,
+        file_names = frozenset(
+            descriptor.name for descriptor in descriptors
+            if file_weight_filter is not None and file_weight_filter(descriptor.name)
         )
+        ordinary = [descriptor for descriptor in descriptors if descriptor.name not in file_names]
+        owner_by_name = dict(zip(
+            (descriptor.name for descriptor in ordinary),
+            _owners(ordinary, world_size, rotation=file_number % world_size, physical_order=True),
+            strict=True,
+        ))
+        owners = [owner_by_name.get(descriptor.name, -1) for descriptor in descriptors]
         if hydrator is None:
             from safetensors import safe_open
 
@@ -4861,8 +5201,14 @@ def recovery_weights_iterator(
         else:
             source_context = nullcontext(None)
         with source_context as source:
-            for batch_start, batch_end in _descriptor_batches(descriptors, staging_buffer_bytes):
+            for batch_start, batch_end in _descriptor_batches(descriptors, staging_buffer_bytes, file_names):
                 batch_descriptors = descriptors[batch_start:batch_end]
+                if batch_descriptors[0].name in file_names:
+                    descriptor = batch_descriptors[0]
+                    yield from _yield_file_source(path, descriptor, prefix)
+                    logical_bytes += descriptor.length
+                    tensor_count += 1
+                    continue
                 batch_owners = owners[batch_start:batch_end]
                 # Use one bounded slab rather than thousands of CUDA
                 # allocations per DS4 shard. Tensor views retain at most this
@@ -5071,6 +5417,144 @@ def recovery_weights_iterator(
     )
 
 
+def _refresh_native_fp8_rows(current: Any, rebuilt: Any, *, name: str) -> None:
+    """Refresh derived FP8 layouts without replacing captured execution storage."""
+    for field in ("values", "scale_rows", "scale_mma", "values_tiled"):
+        target = getattr(current, field)
+        source = getattr(rebuilt, field)
+        if target is None and source is None:
+            continue
+        if (
+            target is None or source is None
+            or target.shape != source.shape or target.dtype != source.dtype
+            or target.device != source.device
+        ):
+            raise RuntimeError(f"native FP8 {field} contract changed at {name!r}")
+        if target.data_ptr() != source.data_ptr():
+            target.copy_(source)
+
+
+def _refresh_initial_native_model(model: Any) -> dict[str, int]:
+    """Rebuild known load-time derivatives after fresh-process native hydration.
+
+    Registered weights/buffers and prepared MoE owners came from the native
+    pack. DSv4/V4.1 FP8 linear scales, fused WO projections and mHC broadcasts
+    also retain plain tensor attributes derived from those weights. Refresh
+    their contents before warmup while preserving execution objects/pointers.
+    Do not replay all quantization finalizers: that could overwrite hydrated
+    MoE weights or duplicate large allocations.
+    """
+    import torch
+
+    counts = {"block32_linears": 0, "block128_linears": 0,
+              "wo_projections": 0, "mhc_broadcasts": 0}
+    modules = tuple(_named_module_items(model))
+    wo_owners = {
+        id(module): module for _, module in modules
+        if getattr(module, "_b12x_wo_projection_weights", None) is not None
+        and any(
+            base.__module__ == "vllm.models.deepseek_v4.attention"
+            and base.__name__ == "DeepseekV4Attention"
+            for base in type(module).__mro__
+        )
+    }
+    # Both child parameters feed the fused owner's packed execution weights.
+    # Newer attention disables their warmup providers without the legacy skip
+    # flag, so ownership is the stable contract for avoiding standalone refresh.
+    fused_children = {
+        id(getattr(owner, field)) for owner in wo_owners.values()
+        for field in ("wo_a", "wo_b")
+    }
+    with torch.no_grad():
+        for name, module in modules:
+            method = getattr(module, "quant_method", None)
+            method_type = type(method)
+            kernel = getattr(method, "fp8_linear", None)
+            kernel_type = type(kernel)
+            current = weight = scale = block_size = count_key = None
+            if (
+                method_type.__module__ == "vllm.models.deepseek_v4_1.b12x_layers"
+                and method_type.__name__ == "B12xFP8LinearMethod"
+            ):
+                current = getattr(module, "b12x_weight", None)
+                weight, scale = module.weight, module.weight_scale_inv
+                block_size, count_key = (32, 32), "block32_linears"
+            elif (
+                kernel_type.__module__ == "vllm.model_executor.kernels.linear.scaled_mm.b12x"
+                and kernel_type.__name__ == "B12xFp8BlockScaledMMKernel"
+                and not getattr(module, "b12x_skip_generic_block_fp8_linear", False)
+                and id(module) not in fused_children
+            ):
+                params = kernel._get_layer_params(module)
+                current = getattr(module, "b12x_packed_weight", None)
+                weight = params.weight
+                scale = params.weight_scale if params.weight_scale_inv is None else params.weight_scale_inv
+                if current is None and getattr(module, "b12x_warmup_provider", None) is kernel:
+                    # Newer B12X block-FP8 GEMM consumes the registered weight
+                    # and scale directly; there is no packed derivative.
+                    pass
+                else:
+                    block_size, count_key = (128, 128), "block128_linears"
+            if count_key is not None:
+                from b12x.gemm import block_fp8_linear
+
+                if current is None or tuple(getattr(current, "block_size", ())) != block_size:
+                    raise RuntimeError(f"native FP8 linear contract changed at {name!r}")
+                rebuilt = block_fp8_linear.pack_weight(weight, scale, block_size=block_size)
+                if (current.in_features, current.out_features) != (
+                    rebuilt.in_features, rebuilt.out_features,
+                ):
+                    raise RuntimeError(f"native FP8 linear dimensions changed at {name!r}")
+                _refresh_native_fp8_rows(current.weight, rebuilt.weight, name=name)
+                del rebuilt
+                counts[count_key] += 1
+            if any(
+                base.__module__ == "vllm.models.deepseek_v4.attention"
+                and base.__name__ == "DeepseekV4Attention"
+                for base in type(module).__mro__
+            ):
+                current = getattr(module, "_b12x_wo_projection_weights", None)
+                if current is not None:
+                    from b12x.gemm import wo_projection
+
+                    groups, group_width, rank, hidden = module._validate_wo_projection_tensors()
+                    if (current.groups, current.group_width, current.rank, current.hidden) != (
+                        groups, group_width, rank, hidden,
+                    ):
+                        raise RuntimeError(f"native WO projection dimensions changed at {name!r}")
+                    rebuilt = wo_projection.pack_weights(
+                        module.wo_a.weight, module.wo_a.weight_scale_inv,
+                        module.wo_b.weight, module.wo_b.weight_scale_inv,
+                        groups=groups, group_width=group_width, rank=rank, hidden=hidden,
+                    )
+                    if current.sfb_k_replicated != rebuilt.sfb_k_replicated:
+                        raise RuntimeError(f"native WO projection scale provenance changed at {name!r}")
+                    for field in ("wo_a", "wo_b"):
+                        _refresh_native_fp8_rows(
+                            getattr(current, field), getattr(rebuilt, field), name=f"{name}.{field}",
+                        )
+                    del rebuilt
+                    counts["wo_projections"] += 1
+            module_type = type(module)
+            if (
+                module_type.__module__ in {
+                    "vllm.models.deepseek_v4.nvidia.model",
+                    "vllm.models.deepseek_v4_1.nvidia.model",
+                }
+                and module_type.__name__ == "DeepseekV4DecoderLayer"
+            ):
+                target = getattr(module, "hc_attn_fn_broadcast", None)
+                if target is not None:
+                    broadcast = module.hc_attn_fn.detach().view(
+                        -1, module.hc_mult, module.hidden_size,
+                    ).sum(dim=1)
+                    if target.shape != broadcast.shape or target.dtype != broadcast.dtype:
+                        raise RuntimeError(f"native mHC broadcast contract changed at {name!r}")
+                    target.copy_(broadcast)
+                    counts["mhc_broadcasts"] += 1
+    return counts
+
+
 def _install_worker_wake_hook() -> None:
     from vllm.v1.worker import gpu_worker
 
@@ -5085,6 +5569,45 @@ def _install_worker_wake_hook() -> None:
     original = GPUWorker.wake_up
     original_sleep = getattr(GPUWorker, "sleep", None)
     original_compile = getattr(GPUWorker, "compile_or_warm_up_model", None)
+
+    original_load = getattr(GPUWorker, "load_model", None)
+    if callable(original_load):
+        @functools.wraps(original_load)
+        def load_with_initial_native_weights(self: Any, *args: Any, **kwargs: Any) -> Any:
+            from coldsnap_synthetic_loader import _native_bootstrap_requested
+
+            native = (
+                os.environ.get(PROCESS_TEMPLATE_RESTORED_ENV) == "1"
+                and _native_bootstrap_requested()
+            )
+            token = _INITIAL_NATIVE_BOOTSTRAP.set(native)
+            try:
+                result = original_load(self, *args, **kwargs)
+                if native:
+                    model = self.model_runner.get_model()
+                    if getattr(model, "_coldsnap_native_bootstrap_loaded", False) is not True:
+                        raise RuntimeError("native startup did not use the native bootstrap loader")
+                    backend = self._get_sleep_mode_backend()
+                    hydrate = getattr(backend, "hydrate_initial_native_weights", None)
+                    if not callable(hydrate):
+                        raise RuntimeError("native startup requires the ColdSnap initial hydration backend")
+                    _bind_native_model_payload_layout(model, backend)
+                    metrics = hydrate()
+                    refreshed = _refresh_initial_native_model(model)
+                    from vllm.logger import init_logger
+
+                    init_logger("vllm.model_executor.model_loader.default_loader").info(
+                        "ColdSnap native startup hydrated %.2f GiB from the model pack in %.3f s (%s); "
+                        "refreshed %d block32/%d block128 linears, %d WO projections and %d mHC broadcasts",
+                        metrics["bytes"] / 1024**3, metrics["seconds"], metrics["backend"],
+                        refreshed["block32_linears"], refreshed["block128_linears"],
+                        refreshed["wo_projections"], refreshed["mhc_broadcasts"],
+                    )
+                return result
+            finally:
+                _INITIAL_NATIVE_BOOTSTRAP.reset(token)
+
+        GPUWorker.load_model = load_with_initial_native_weights
 
     def initial_materialization_requested() -> bool:
         if os.environ.get(PROCESS_TEMPLATE_RESTORED_ENV) != "1":
@@ -5111,13 +5634,10 @@ def _install_worker_wake_hook() -> None:
             if not initial_materialization_requested():
                 return result
             backend = self._get_sleep_mode_backend()
-            materialize = getattr(
-                backend, "materialize_initial_recovery_payload", None
-            )
+            materialize = getattr(backend, "materialize_initial_recovery_payload", None)
             if not callable(materialize):
                 raise RuntimeError(
-                    "n580 model payload materialization requires a compatible "
-                    "ColdSnap disk backend"
+                    "n580 model payload materialization requires a compatible ColdSnap disk backend"
                 )
             get_model = getattr(self.model_runner, "get_model", None)
             if not callable(get_model):
@@ -5226,7 +5746,8 @@ def _install_worker_wake_hook() -> None:
             skip_token = _RECOVERY_SKIP_SOURCE_NAMES.set(skip_sources)
             preloaded_token = _RECOVERY_PRELOADED_DESTINATION_NAMES.set(preloaded_destinations)
             try:
-                model_runner.reload_weights()
+                with _defer_recovery_model_finalizers(model):
+                    model_runner.reload_weights()
             finally:
                 _RECOVERY_PRELOADED_DESTINATION_NAMES.reset(preloaded_token)
                 _RECOVERY_SKIP_SOURCE_NAMES.reset(skip_token)
@@ -5668,6 +6189,7 @@ def _observed_capture_iterator(
     prepared, descriptors = _capture_source_descriptors(loader, source)
     started = time.perf_counter()
     logical_bytes = 0
+    file_backed_bytes = 0
     tensors = 0
     bootstrap_tensors: list[dict[str, Any]] = []
     completed = False
@@ -5682,12 +6204,25 @@ def _observed_capture_iterator(
             actual_bytes = int(tensor.numel()) * int(tensor.element_size())
             if tuple(tensor.shape) != descriptor.shape or actual_bytes != descriptor.length:
                 raise RuntimeError(f"capture loader tensor metadata changed for {name!r} in {path}")
-            active = RecoverySourceTensor(
-                name=name,
-                path=path,
-                descriptor=descriptor,
-                pointer=int(tensor.data_ptr()),
-            )
+            file_filter = getattr(source, "file_weight_filter", None)
+            file_backed = file_filter is not None and file_filter(descriptor.name)
+            if file_backed:
+                from vllm.model_executor.weight_transfer import get_file_tensor_source
+
+                backing = get_file_tensor_source(tensor)
+                if (
+                    backing is None or not tensor.is_meta
+                    or os.path.abspath(backing.path) != path
+                    or backing.offset != descriptor.file_offset
+                    or tuple(backing.shape) != descriptor.shape
+                    or backing.dtype != tensor.dtype
+                ):
+                    raise RuntimeError(f"capture file-backed tensor metadata changed for {name!r}")
+                active = None
+            else:
+                active = RecoverySourceTensor(
+                    name=name, path=path, descriptor=descriptor, pointer=int(tensor.data_ptr()),
+                )
             token = _ACTIVE_RECOVERY_SOURCE.set(active)
             try:
                 yield name, tensor
@@ -5695,14 +6230,16 @@ def _observed_capture_iterator(
                 _ACTIVE_RECOVERY_SOURCE.reset(token)
             logical_bytes += descriptor.length
             tensors += 1
-            bootstrap_tensors.append(
-                {
-                    "name": name,
-                    "dtype": descriptor.dtype_name,
-                    "shape": list(descriptor.shape),
-                    "length": descriptor.length,
-                }
-            )
+            entry = {
+                "name": name,
+                "dtype": descriptor.dtype_name,
+                "shape": list(descriptor.shape),
+                "length": descriptor.length,
+            }
+            if file_backed:
+                file_backed_bytes += descriptor.length
+                entry["file_source"] = {"path": path, "offset": descriptor.file_offset}
+            bootstrap_tensors.append(entry)
         completed = True
     finally:
         if completed:
@@ -5716,7 +6253,8 @@ def _observed_capture_iterator(
             _group, _rank, world_size = _distributed_context(torch)
         except (AssertionError, ImportError, RuntimeError):
             world_size = 1
-        local_bytes = logical_bytes // max(world_size, 1)
+        # File-backed metadata never traverses the fast loader transport.
+        local_bytes = (logical_bytes - file_backed_bytes) // max(world_size, 1)
         metrics = RecoveryLoadMetrics(
             files=len(prepared.files),
             tensors=tensors,
@@ -5900,6 +6438,10 @@ def install_recovery_aware_loader() -> None:
         """Default vLLM loader with a recovery-aware safetensors source."""
 
         def load_weights(self: Any, model: Any, model_config: Any) -> Any:
+            if _INITIAL_NATIVE_BOOTSTRAP.get():
+                result = super(ColdSnapRecoveryModelLoader, self).load_weights(model, model_config)
+                model._coldsnap_native_bootstrap_loaded = True
+                return result
             return _load_weights_with_recovery_observer(
                 self,
                 model,
@@ -5910,6 +6452,15 @@ def install_recovery_aware_loader() -> None:
             from vllm.logger import init_logger
 
             loader_logger = init_logger(__name__)
+            if _INITIAL_NATIVE_BOOTSTRAP.get():
+                from coldsnap_synthetic_loader import _native_bootstrap_weights
+
+                if getattr(self, "counter_before_loading_weights", 0.0) == 0.0:
+                    self.counter_before_loading_weights = time.perf_counter()
+                init_logger("vllm.model_executor.model_loader.default_loader").info(
+                    "ColdSnap native bootstrap preparing source %s", source.model_or_path,
+                )
+                return _native_bootstrap_weights(source)
             loader_logger.info(
                 "ColdSnap recovery loader preparing source %s",
                 source.model_or_path,
@@ -5942,6 +6493,7 @@ def install_recovery_aware_loader() -> None:
                 prefix=prepared.prefix,
                 weight_name_prefixes=prepared.weight_name_prefixes,
                 local_expert_ids=getattr(self, "local_expert_ids", None),
+                file_weight_filter=getattr(source, "file_weight_filter", None),
             )
 
     ColdSnapRecoveryModelLoader.__module__ = __name__

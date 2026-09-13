@@ -257,6 +257,38 @@ class V2ShapeCalibrationTest(unittest.TestCase):
         self.assertEqual(runner.cudagraph_manager.recorded, [])
         self.assertFalse(runner.cudagraph_manager._graphs_captured)
 
+    def test_v2_accepts_new_positional_progress_api(self) -> None:
+        class Manager(FakeCudaGraphManager):
+            def capture(self, create_forward_fn, progress_bar_desc="Capturing"):
+                raise AssertionError("real recording loop must be intercepted")
+
+        runner = self._runner()
+        runner.cudagraph_manager = Manager(runner.cudagraph_manager._capture_descs)
+
+        def capture_model():
+            def create_forward_fn(desc, warmup):
+                return lambda mode: runner.warmed.append((desc.num_tokens, mode, warmup))
+            runner.cudagraph_manager.capture(create_forward_fn, "Capturing model")
+
+        runner.capture_model = capture_model
+        result = calibrate_capture_shapes(runner)
+        self.assertEqual(result["warmed_shapes"], 3)
+        self.assertTrue(all(mode is FakeMode.NONE for _, mode, _ in runner.warmed))
+        self.assertFalse(runner.cudagraph_manager._graphs_captured)
+
+    def test_v2_preserves_retained_graphs_and_resources(self) -> None:
+        runner = self._runner()
+        manager = runner.cudagraph_manager
+        manager._graphs_captured = True
+        graph = manager.graphs["stale"]
+        resources = manager.graph_capture_resources = {"stale": object()}
+        result = calibrate_capture_shapes(runner)
+        self.assertEqual(result["warmed_shapes"], 3)
+        self.assertTrue(manager._graphs_captured)
+        self.assertIs(manager.graphs["stale"], graph)
+        self.assertIs(manager.graph_capture_resources, resources)
+        self.assertEqual(manager.recorded, [])
+
     def test_v2_warms_piecewise_before_full_regardless_of_mapping_order(
         self,
     ) -> None:

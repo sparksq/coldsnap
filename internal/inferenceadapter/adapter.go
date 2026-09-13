@@ -2209,7 +2209,7 @@ func (adapter Adapter) constructArtifact(
 					packPath := filepath.Join(filepath.Dir(manifest.Path), modelPayloadName)
 					pack, packErr := adapter.remoteModelPayloadObject(
 						unitContext, unit, snapshot.WorkerOwner(manifest.Worker), packPath,
-						"pending-content-address", 0, "",
+						"pending-content-address", manifest.ModelPayload.Bytes, manifest.ModelPayload.SHA256,
 					)
 					if packErr != nil {
 						return packErr
@@ -2638,10 +2638,17 @@ func (adapter Adapter) removeCacheSeeds(
 	})
 }
 
+type capturedModelPayload struct {
+	Blob   string `json:"blob"`
+	Bytes  int64  `json:"bytes"`
+	SHA256 string `json:"sha256"`
+}
+
 type hydrationManifest struct {
-	Worker   string
-	Path     string
-	Relative string
+	Worker       string
+	Path         string
+	Relative     string
+	ModelPayload capturedModelPayload
 }
 
 func (adapter Adapter) hydrationManifests(
@@ -2675,7 +2682,8 @@ func (adapter Adapter) hydrationManifests(
 			return nil, fmt.Errorf("read hydration manifest %s: %w", path, readErr)
 		}
 		var identity struct {
-			Worker string `json:"worker_id"`
+			Worker       string               `json:"worker_id"`
+			ModelPayload capturedModelPayload `json:"model_payload"`
 		}
 		if decodeErr := json.Unmarshal(payload, &identity); decodeErr != nil {
 			return nil, fmt.Errorf("decode hydration manifest %s: %w", path, decodeErr)
@@ -2683,8 +2691,13 @@ func (adapter Adapter) hydrationManifests(
 		if !expected[identity.Worker] || seen[identity.Worker] {
 			return nil, fmt.Errorf("hydration manifest has invalid or duplicate worker %q", identity.Worker)
 		}
+		if identity.ModelPayload != (capturedModelPayload{}) && (identity.ModelPayload.Blob != modelPayloadName || identity.ModelPayload.Bytes <= 0 ||
+			(!strings.HasPrefix(identity.ModelPayload.SHA256, "sha256:") ||
+				!fsutil.ValidSHA256(strings.TrimPrefix(identity.ModelPayload.SHA256, "sha256:")))) {
+			return nil, fmt.Errorf("hydration manifest %s has invalid model payload identity", path)
+		}
 		seen[identity.Worker] = true
-		result = append(result, hydrationManifest{Worker: identity.Worker, Path: path, Relative: relative})
+		result = append(result, hydrationManifest{Worker: identity.Worker, Path: path, Relative: relative, ModelPayload: identity.ModelPayload})
 	}
 	slices.SortFunc(result, func(left, right hydrationManifest) int {
 		leftWorker, _ := launch.Execution.Worker(left.Worker)

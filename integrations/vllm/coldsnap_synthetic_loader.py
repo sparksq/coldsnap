@@ -34,10 +34,11 @@ _TORCH_DTYPE_ATTRIBUTES = {
     "F64": "float64",
     "F8_E4M3": "float8_e4m3fn",
     "F8_E5M2": "float8_e5m2",
+    "F8_E8M0": "float8_e8m0fnu",
 }
 
 NATIVE_BOOTSTRAP_INDEX_NAME = "native-bootstrap-index.json"
-NATIVE_BOOTSTRAP_INDEX_FORMAT = 1
+NATIVE_BOOTSTRAP_INDEX_FORMAT = 2
 NATIVE_BOOTSTRAP_INDEX_KIND = "coldsnap-native-bootstrap-index"
 _NATIVE_BOOTSTRAP_INDEX_LOCK = threading.Lock()
 
@@ -73,8 +74,8 @@ def record_native_bootstrap_source(
 ) -> Path | None:
     """Persist compact iterator metadata beside an n580 native manifest."""
     if (
-        not os.environ.get("COLDSNAP_PROCESS_TEMPLATE_PHASE")
-        or os.environ.get("COLDSNAP_EXPORT_MODEL_PAYLOAD") != "1"
+        os.environ.get("COLDSNAP_EXPORT_MODEL_PAYLOAD") != "1"
+        or os.environ.get("COLDSNAP_PROCESS_TEMPLATE_RESTORED") == "1"
     ):
         return None
     root = _native_bootstrap_root()
@@ -137,7 +138,7 @@ def _native_bootstrap_requested() -> bool:
         NATIVE_BOOTSTRAP_INDEX_NAME,
     ):
         if not (root / name).is_file():
-            raise RuntimeError(f"n580 native bootstrap is missing {name}")
+            raise RuntimeError(f"n580 native bootstrap is missing {name}; recapture with native bootstrap support")
     return True
 
 
@@ -150,7 +151,7 @@ def _native_bootstrap_weights(source: Any) -> Generator[tuple[str, Any], None, N
 
     if (
         not isinstance(value, dict)
-        or value.get("format") != NATIVE_BOOTSTRAP_INDEX_FORMAT
+        or value.get("format") not in {1, NATIVE_BOOTSTRAP_INDEX_FORMAT}
         or value.get("kind") != NATIVE_BOOTSTRAP_INDEX_KIND
         or value.get("capture_id") != os.environ.get("COLDSNAP_CAPTURE_ID", "")
         or value.get("worker_id") != _worker_id()
@@ -190,11 +191,39 @@ def _native_bootstrap_weights(source: Any) -> Generator[tuple[str, Any], None, N
             or length <= 0
         ):
             raise RuntimeError("n580 native bootstrap tensor metadata is invalid")
+        from coldsnap_recovery_loader import (
+            SafetensorDescriptor, _file_source_tensor, _validate_descriptor_size,
+        )
+        file_source = item.get("file_source")
+        prefix = str(getattr(source, "prefix", ""))
+        if not name.startswith(prefix):
+            raise RuntimeError("n580 native bootstrap tensor prefix changed")
+        file_filter = getattr(source, "file_weight_filter", None)
+        expects_file = file_filter is not None and file_filter(name[len(prefix):])
+        if expects_file != (file_source is not None):
+            raise RuntimeError("native bootstrap file-backed tensor contract changed; recapture required")
+        descriptor = SafetensorDescriptor(name, dtype_name, tuple(shape), 0, length)
+        _validate_descriptor_size(torch, descriptor)
         logical_bytes += length
-        yield name, materializer.tensor(torch, name, tuple(shape), dtype)
-    init_logger(__name__).info(
+        if file_source is not None:
+            if (
+                not isinstance(file_source, dict)
+                or not isinstance(file_source.get("path"), str)
+                or not Path(file_source["path"]).is_absolute()
+                or type(file_source.get("offset")) is not int
+                or file_source["offset"] < 8
+            ):
+                raise RuntimeError("native bootstrap file range is invalid")
+            path = Path(file_source["path"])
+            if file_source["offset"] + length > path.stat().st_size:
+                raise RuntimeError("native bootstrap file range exceeds checkpoint file")
+            descriptor = SafetensorDescriptor(name, dtype_name, tuple(shape), file_source["offset"], length)
+            yield name, _file_source_tensor(path, descriptor)
+        else:
+            yield name, materializer.tensor(torch, name, tuple(shape), dtype)
+    init_logger("vllm.model_executor.model_loader.default_loader").info(
         "Native bootstrap supplied %d tensors (%.2f GiB logical, %.2f MiB physical) in %.3f s",
-        materializer.stats.tensors,
+        len(matches[0]["tensors"]),
         logical_bytes / 1024**3,
         materializer.stats.physical_source_bytes / 1024**2,
         time.monotonic() - started,

@@ -1328,6 +1328,8 @@ func ValidateArtifact(artifact Artifact) error {
 	return artifact.Validate()
 }
 
+// RequestSHA256 identifies the decoded, default-resolved request, not the wire
+// bytes. Callers reproducing it must use DecodeRequest before hashing.
 func RequestSHA256(request Request) (string, error) {
 	data, err := json.Marshal(request)
 	if err != nil {

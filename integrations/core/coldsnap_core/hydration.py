@@ -28,6 +28,7 @@ _VERIFY_CRC32_SHA256 = 2
 _REGISTER_DEVICE_BUFFERS = 1
 _CAPTURE_FILE_SHA256 = 1
 _CAPTURE_VERIFY_READBACK = 2
+_CAPTURE_PAD_EXTENTS = 4
 DIRECT_ALIGNMENT = 4096
 
 
@@ -322,7 +323,7 @@ class NativeHydrator:
         return bool(self._capture_backend_available(backend_id))
 
     def resolve_capture_backend(
-        self, backend: str, extents: list[CaptureExtent]
+        self, backend: str, extents: list[CaptureExtent], *, pad_extents: bool = False
     ) -> str:
         if backend != "auto":
             if backend not in _CAPTURE_BACKENDS:
@@ -332,7 +333,7 @@ class NativeHydrator:
             return backend
         direct_compatible = all(
             extent.file_offset % DIRECT_ALIGNMENT == 0
-            and extent.length % DIRECT_ALIGNMENT == 0
+            and (pad_extents or extent.length % DIRECT_ALIGNMENT == 0)
             for extent in extents
         )
         if direct_compatible and self.capture_available("direct"):
@@ -471,6 +472,7 @@ class NativeHydrator:
         cuda_device: int = -1,
         file_sha256: bool = False,
         verify_readback: bool = False,
+        pad_extents: bool = False,
     ) -> CaptureResult:
         """Capture device extents through the shared staged native pipeline."""
         if not extents:
@@ -484,8 +486,12 @@ class NativeHydrator:
             if extent.file_offset < previous_end:
                 raise ValueError("capture extents must be ordered and non-overlapping")
             previous_end = extent.file_offset + extent.length
+            if pad_extents:
+                if extent.file_offset % DIRECT_ALIGNMENT:
+                    raise ValueError("padded capture offsets must be 4096-byte aligned")
+                previous_end = (previous_end + DIRECT_ALIGNMENT - 1) // DIRECT_ALIGNMENT * DIRECT_ALIGNMENT
         requested_backend = backend
-        backend = self.resolve_capture_backend(backend, extents)
+        backend = self.resolve_capture_backend(backend, extents, pad_extents=pad_extents)
         if self._capture_file is None:
             raise HydrationError(
                 "native transfer library does not expose the capture ABI"
@@ -517,6 +523,8 @@ class NativeHydrator:
             flags |= _CAPTURE_FILE_SHA256
         if verify_readback:
             flags |= _CAPTURE_VERIFY_READBACK
+        if pad_extents:
+            flags |= _CAPTURE_PAD_EXTENTS
         options = _NativeCaptureOptions(
             abi_version=ABI_VERSION,
             backend=backend_id,

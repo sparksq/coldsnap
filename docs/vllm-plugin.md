@@ -46,6 +46,38 @@ start with eager dispatch and capture graphs after readiness at the supported
 engine boundary. Capture-time calibration records the engine's supported graph
 plan; it does not assume that all runtime shapes are interchangeable.
 
+Deferred warmup supports workers with either a combined `kernel_warmup`
+function or separate `kernel_warmup` and `runtime_kernel_warmup` functions.
+The combined layout is used by the DeepSeek V4.1 image built from
+`local-inference-lab/vllm@3aada67721bfdb8b98355207ca3780bb32e6f434`.
+ColdSnap replays the combined hook once; split workers retain their existing
+completion-flag behavior. Profiling and kernel warmup remain synchronous unless
+deferral is enabled and an explicit KV-cache memory size is available. The
+worker's separate V1 sampler and V2 runner warmup still follow vLLM's own path.
+The checkpoint observer uses vLLM's literal weight-name prefix matching,
+including DSpark's `mtp.` prefix; it does not add a separator to the prefix.
+
+DSpark adaptive verification in this image initializes required cost tables
+inside `capture_model`. Use `coldsnap.process.async_graphs: false` in the
+sparkrun recipe so graph capture completes before readiness. Deferring that
+call leaves the tables unavailable during V2 sampler warmup. This setting
+retains vLLM's normal CUDA graphs and adaptive verification.
+
+Native-kernel models can finish warmup without entering `torch.compile`.
+ColdSnap records a compiler-cache namespace only when vLLM exposes one; an
+empty namespace clears an old marker instead of making capture fail. Nonempty
+cache paths still require the qualified directory layout.
+
+The default n580 pre-exec checkpoint precedes the inference engine. Once that
+validated boundary is released, capture acceptance and restore may create fresh
+`io_uring` readers for disk-backed Engram tables. Later checkpoint boundaries,
+including n610, retain the CRIU-compatible `io_uring` filter. This does not add
+checkpoint/restore support for live `io_uring` state.
+
+The engine launcher also applies vLLM's 65,535-descriptor soft-limit target to
+headless ranks, which bypass the API server's limit adjustment. It preserves
+the host hard limit and any higher existing soft limit.
+
 ## Capture and restore sequence
 
 Capture starts a real vLLM workload with sleep mode enabled. The adapter prefers
@@ -139,3 +171,26 @@ tests under `test/` and GPU qualification on the intended engine, model, driver,
 and topology. Contract tests alone do not establish successful GPU restore or
 startup performance. Use the [benchmark harnesses](../benchmarks/harnesses/README.md)
 for matched hardware measurements.
+
+## V4.1 model-owned prepared experts
+
+The qualified `B12xV41Experts` lifecycle keeps its packed expert tensors in
+`prepared` and releases the registered source Parameters. ColdSnap includes
+those canonical tensors in native model payloads and excludes checkpoint-backed
+weight/scale storage from recovery residuals. Derived activation scales and
+alphas remain residual-owned for recovery. Discovery qualifies the V4.1 class;
+an unrelated module's `prepared` attribute is not treated as model weights.
+
+Recovery aliases the original source metadata onto captured prepared storage
+and invokes the image's own `finalize_weights`. V4.1 normally invokes this from
+the root model, so the adapter also runs it before layerwise copyback into the
+released Parameters. It validates stable weight addresses and preserves the
+captured execution plan and local-ID buffer. Full replay, partial replay, and
+normal reload use the same preparation contract. Temporary hooks are restored
+on success and failure; older quant-method-owned B12x layers retain their
+existing lifecycle.
+
+Disk Engram tables remain file-backed. Their batch-bounded mapped-host cache
+and decoded GPU row buffers are runtime state, not the full table payload.
+The `weights.blob` name denotes residual allocator bytes; it does not mean
+that every byte is a model parameter or an Engram table.

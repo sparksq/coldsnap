@@ -166,6 +166,125 @@ class DeferredWarmupTest(unittest.TestCase):
         self.assertTrue(status["runtime_kernel_deferred"])
         self.assertEqual(events, ["profile", "kernel", "runtime-kernel"])
 
+    def test_worker_hooks_support_unified_and_split_warmup(self) -> None:
+        # Unified vLLM (including the DS4.1 image) has no separate runtime
+        # hook and returns None. Older split hooks return False when more
+        # runtime warmup is needed, or True when they already completed it.
+        for worker_name in ("Worker", "GPUWorker"):
+            for layout in ("unified", "split", "split-complete"):
+                for enabled, kv_bytes in ((True, 4096), (True, None), (False, 4096)):
+                    with self.subTest(
+                        worker=worker_name, layout=layout, enabled=enabled, kv_bytes=kv_bytes
+                    ):
+                        self._check_worker_warmup_layout(worker_name, layout, enabled, kv_bytes)
+
+    def _check_worker_warmup_layout(self, worker_name, layout, enabled, kv_bytes) -> None:
+        events: list[str] = []
+
+        class Worker:
+            def __init__(self) -> None:
+                self.cache_config = SimpleNamespace(
+                    kv_cache_memory_bytes=kv_bytes
+                )
+                self.model_runner = SimpleNamespace(
+                    profile_run=lambda: events.append("profile")
+                )
+
+            def determine_available_memory(self, *, budget: int) -> int:
+                self.model_runner.profile_run()
+                return budget
+
+        def kernel(_worker, *, process_local_only=False):
+            events.append("kernel")
+            if layout == "unified":
+                events.append("runtime-kernel")
+                return None
+            if layout == "split-complete":
+                events.append("runtime-kernel")
+                return True
+            return False
+
+        def runtime_kernel(_worker):
+            events.append("runtime-kernel")
+
+        module = SimpleNamespace(**{worker_name: Worker}, kernel_warmup=kernel)
+        if layout != "unified":
+            module.runtime_kernel_warmup = runtime_kernel
+        settings = deferred.DeferredWarmupSettings(enabled=enabled)
+        with mock.patch.object(deferred, "_effective_settings", return_value=settings):
+            deferred._install_worker_hooks(settings, module)
+            worker = Worker()
+            self.assertEqual(worker.determine_available_memory(budget=8192), 8192)
+            complete = module.kernel_warmup(worker)
+            if layout != "unified" and not complete:
+                module.runtime_kernel_warmup(worker)
+            should_defer = enabled and kv_bytes is not None
+            if should_defer:
+                self.assertEqual(events, [])
+            else:
+                self.assertEqual(events, ["profile", "kernel", "runtime-kernel"])
+            status = worker.coldsnap_run_deferred_warmup()
+            self.assertEqual(status["phase"], "ready")
+            self.assertEqual(status["profile_deferred"], should_defer)
+            self.assertEqual(status["kernel_deferred"], should_defer)
+            self.assertEqual(
+                status["runtime_kernel_deferred"], should_defer and layout != "unified"
+            )
+            # Running the RPC again must not repeat any work.
+            self.assertEqual(worker.coldsnap_run_deferred_warmup(), status)
+        self.assertEqual(events, ["profile", "kernel", "runtime-kernel"])
+        self.assertEqual(hasattr(module, "runtime_kernel_warmup"), layout != "unified")
+
+    def test_unified_kernel_preserves_synchronous_arguments_and_result(self) -> None:
+        class Worker:
+            def determine_available_memory(self):
+                return 4096
+
+        kernel = mock.Mock(return_value="result")
+        module = SimpleNamespace(Worker=Worker, kernel_warmup=kernel)
+        settings = deferred.DeferredWarmupSettings(enabled=False)
+        with mock.patch.object(deferred, "_effective_settings", return_value=settings):
+            deferred._install_worker_hooks(settings, module)
+            worker = Worker()
+            self.assertEqual(module.kernel_warmup(worker, process_local_only=True), "result")
+        kernel.assert_called_once_with(worker, process_local_only=True)
+
+    def test_worker_rejects_broken_hooks_before_installation(self) -> None:
+        for missing in ("determine", "kernel", "runtime"):
+            with self.subTest(missing=missing):
+                class Worker:
+                    def determine_available_memory(self):
+                        return 4096
+
+                original_determine = Worker.determine_available_memory
+                def kernel(_worker):
+                    return None
+
+                module = SimpleNamespace(Worker=Worker, kernel_warmup=kernel)
+                if missing == "determine":
+                    Worker.determine_available_memory = None
+                elif missing == "kernel":
+                    del module.kernel_warmup
+                else:
+                    module.runtime_kernel_warmup = None
+                with self.assertRaises(deferred.VllmContractError):
+                    deferred._install_worker_hooks(deferred.DeferredWarmupSettings(), module)
+                self.assertFalse(hasattr(Worker, "coldsnap_run_deferred_warmup"))
+                if missing != "determine":
+                    self.assertIs(Worker.determine_available_memory, original_determine)
+                if missing != "kernel":
+                    self.assertIs(module.kernel_warmup, kernel)
+
+    def test_unified_kernel_failure_is_terminal(self) -> None:
+        worker = SimpleNamespace()
+        deferred._state(worker).kernel_deferred = True
+        kernel = mock.Mock(side_effect=RuntimeError("JIT failed"))
+        status = deferred._run_deferred_warmup(worker, kernel, None)
+        self.assertEqual(status["phase"], "failed")
+        self.assertIn("JIT failed", status["error"])
+        self.assertEqual(deferred._run_deferred_warmup(worker, kernel, None), status)
+        kernel.assert_called_once_with(worker)
+
     def test_worker_never_swallows_shutdown(self) -> None:
         class Runner:
             @staticmethod

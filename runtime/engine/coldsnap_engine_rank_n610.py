@@ -548,11 +548,12 @@ def _child_environment(args: argparse.Namespace, job_file: Path) -> dict[str, st
     environment = os.environ.copy()
     engine = getattr(args, "engine", "vllm")
     environment["COLDSNAP_ENGINE"] = engine
-    if engine == "sglang":
-        # SGLang's TorchMemorySaver owns stable VMM regions during capture and
-        # explicitly cannot coexist with PyTorch expandable segments. Preserve
-        # every other allocator tuning while making that one ownership choice
-        # deterministic inside ColdSnap rather than in a recipe environment.
+    if engine in {"sglang", "vllm"}:
+        # n610 checkpoints a live CUDA context. The qualified DSv4 image with
+        # PyTorch 2.13 fails CUDA checkpoint with expandable segments enabled,
+        # despite ample host memory; stable segments checkpoint successfully.
+        # SGLang's TorchMemorySaver also requires this ownership policy.
+        # Preserve every other allocator tuning and both environment aliases.
         environment["PYTORCH_CUDA_ALLOC_CONF"] = _without_expandable_segments(
             environment.get("PYTORCH_CUDA_ALLOC_CONF")
         )
@@ -1080,6 +1081,31 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             tree = base._process_tree(target.pid)
             rss_bytes = sum(base._rss_bytes(pid) for pid in tree)
             regular_backings = _capture_regular_backings(args, tree)
+            # Keep the already-collected preparation evidence even if the CUDA
+            # checkpoint fails before capture.json can be committed. This adds
+            # no worker RPCs or payload verification at the checkpoint boundary.
+            state_fields = (
+                "state", "regions", "cuda_graph", "blob_bytes",
+                "discarded_bytes", "discard_detail", "sleep_seconds",
+                "unique_residual_bytes", "stored_residual_bytes",
+            )
+            base._atomic_json(args.artifact_root / "checkpoint-input.json", {
+                "format": 1,
+                "kind": f"coldsnap-{args.engine}-checkpoint-input",
+                "rank": args.rank,
+                "generation": generation,
+                "pre_checkpoint_response": before,
+                "checkpoint_prepare": prepare,
+                "nccl_workers_before_sleep": ib_before_sleep,
+                "hibernate_states": {
+                    name: {key: value for key, value in state.items() if key in state_fields}
+                    for name, state in hibernate_states.items()
+                },
+                "shape_calibration": shape_calibration,
+                "process_tree": tree,
+                "process_tree_rss_bytes": rss_bytes,
+                "controller_seconds": time.perf_counter() - started,
+            })
             command = _criu_command(args, "dump", "dump.log")
             command.extend(["--pid", str(target.pid)])
             dump_seconds = base._run_criu(command, _criu_environment(args, job_file))

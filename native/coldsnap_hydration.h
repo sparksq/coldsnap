@@ -79,6 +79,8 @@ enum coldsnap_capture_checksum {
 enum coldsnap_capture_flags {
     COLDSNAP_CAPTURE_FILE_SHA256 = 1U << 0,
     COLDSNAP_CAPTURE_VERIFY_READBACK = 1U << 1,
+    // Pad extent tails with zeros; checksums cover only logical source bytes.
+    COLDSNAP_CAPTURE_PAD_EXTENTS = 1U << 2,
 };
 
 struct coldsnap_capture_extent {

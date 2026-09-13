@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import re
+import resource
 import shlex
 import stat
 import sys
@@ -110,7 +111,7 @@ def _accelerator_state() -> tuple[list[str], list[str]]:
     return sorted(mappings), sorted(descriptors)
 
 
-def _process_template_pre_exec() -> None:
+def _process_template_pre_exec() -> bool:
     """Publish a driver-portable n580 boundary before the serving CLI execs.
 
     This boundary deliberately precedes both inference engines. A later vLLM
@@ -122,7 +123,7 @@ def _process_template_pre_exec() -> None:
     accelerate the post-restore startup path.
     """
     if os.environ.get("COLDSNAP_PROCESS_TEMPLATE_PHASE") != "pre_exec":
-        return
+        return False
     generation = os.environ.get("COLDSNAP_MODEL_LOAD_GENERATION", "").strip()
     ready_value = os.environ.get("COLDSNAP_MODEL_LOAD_READY_DIR", "").strip()
     release_value = os.environ.get("COLDSNAP_MODEL_LOAD_RELEASE_FILE", "").strip()
@@ -183,6 +184,7 @@ def _process_template_pre_exec() -> None:
             # restored service performs its activation load.
             os.environ["COLDSNAP_EXPORT_MODEL_PAYLOAD"] = "0"
             os.environ["COLDSNAP_PROCESS_TEMPLATE_RESTORED"] = "1"
+    return True
 
 
 def _clear_process_template_barrier_environment() -> None:
@@ -519,6 +521,20 @@ def _capture_load_format(command: list[str]) -> tuple[list[str], str | None]:
     return _replace_load_format(command, selected), selected
 
 
+def _prepare_vllm_file_limit() -> None:
+    """Apply vLLM's API-server descriptor budget to headless ranks too."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = 65535 if hard == resource.RLIM_INFINITY else min(65535, hard)
+    if soft == resource.RLIM_INFINITY or soft >= target:
+        return
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    print(
+        f"ColdSnap raised vLLM open-file soft limit from {soft} to {target}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _block_io_uring() -> None:
     library_name = ctypes.util.find_library("seccomp")
     if library_name is None:
@@ -568,7 +584,7 @@ def main() -> int:
     engine = os.environ.get("COLDSNAP_ENGINE", "vllm").strip().lower()
     if engine not in {"vllm", "sglang"}:
         raise ValueError(f"unsupported ColdSnap engine {engine!r}")
-    _process_template_pre_exec()
+    checkpoint_before_exec = _process_template_pre_exec()
     placement = _restored_placement()
     if placement is not None:
         command = _replace_restore_placement(command, placement)
@@ -633,7 +649,14 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
-    _block_io_uring()
+    # The n580 pre-exec template has already been checkpointed, and both
+    # capture acceptance and restore construct the engine from scratch after
+    # this boundary. Its disk-backed loaders may create fresh io_uring rings.
+    # Later checkpoint boundaries still need the CRIU-safe syscall filter.
+    if engine == "vllm":
+        _prepare_vllm_file_limit()
+    if not checkpoint_before_exec:
+        _block_io_uring()
     os.execvpe(command[0], command, os.environ)
     return 127
 

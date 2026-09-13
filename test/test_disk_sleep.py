@@ -1064,6 +1064,7 @@ class DiskSleepIoTest(unittest.TestCase):
             backend.chunk_bytes = 4096
             backend.verify_mode = "inline"
             backend.read_direct = False
+            backend.write_direct = False
             backend._stage_cache = []
             backend.memory_provider = memory
             backend.blob_path.write_bytes(b"obsolete")
@@ -1072,9 +1073,9 @@ class DiskSleepIoTest(unittest.TestCase):
 
             self.assertTrue(backend.blob_path.is_file())
             self.assertEqual(manifest["blob"], "weights.blob")
-            self.assertEqual(manifest["blob_bytes"], 4096)
+            self.assertEqual(manifest["blob_bytes"], 8192)
             self.assertIs(manifest["portable_residual_blob"], True)
-            self.assertEqual(manifest["write_io_mode"], "hybrid-residual-buffered")
+            self.assertEqual(manifest["write_io_mode"], "padded-buffered")
             self.assertEqual(manifest["allocation_bytes"], 8192)
             self.assertEqual(manifest["model_weight_bytes"], 4096)
             self.assertEqual(manifest["residual_bytes"], 4096)
@@ -1210,6 +1211,7 @@ class DiskSleepIoTest(unittest.TestCase):
             backend.verify_mode = "preverified"
             backend.read_direct = False
             backend.write_direct = False
+            backend.write_direct = False
             backend._stage_cache = []
             backend.memory_provider = memory
 
@@ -1227,11 +1229,11 @@ class DiskSleepIoTest(unittest.TestCase):
                 (backend.snapshot_dir / disk_backend.MODEL_PAYLOAD_NAME).stat().st_size,
                 12288,
             )
-            self.assertEqual(backend.blob_path.stat().st_size, 4095)
-            self.assertEqual(
-                (backend.snapshot_dir / disk_backend.NATIVE_RESIDUAL_NAME).stat().st_size,
-                3967,
-            )
+            self.assertEqual(backend.blob_path.stat().st_size, 16384)
+            self.assertFalse((backend.snapshot_dir / disk_backend.NATIVE_RESIDUAL_NAME).exists())
+            self.assertEqual(recovery["unique_residual_bytes"], 4095)
+            self.assertEqual(recovery["verification_seconds"], sum(recovery["verification_objects"].values()))
+            self.assertEqual(recovery["model_payload"]["validation"]["bytes_hashed"], 12288)
             (backend.snapshot_dir / disk_backend.ACTIVATION_PROVIDER_NAME).write_text(
                 "native\n", encoding="utf-8"
             )
@@ -1255,7 +1257,8 @@ class DiskSleepIoTest(unittest.TestCase):
             self.assertEqual(native["blob"], disk_backend.MODEL_PAYLOAD_NAME)
             self.assertEqual(native["model_weight_bytes"], 4225)
             self.assertEqual(native["residual_bytes"], 3967)
-            self.assertEqual(native["residual_blob"], disk_backend.NATIVE_RESIDUAL_NAME)
+            self.assertEqual(native["residual_blob"], "weights.blob")
+            self.assertEqual(native["residual_layout"], disk_backend.RESIDUAL_LAYOUT_SHARED)
             self.assertEqual(
                 backend.weight_recovery_source,
                 disk_backend.WEIGHT_SOURCE_SPLIT_NATIVE,
@@ -1814,6 +1817,44 @@ class DiskSleepIoTest(unittest.TestCase):
             recovery_loader.CHECKPOINT_DESTINATION_TENSOR_NAMES_ATTR,
         )
         self.assertEqual(recovery_loader._model_weight_tensors(model), [])
+
+    def test_layer_cached_b12x_owner_discovery_and_reload_retention(self) -> None:
+        class B12xExperts:
+            __module__ = "vllm.model_executor.layers.fused_moe.b12x"
+
+            def _prepared(self):
+                if self._prepared_experts is None:
+                    raise RuntimeError("not prepared")
+                return self._prepared_experts
+
+        fields = {name: object() for name in recovery_loader.B12X_PREPARED_WEIGHT_FIELDS}
+        prepared = SimpleNamespace(plan=SimpleNamespace(discards_source_parameters=True), **fields)
+        owner = B12xExperts()
+        owner._prepared_experts = prepared
+        owner._source_parameters_released = True
+        layer = SimpleNamespace(
+            quant_method=SimpleNamespace(moe_kernel=SimpleNamespace(fused_experts=owner)),
+            _b12x_prepared_experts=prepared,
+            b12x_warmup_provider=owner,
+            **{name: object() for name, _ in recovery_loader.B12X_SOURCE_STORAGE_FIELDS},
+        )
+        model = SimpleNamespace(named_modules=lambda: iter([("experts", layer)]))
+        self.assertEqual(recovery_loader._b12x_prepared_owners(model),
+                         [("experts", layer, owner, prepared)])
+        adapter, = recovery_loader._discover_b12x_recovery_storage(model)
+        adapter.begin_reload()
+        self.assertIsNone(owner._prepared_experts)
+        self.assertIs(layer._b12x_prepared_experts, prepared)
+        self.assertIs(adapter._live_owner(), owner)
+        adapter.abort_reload()
+        self.assertIs(owner._prepared(), prepared)
+        self.assertIs(layer._b12x_prepared_experts, prepared)
+        self.assertTrue(owner._source_parameters_released)
+        layer._b12x_prepared_experts = object()
+        with self.assertRaisesRegex(RuntimeError, "owners disagree"):
+            recovery_loader._b12x_prepared_owners(model)
+        unrelated = SimpleNamespace(_prepared=lambda: prepared, _prepared_experts=prepared)
+        self.assertIsNone(recovery_loader._b12x_prepared_experts(unrelated))
 
     def test_native_payload_layout_includes_registered_derived_model_state(self) -> None:
         class Tensor:
@@ -2830,28 +2871,91 @@ class DiskSleepIoTest(unittest.TestCase):
             self.assertEqual(getattr(worker, _CONFIGURED_MODEL_LEN_ATTR), 4096)
             self.assertIn("save", events)
 
-    def test_startup_plan_uses_configured_model_len_for_compile_cache(self) -> None:
-        observed: list[int] = []
+    def test_startup_plan_hash_identity_preserves_fitted_attention_capacity(self) -> None:
+        observed = []
+
+        class ModelConfig:
+            max_model_len = 13_300
+
+            def compute_hash(self):
+                # The real hash includes max_model_len among the config factors.
+                return str(self.max_model_len)
 
         class Worker:
-            def compile_or_warm_up_model(self) -> str:
-                observed.append(self.vllm_config.model_config.max_model_len)
+            def compile_or_warm_up_model(self):
+                config = self.vllm_config.model_config
+                observed.append((config.max_model_len, config.compute_hash()))
+                # New sparse attention allocates C128A buffers at the fitted
+                # limit, before compile_or_warm_up_model is called.
+                assert config.max_model_len <= self.attention_capacity
+                assert self.model_runner.model_state.max_model_len == config.max_model_len
                 return "compiled"
 
-        model_config = SimpleNamespace(max_model_len=13_300)
+        model_config = ModelConfig()
         worker = Worker()
+        worker.attention_capacity = 13_312
+        worker.model_runner = SimpleNamespace(
+            max_model_len=13_300,
+            model_state=SimpleNamespace(
+                model_config=model_config, max_model_len=1_048_576
+            ),
+        )
         worker.vllm_config = SimpleNamespace(
             model_config=model_config,
             compilation_config=SimpleNamespace(cache_dir=""),
         )
         setattr(worker, _CONFIGURED_MODEL_LEN_ATTR, 1_048_576)
-        module = SimpleNamespace(Worker=Worker)
-
-        _install_compile_cache_identity_hook(module)
+        _install_compile_cache_identity_hook(SimpleNamespace(Worker=Worker))
 
         self.assertEqual(worker.compile_or_warm_up_model(), "compiled")
-        self.assertEqual(observed, [1_048_576])
+        self.assertEqual(observed, [(13_300, "1048576")])
         self.assertEqual(model_config.max_model_len, 13_300)
+        self.assertEqual(model_config.compute_hash(), "13300")
+        self.assertEqual(ModelConfig().compute_hash(), "13300")
+
+    def test_startup_plan_leaves_unrelated_model_state_limits_unchanged(self) -> None:
+        class Worker:
+            def compile_or_warm_up_model(self):
+                return self.model_runner.model_state.max_model_len
+
+        for shared_config, runner_limit in ((False, 4096), (True, 8192)):
+            config = SimpleNamespace(max_model_len=4096)
+            worker = Worker()
+            worker.vllm_config = SimpleNamespace(
+                model_config=config, compilation_config=SimpleNamespace(cache_dir="")
+            )
+            worker.model_runner = SimpleNamespace(
+                max_model_len=runner_limit,
+                model_state=SimpleNamespace(
+                    model_config=config if shared_config else object(), max_model_len=8192
+                ),
+            )
+            _install_compile_cache_identity_hook(SimpleNamespace(Worker=Worker))
+            self.assertEqual(worker.compile_or_warm_up_model(), 8192)
+
+    def test_startup_plan_hash_identity_is_cleared_after_warmup_failure(self) -> None:
+        class ModelConfig:
+            max_model_len = 4096
+
+            def compute_hash(self):
+                return self.max_model_len
+
+        class Worker:
+            def compile_or_warm_up_model(self):
+                assert self.vllm_config.model_config.compute_hash() == 8192
+                assert self.vllm_config.model_config.max_model_len == 4096
+                raise RuntimeError("warmup failed")
+
+        worker = Worker()
+        worker.vllm_config = SimpleNamespace(
+            model_config=ModelConfig(),
+            compilation_config=SimpleNamespace(cache_dir=""),
+        )
+        setattr(worker, _CONFIGURED_MODEL_LEN_ATTR, 8192)
+        _install_compile_cache_identity_hook(SimpleNamespace(Worker=Worker))
+        with self.assertRaisesRegex(RuntimeError, "warmup failed"):
+            worker.compile_or_warm_up_model()
+        self.assertEqual(worker.vllm_config.model_config.compute_hash(), 4096)
 
     def test_capture_records_and_restore_reuses_compiler_cache_namespace(self) -> None:
         class Worker:
@@ -2906,6 +3010,37 @@ class DiskSleepIoTest(unittest.TestCase):
                 observed,
                 ["", str(root / "torch_compile_cache" / "84fd94c82e")],
             )
+
+    def test_capture_and_restore_without_a_torch_compile_namespace(self) -> None:
+        for cache_dir in (None, ""):
+            with self.subTest(cache_dir=cache_dir), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker = root / "coldsnap-compile-cache.json"
+                marker.write_text('{"schema":1,"kind":"coldsnap-vllm-compile-cache",'
+                                  '"namespace":"84fd94c82e"}')
+                observed = []
+
+                class Worker:
+                    def compile_or_warm_up_model(self, _observed=observed):
+                        _observed.append(self.vllm_config.compilation_config.cache_dir)
+                        return "native-warmed"
+
+                _install_compile_cache_identity_hook(SimpleNamespace(Worker=Worker))
+                for restored in (False, True):
+                    worker = Worker()
+                    worker.vllm_config = SimpleNamespace(
+                        model_config=SimpleNamespace(max_model_len=4096),
+                        compilation_config=SimpleNamespace(cache_dir=cache_dir),
+                    )
+                    environment = {"VLLM_CACHE_ROOT": str(root)}
+                    environment.update(
+                        {"COLDSNAP_PROCESS_TEMPLATE_RESTORED": "1"} if restored
+                        else {"COLDSNAP_CAPTURE_LOAD_FORMAT": "instanttensor"}
+                    )
+                    with patch.dict(os.environ, environment, clear=True):
+                        self.assertEqual(worker.compile_or_warm_up_model(), "native-warmed")
+                    self.assertFalse(marker.exists())
+                self.assertEqual(observed, [cache_dir, cache_dir])
 
     def test_compiler_cache_marker_rejects_unqualified_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3033,9 +3168,39 @@ class DiskSleepIoTest(unittest.TestCase):
             ],
         )
 
-    def test_fast_capture_iterator_attaches_recovery_source_metadata(self) -> None:
+    def test_recovery_loader_matches_vllm_literal_weight_prefixes(self) -> None:
+        names = ["mtp.0.weight", "mtp_extra.weight", "model.layer.weight", "model.layer_norm.weight"]
         metadata = {
-            "weight": {"dtype": "I8", "shape": [4], "data_offsets": [0, 4]},
+            name: {"dtype": "I8", "shape": [1], "data_offsets": [offset, offset + 1]}
+            for offset, name in enumerate(names)
+        }
+        encoded = json.dumps(metadata, separators=(",", ":")).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "weights.safetensors"
+            path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + b"abcd")
+            for prefixes, expected in (
+                (None, names),
+                ((), names),
+                (("mtp.",), [names[0]]),
+                (("mtp",), names[:2]),
+                (("model.layer",), names[2:]),
+                (("missing.",), []),
+            ):
+                with self.subTest(prefixes=prefixes):
+                    descriptors = recovery_descriptors(
+                        path, indexed_tensor_files=None, weight_name_prefixes=prefixes
+                    )
+                    self.assertEqual([item.name for item in descriptors], expected)
+
+    def test_fast_capture_iterator_attaches_recovery_source_metadata(self) -> None:
+        self._check_fast_capture_iterator("weight", None)
+
+    def test_fast_capture_iterator_observes_dspark_draft_prefix(self) -> None:
+        self._check_fast_capture_iterator("mtp.0.weight", ("mtp.",))
+
+    def _check_fast_capture_iterator(self, tensor_name, prefixes) -> None:
+        metadata = {
+            tensor_name: {"dtype": "I8", "shape": [4], "data_offsets": [0, 4]},
             "__metadata__": {"format": "pt"},
         }
         encoded = json.dumps(metadata, separators=(",", ":")).encode()
@@ -3068,14 +3233,14 @@ class DiskSleepIoTest(unittest.TestCase):
                 revision="revision",
                 fall_back_to_pt=False,
                 allow_patterns_overrides=None,
-                weight_name_prefixes=None,
+                weight_name_prefixes=prefixes,
                 prefix="",
             )
             prepared = SimpleNamespace(
                 folder=directory,
                 files=(str(path),),
                 prefix="",
-                weight_name_prefixes=None,
+                weight_name_prefixes=prefixes,
             )
             with (
                 patch.object(
@@ -3092,12 +3257,12 @@ class DiskSleepIoTest(unittest.TestCase):
                 iterator = recovery_loader._observed_capture_iterator(
                     loader,
                     source,
-                    iter([("weight", Tensor())]),
+                    iter([(tensor_name, Tensor())]),
                 )
                 name, _tensor = next(iterator)
                 active = recovery_loader._ACTIVE_RECOVERY_SOURCE.get()
-                self.assertEqual(name, "weight")
-                self.assertEqual(active.name, "weight")
+                self.assertEqual(name, tensor_name)
+                self.assertEqual(active.name, tensor_name)
                 self.assertEqual(active.path, os.path.abspath(path))
                 self.assertEqual(active.pointer, 0x1234)
                 with self.assertRaises(StopIteration):

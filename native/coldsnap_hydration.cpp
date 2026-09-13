@@ -558,18 +558,25 @@ void hydrate_staged(
     result.verified_extents = finish_checksums(checks, extents);
 }
 
-void validate_direct_capture_jobs(const std::vector<CaptureJob>& jobs) {
+uint64_t padded_capture_length(uint64_t length) {
+    if (length > std::numeric_limits<uint64_t>::max() - 4095) {
+        throw std::runtime_error("padded capture extent length overflows uint64");
+    }
+    return (length + 4095) / 4096 * 4096;
+}
+
+void validate_direct_capture_jobs(const std::vector<CaptureJob>& jobs, bool padded) {
     for (const auto& job : jobs) {
-        if (job.file_offset % 4096 != 0 || job.length % 4096 != 0) {
+        if (job.file_offset % 4096 != 0 || (!padded && job.length % 4096 != 0)) {
             throw std::runtime_error(
                 "direct capture requires 4096-byte aligned offsets and lengths");
         }
     }
 }
 
-bool direct_capture_jobs_compatible(const std::vector<CaptureJob>& jobs) {
-    return std::all_of(jobs.begin(), jobs.end(), [](const CaptureJob& job) {
-        return job.file_offset % 4096 == 0 && job.length % 4096 == 0;
+bool direct_capture_jobs_compatible(const std::vector<CaptureJob>& jobs, bool padded) {
+    return std::all_of(jobs.begin(), jobs.end(), [padded](const CaptureJob& job) {
+        return job.file_offset % 4096 == 0 && (padded || job.length % 4096 == 0);
     });
 }
 
@@ -596,19 +603,51 @@ void verify_capture_file(
     const coldsnap_capture_digest* expected,
     const coldsnap_capture_result& result) {
     const int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
-        (options.backend == COLDSNAP_CAPTURE_DIRECT ? O_DIRECT : 0);
+        (result.backend == COLDSNAP_CAPTURE_DIRECT ? O_DIRECT : 0);
     FileDescriptor fd(::open(path, flags));
     if (fd.get() < 0) {
         throw std::runtime_error(system_error("open capture blob for verification"));
     }
-    const auto jobs = make_capture_jobs(extents, extent_count, options.chunk_bytes);
     std::vector<CheckState> checks = make_capture_check_states(extents, extent_count);
     StagedTransport& transport = reusable_staged_transport(
         static_cast<size_t>(options.chunk_bytes), 1);
     void* buffer = transport.stage(0).data();
-    for (const auto& job : jobs) {
-        pread_exact(fd.get(), buffer, job.length, job.file_offset);
-        update_checksum(checks[job.extent_index], buffer, job.length);
+    std::unique_ptr<EVP_MD_CTX, DigestContextDeleter> sha;
+    if ((options.flags & COLDSNAP_CAPTURE_FILE_SHA256) != 0) {
+        sha = make_sha256_context("capture readback file SHA-256");
+        size_t extent_index = 0;
+        for (uint64_t offset = 0; offset < result.file_bytes;) {
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(
+                options.chunk_bytes, result.file_bytes - offset));
+            pread_exact(fd.get(), buffer, count, offset);
+            if (EVP_DigestUpdate(sha.get(), buffer, count) != 1) {
+                throw std::runtime_error("cannot update capture readback file SHA-256");
+            }
+            while (extent_index < extent_count) {
+                const auto& extent = extents[extent_index];
+                const uint64_t start = std::max(offset, extent.file_offset);
+                const uint64_t end = std::min(
+                    offset + count, extent.file_offset + extent.length);
+                if (end > start) {
+                    update_checksum(
+                        checks[extent_index], static_cast<uint8_t*>(buffer) + start - offset,
+                        static_cast<size_t>(end - start));
+                }
+                if (extent.file_offset + extent.length > offset + count) {
+                    break;
+                }
+                ++extent_index;
+            }
+            offset += count;
+        }
+    } else {
+        const bool padded = (options.flags & COLDSNAP_CAPTURE_PAD_EXTENTS) != 0;
+        const auto jobs = make_capture_jobs(extents, extent_count, options.chunk_bytes);
+        for (const auto& job : jobs) {
+            const size_t count = padded ? padded_capture_length(job.length) : job.length;
+            pread_exact(fd.get(), buffer, count, job.file_offset);
+            update_checksum(checks[job.extent_index], buffer, job.length);
+        }
     }
     std::vector<coldsnap_capture_digest> observed(extent_count);
     finish_capture_checksums(checks, observed.data());
@@ -629,18 +668,7 @@ void verify_capture_file(
                 "capture readback SHA-256 mismatch for extent " + std::to_string(index));
         }
     }
-    if ((options.flags & COLDSNAP_CAPTURE_FILE_SHA256) != 0) {
-        auto sha = make_sha256_context("capture readback file SHA-256");
-        uint64_t offset = 0;
-        while (offset < result.file_bytes) {
-            const size_t count = static_cast<size_t>(std::min<uint64_t>(
-                options.chunk_bytes, result.file_bytes - offset));
-            pread_exact(fd.get(), buffer, count, offset);
-            if (EVP_DigestUpdate(sha.get(), buffer, count) != 1) {
-                throw std::runtime_error("cannot update capture readback file SHA-256");
-            }
-            offset += count;
-        }
+    if (sha) {
         std::array<uint8_t, 32> observed_file{};
         finish_sha256(
             sha.get(), observed_file.data(), "capture readback file SHA-256");
@@ -660,9 +688,10 @@ void capture_staged(
     coldsnap_capture_result& result) {
     const auto initialization_started = Clock::now();
     const auto jobs = make_capture_jobs(extents, extent_count, options.chunk_bytes);
+    const bool padded = (options.flags & COLDSNAP_CAPTURE_PAD_EXTENTS) != 0;
     uint32_t backend = options.backend;
     if (backend == COLDSNAP_CAPTURE_AUTO) {
-        backend = direct_capture_jobs_compatible(jobs)
+        backend = direct_capture_jobs_compatible(jobs, padded)
             ? COLDSNAP_CAPTURE_DIRECT
             : COLDSNAP_CAPTURE_BUFFERED;
     }
@@ -684,7 +713,7 @@ void capture_staged(
     result.backend = backend;
     prepare_capture_file(fd.get(), result.file_bytes);
     if (backend == COLDSNAP_CAPTURE_DIRECT) {
-        validate_direct_capture_jobs(jobs);
+        validate_direct_capture_jobs(jobs, padded);
     }
     const size_t depth = std::min<size_t>(options.queue_depth, jobs.size());
     StagedTransport& transport = reusable_staged_transport(
@@ -761,10 +790,15 @@ void capture_staged(
         }
         result.checksum_ns += elapsed_ns(checksum_started);
 
+        const size_t write_length = padded ? padded_capture_length(job.length) : job.length;
+        if (write_length > job.length) {
+            std::memset(static_cast<uint8_t*>(stage.data()) + job.length, 0,
+                        write_length - job.length);
+        }
         stage.write = std::async(
             std::launch::async,
-            [fd_value = fd.get(), pointer = stage.data(), job]() {
-                return pwrite_exact(fd_value, pointer, job.length, job.file_offset);
+            [fd_value = fd.get(), pointer = stage.data(), job, write_length]() {
+                return pwrite_exact(fd_value, pointer, write_length, job.file_offset);
             });
         stage.write_active = true;
         ++completed;
@@ -1116,7 +1150,8 @@ void validate_capture_request(
             "capture chunk size must be positive and 4096-byte aligned");
     }
     const uint32_t supported_flags =
-        COLDSNAP_CAPTURE_FILE_SHA256 | COLDSNAP_CAPTURE_VERIFY_READBACK;
+        COLDSNAP_CAPTURE_FILE_SHA256 | COLDSNAP_CAPTURE_VERIFY_READBACK |
+        COLDSNAP_CAPTURE_PAD_EXTENTS;
     if ((options->flags & ~supported_flags) != 0 || options->reserved != 0) {
         throw std::runtime_error("unsupported capture options or flags");
     }
@@ -1135,7 +1170,13 @@ void validate_capture_request(
         }
         has_checksum = has_checksum ||
             extent.checksum != COLDSNAP_CAPTURE_CHECKSUM_NONE;
-        previous_end = extent.file_offset + extent.length;
+        const bool padded = (options->flags & COLDSNAP_CAPTURE_PAD_EXTENTS) != 0;
+        const uint64_t stored_length = padded ? padded_capture_length(extent.length) : extent.length;
+        if ((padded && extent.file_offset % 4096 != 0) ||
+            extent.file_offset > std::numeric_limits<uint64_t>::max() - stored_length) {
+            throw std::runtime_error("invalid padded capture extent layout");
+        }
+        previous_end = extent.file_offset + stored_length;
     }
     if ((options->flags & COLDSNAP_CAPTURE_VERIFY_READBACK) != 0 &&
         !has_checksum && (options->flags & COLDSNAP_CAPTURE_FILE_SHA256) == 0) {
@@ -1208,7 +1249,9 @@ extern "C" int coldsnap_capture_file(
                 throw std::runtime_error("capture byte count overflows uint64");
             }
             result->bytes += extents[index].length;
-            result->file_bytes = extents[index].file_offset + extents[index].length;
+            const uint64_t stored_length = (options->flags & COLDSNAP_CAPTURE_PAD_EXTENTS) != 0
+                ? padded_capture_length(extents[index].length) : extents[index].length;
+            result->file_bytes = extents[index].file_offset + stored_length;
         }
         if (options->cuda_device >= 0) {
             check_cuda(cudaSetDevice(options->cuda_device), "cudaSetDevice capture");

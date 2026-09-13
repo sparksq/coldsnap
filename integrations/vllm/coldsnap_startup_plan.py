@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import functools
 import json
 import os
@@ -24,6 +25,7 @@ _PHASE_FINGERPRINT_ATTR = "_coldsnap_startup_plan_initial_fingerprint"
 _PHASE_FINGERPRINT_MARKER = "_coldsnap_phase_stable_fingerprint"
 _CONFIGURED_MODEL_LEN_ATTR = "_coldsnap_startup_plan_configured_model_len"
 _COMPILE_IDENTITY_MARKER = "_coldsnap_startup_plan_compile_identity"
+_COMPILE_HASH_MODEL_LEN_ATTR = "_coldsnap_compile_hash_model_len"
 _GPU_WORKER_MODULE = "vllm.v1.worker.gpu_worker"
 _CAPTURE_LOAD_FORMAT_ENV = "COLDSNAP_CAPTURE_LOAD_FORMAT"
 _PROCESS_TEMPLATE_RESTORE_LOAD_FORMAT_ENV = (
@@ -113,7 +115,14 @@ def _read_compile_cache_marker() -> Path | None:
 
 
 def _write_compile_cache_marker(cache_dir: Any) -> None:
-    if not isinstance(cache_dir, str) or not cache_dir:
+    # Models implemented with native kernels (including DeepSeek V4.1's b12x
+    # path) can complete warmup without entering vLLM's torch.compile backend.
+    # There is no compiler namespace to preserve in that case. Remove any
+    # prior marker so a later restore cannot select an unrelated old cache.
+    if cache_dir is None or cache_dir == "":
+        _compile_cache_marker_path().unlink(missing_ok=True)
+        return
+    if not isinstance(cache_dir, str):
         raise RuntimeError("vLLM did not expose its compiler-cache directory")
     directory = Path(cache_dir)
     compile_root = _vllm_cache_root() / "torch_compile_cache"
@@ -238,6 +247,27 @@ def _install_free_memory_admission_hook(module: Any) -> None:
     worker_class.init_device = init_device_then_validate
 
 
+def _install_model_config_hash_identity(model_config: Any) -> None:
+    """Hash a configured-length copy without changing live attention limits."""
+    config_type = type(model_config)
+    original_hash = getattr(config_type, "compute_hash", None)
+    if not callable(original_hash):
+        raise RuntimeError("vLLM model configuration compute_hash is unavailable")
+    if getattr(original_hash, _COMPILE_IDENTITY_MARKER, False):
+        return
+
+    @functools.wraps(original_hash)
+    def compute_hash(config: Any, *args: Any, **kwargs: Any) -> Any:
+        configured = getattr(config, _COMPILE_HASH_MODEL_LEN_ATTR, None)
+        if configured is not None:
+            config = copy.copy(config)
+            config.max_model_len = configured
+        return original_hash(config, *args, **kwargs)
+
+    setattr(compute_hash, _COMPILE_IDENTITY_MARKER, True)
+    config_type.compute_hash = compute_hash
+
+
 def _install_compile_cache_identity_hook(module: Any) -> None:
     """Keep capture and startup-plan restores in one compiler cache namespace.
 
@@ -245,10 +275,9 @@ def _install_compile_cache_identity_hook(module: Any) -> None:
     profiles memory and reduces ``max_model_len``.  A restore that applies a
     persisted startup plan skips profiling, auto-fits the model length first,
     and otherwise computes its compiler-cache key from that derived value.
-    The derived scheduling limit does not change the graph captured for the
-    original configured model limit.  Temporarily expose the configured value
-    only while vLLM compiles or looks up its cache, then restore the fitted
-    runtime value.
+    Hash a configured-length copy while compiling or looking up the cache.
+    Keep the live fitted limit throughout warmup and graph capture: attention
+    metadata buffers may already have been allocated for that smaller limit.
     """
     worker_classes = []
     for name in ("Worker", "GPUWorker"):
@@ -285,6 +314,20 @@ def _install_compile_cache_identity_hook(module: Any) -> None:
         configured = getattr(worker, _CONFIGURED_MODEL_LEN_ATTR, None)
         model_config = getattr(vllm_config, "model_config", None)
         current = getattr(model_config, "max_model_len", None)
+        # Some v2 runners update their own and the request-state limits after
+        # KV fitting but leave ModelState's cached limit at the original value.
+        # Graph metadata reads that cache, while attention buffers use the
+        # fitted config. Keep these views consistent before any warmup.
+        runner = getattr(worker, "model_runner", None)
+        model_state = getattr(runner, "model_state", None)
+        if (
+            isinstance(current, int)
+            and current > 0
+            and getattr(model_state, "model_config", None) is model_config
+            and isinstance(getattr(model_state, "max_model_len", None), int)
+            and getattr(runner, "max_model_len", None) == current
+        ):
+            model_state.max_model_len = current
         use_configured_model_len = (
             not isinstance(configured, int)
             or configured <= 0
@@ -292,13 +335,18 @@ def _install_compile_cache_identity_hook(module: Any) -> None:
             or current <= 0
             or configured == current
         ) is False
+        previous_hash_length = getattr(model_config, _COMPILE_HASH_MODEL_LEN_ATTR, None)
         if use_configured_model_len:
-            model_config.max_model_len = configured
+            _install_model_config_hash_identity(model_config)
+            setattr(model_config, _COMPILE_HASH_MODEL_LEN_ATTR, configured)
         try:
             result = original(worker, *args, **kwargs)
         finally:
             if use_configured_model_len:
-                model_config.max_model_len = current
+                if previous_hash_length is None:
+                    delattr(model_config, _COMPILE_HASH_MODEL_LEN_ATTR)
+                else:
+                    setattr(model_config, _COMPILE_HASH_MODEL_LEN_ATTR, previous_hash_length)
 
         if os.environ.get(_CAPTURE_LOAD_FORMAT_ENV, "").strip():
             _write_compile_cache_marker(compilation_config.cache_dir)

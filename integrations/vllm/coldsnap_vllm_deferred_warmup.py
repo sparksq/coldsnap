@@ -189,7 +189,7 @@ def _determine_with_deferred_profile(
 def _run_deferred_warmup(
     worker: Any,
     original_kernel_warmup: Callable[..., Any],
-    original_runtime_kernel_warmup: Callable[..., Any],
+    original_runtime_kernel_warmup: Callable[..., Any] | None,
 ) -> dict[str, Any]:
     state = _state(worker)
     if state.phase in {"ready", "failed"}:
@@ -211,6 +211,8 @@ def _run_deferred_warmup(
         if state.kernel_deferred:
             runtime_complete = bool(original_kernel_warmup(worker))
         if state.runtime_kernel_deferred and not runtime_complete:
+            if original_runtime_kernel_warmup is None:
+                raise VllmContractError("Deferred runtime kernel warmup hook is unavailable")
             original_runtime_kernel_warmup(worker)
     except Exception as error:
         state.phase = "failed"
@@ -243,14 +245,16 @@ def _install_worker_hooks(
     original_determine = getattr(worker_class, "determine_available_memory", None)
     original_kernel = getattr(module, "kernel_warmup", None)
     original_runtime_kernel = getattr(module, "runtime_kernel_warmup", None)
-    if not (
-        callable(original_determine)
-        and callable(original_kernel)
-        and callable(original_runtime_kernel)
-    ):
+    if not callable(original_determine) or not callable(original_kernel):
         raise VllmContractError(
-            "GPU worker lacks determine_available_memory or kernel warmup hooks"
+            "GPU worker lacks determine_available_memory or kernel_warmup"
         )
+    # Some vLLM branches split runtime-dependent warmup into a second hook;
+    # newer branches perform that work inside kernel_warmup itself. Keep the
+    # split path when exposed, without inventing a runtime hook on unified
+    # workers or changing their separate V1 sampler / V2 runner warmup.
+    if hasattr(module, "runtime_kernel_warmup") and not callable(original_runtime_kernel):
+        raise VllmContractError("GPU worker runtime_kernel_warmup is not callable")
     if not getattr(original_determine, _DETERMINE_MARKER, False):
 
         @functools.wraps(original_determine)
@@ -285,7 +289,7 @@ def _install_worker_hooks(
         module.kernel_warmup = kernel_warmup
 
     original_runtime = getattr(module, "runtime_kernel_warmup", None)
-    if not getattr(original_runtime, _KERNEL_MARKER, False):
+    if callable(original_runtime_kernel) and not getattr(original_runtime, _KERNEL_MARKER, False):
 
         @functools.wraps(original_runtime_kernel)
         def runtime_kernel_warmup(worker: Any, *args: Any, **kwargs: Any) -> Any:

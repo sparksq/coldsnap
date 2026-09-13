@@ -88,6 +88,7 @@ MODEL_METADATA_ENV = "COLDSNAP_MODEL_METADATA_SHA256"
 MODEL_PAYLOAD_ENV = "COLDSNAP_EXPORT_MODEL_PAYLOAD"
 MODEL_PAYLOAD_NAME = "model-weights.pack"
 NATIVE_RESIDUAL_NAME = "native-residual.blob"
+RESIDUAL_LAYOUT_SHARED = "shared-padded-v1"
 NATIVE_MANIFEST_NAME = "native-manifest.json"
 ACTIVATION_PROVIDER_NAME = "activation-provider"
 ACTIVATION_DIRECTORY_PREFIX = "activation-directory-"
@@ -517,6 +518,70 @@ def _partition_semantic_weight_extents(
     if not model_extents or not residual_extents:
         raise RuntimeError(f"{label} requires model and residual byte ranges")
     return model_extents, residual_extents
+
+
+def _shared_residual_extents(
+    *views: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]]]:
+    """Partition the union once; each provider references the same stored pieces.
+
+    Boundaries from both providers keep every piece's CRC reusable, including
+    when their model ownership overlaps only partially. File offsets and CRCs
+    are filled by the writer on the shared dictionaries before publication.
+    """
+    events: dict[int, dict[int, list[tuple[int, int]]]] = {}
+    for view_index, extents in enumerate(views):
+        for extent in extents:
+            points = events.setdefault(int(extent["allocation_ptr"]), {})
+            start, size = int(extent["ptr"]), int(extent["size"])
+            points.setdefault(start, []).append((view_index, 1))
+            points.setdefault(start + size, []).append((view_index, -1))
+    stored: list[dict[str, Any]] = []
+    references: list[list[dict[str, Any]]] = [[] for _ in views]
+    for allocation, points in sorted(events.items()):
+        active = [0] * len(views)
+        previous = min(points)
+        for pointer, changes in sorted(points.items()):
+            if pointer > previous and any(active):
+                piece = {"ptr": previous, "size": pointer - previous, "allocation_ptr": allocation}
+                stored.append(piece)
+                for index, present in enumerate(active):
+                    if present:
+                        references[index].append(piece)
+            for index, delta in changes:
+                active[index] += delta
+                if active[index] not in (0, 1):
+                    raise RuntimeError("residual view contains overlapping ranges")
+            previous = pointer
+    return stored, references
+
+
+def _validate_residual_file_extents(
+    extents: list[dict[str, Any]], file_bytes: int, layout: str | None,
+) -> None:
+    """Accept legacy contiguous blobs or explicit aligned views of a shared blob."""
+    if layout not in (None, RESIDUAL_LAYOUT_SHARED):
+        raise ValueError("unknown residual file layout")
+    shared = layout == RESIDUAL_LAYOUT_SHARED
+    if file_bytes <= 0 or (shared and file_bytes % 4096):
+        raise ValueError("invalid residual file size")
+    cursor = 0
+    for extent in sorted(extents, key=lambda item: int(item["offset"])):
+        offset, size = int(extent["offset"]), int(extent["size"])
+        crc = extent.get("crc32")
+        if (
+            size <= 0 or offset < cursor
+            or (shared and offset % 4096)
+            or (not shared and offset != cursor)
+            or not isinstance(crc, str) or len(crc) != 8
+            or any(character not in "0123456789abcdef" for character in crc)
+        ):
+            raise ValueError("invalid residual extent")
+        cursor = offset + (_align_up(size) if shared else size)
+        if cursor > file_bytes:
+            raise ValueError("residual extent exceeds file")
+    if not shared and cursor != file_bytes:
+        raise ValueError("residual extents do not cover file")
 
 
 def _relocate_split_native_manifest(
@@ -1818,84 +1883,19 @@ class DiskCuMemBackend:
             if export_model_payload
             else (model_weight_extents, residual_extents)
         )
-        separate_native_residual = native_semantic_layout != semantic_layout
-        native_residual_bytes = sum(
-            int(extent["size"]) for extent in native_residual_extents
+        stored_extents, residual_views = _shared_residual_extents(
+            residual_extents, *([native_residual_extents] if export_model_payload else [])
         )
+        residual_extents = residual_views[0]
+        native_residual_extents = residual_views[-1]
+        stored_bytes = _packed_extent_bytes(stored_extents)
         model_payload_bytes = _packed_extent_bytes(native_model_extents)
-        self._ensure_space(
-            residual_bytes
-            + (
-                model_payload_bytes
-                + (native_residual_bytes if separate_native_residual else 0)
-                if export_model_payload
-                else 0
-            )
-        )
-        stage = self._stage()
-        tmp_blob = self.blob_path.with_name(
-            f".{self.blob_path.name}.{os.getpid()}.tmp"
-        )
-        fd = os.open(tmp_blob, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        blob_offset = 0
-        phases = {
-            "cuda_copy_s": 0.0,
-            "checksum_s": 0.0,
-            "disk_write_s": 0.0,
-            "preallocate_s": 0.0,
-            "sync_s": 0.0,
-        }
-        try:
-            phase = time.perf_counter()
-            _preallocate(fd, residual_bytes)
-            phases["preallocate_s"] += time.perf_counter() - phase
-            for extent in residual_extents:
-                extent["offset"] = blob_offset
-                crc = 0
-                copied = 0
-                while copied < int(extent["size"]):
-                    count = min(
-                        self.chunk_bytes, int(extent["size"]) - copied
-                    )
-                    phase = time.perf_counter()
-                    memory.copy_to_host(
-                        stage, int(extent["ptr"]) + copied, count
-                    )
-                    phases["cuda_copy_s"] += time.perf_counter() - phase
-                    view = stage.view[:count]
-                    phase = time.perf_counter()
-                    crc = zlib.crc32(view, crc)
-                    phases["checksum_s"] += time.perf_counter() - phase
-                    phase = time.perf_counter()
-                    _write_all_at(fd, view, blob_offset)
-                    phases["disk_write_s"] += time.perf_counter() - phase
-                    copied += count
-                    blob_offset += count
-                extent["crc32"] = f"{crc & 0xFFFFFFFF:08x}"
-            phase = time.perf_counter()
-            os.fdatasync(fd)
-            _drop_cache(fd, 0, 0)
-            phases["sync_s"] += time.perf_counter() - phase
-        except Exception:
-            os.close(fd)
-            tmp_blob.unlink(missing_ok=True)
-            raise
-        else:
-            os.close(fd)
-        if blob_offset != residual_bytes:
-            tmp_blob.unlink(missing_ok=True)
-            raise RuntimeError("residual snapshot byte count changed during write")
-        os.replace(tmp_blob, self.blob_path)
-        os.chmod(self.blob_path, 0o400)
-        blob_stat = _stat_identity(self.blob_path)
-        verification_s = 0.0
-        preverified = False
-        if self.verify_mode == "preverified":
-            phase = time.perf_counter()
-            self._verify_blob(residual_extents, residual_bytes, direct=False)
-            verification_s = time.perf_counter() - phase
-            preverified = True
-            blob_stat = _stat_identity(self.blob_path)
+        self._ensure_space(stored_bytes + (model_payload_bytes if export_model_payload else 0))
+        stored_residual = self._write_extent_blob(memory, stored_extents, self.blob_path)
+        blob_stat = stored_residual["stat"]
+        verification_s = stored_residual["verification_seconds"]
+        preverified = stored_residual["preverified"]
+        phases = dict(stored_residual["phase_seconds"])
 
         if model_weight_bytes + residual_bytes != allocation_bytes:
             raise RuntimeError(
@@ -1916,19 +1916,23 @@ class DiskCuMemBackend:
             "weight_source": WEIGHT_SOURCE_SAFETENSORS,
             "model_source": _model_source_identity(),
             "blob": self.blob_path.name,
-            "blob_bytes": residual_bytes,
+            "blob_bytes": stored_bytes,
             "blob_stat": blob_stat,
             # OCI/HF distribution necessarily changes filesystem identity.
-            # The capsule digest binds the object, and wake verifies every
-            # residual extent against its recorded CRC32 before exposing it.
+            # The capsule digest binds the object. Inline wake checks extent
+            # CRCs; preverified wake relies on capture and artifact admission.
             "portable_residual_blob": True,
             "allocation_bytes": allocation_bytes,
             "model_weight_bytes": model_weight_bytes,
             "residual_bytes": residual_bytes,
             "model_weight_extents": model_weight_extents,
             "residual_extents": residual_extents,
-            "direct_io": False,
-            "write_io_mode": "hybrid-residual-buffered",
+            "residual_layout": RESIDUAL_LAYOUT_SHARED,
+            "direct_io": stored_residual["direct_io"],
+            "write_io_mode": stored_residual["write_io_mode"],
+            "capture_backend": stored_residual["capture_backend"],
+            "stored_residual_bytes": stored_bytes,
+            "unique_residual_bytes": sum(int(extent["size"]) for extent in stored_extents),
             "blob_reused": False,
             "verify_mode": f"model-revision+residual-{self.verify_mode}",
             "checksum": "crc32",
@@ -1940,19 +1944,7 @@ class DiskCuMemBackend:
         }
         _atomic_json(self.manifest_path, manifest)
         if export_model_payload:
-            native_residual = {
-                "path": self.blob_path,
-                "bytes": residual_bytes,
-                "stat": blob_stat,
-                "extents": residual_extents,
-                "preverified": preverified,
-            }
-            if separate_native_residual:
-                native_residual = self._write_buffered_extent_blob(
-                    memory,
-                    native_residual_extents,
-                    native_residual_path,
-                )
+            native_residual = {**stored_residual, "extents": native_residual_extents}
             manifest["model_payload"] = self._write_model_payload(
                 memory,
                 native_model_extents,
@@ -1961,90 +1953,147 @@ class DiskCuMemBackend:
                 manifest,
                 native_residual,
             )
+            payload = manifest["model_payload"]
+            manifest["verification_seconds"] += payload["verification_seconds"]
+            for key, value in payload["phase_seconds"].items():
+                phases[key] = phases.get(key, 0.0) + value
+            manifest["verification_objects"] = {
+                self.blob_path.name: stored_residual["verification_seconds"],
+                model_payload_path.name: payload["verification_seconds"],
+            }
             manifest["model_payload_exported"] = True
             manifest["write_seconds"] = time.perf_counter() - started
             _atomic_json(self.manifest_path, manifest)
             self._model_payload_exported = True
         return manifest
 
-    def _write_buffered_extent_blob(
+    def _write_extent_blob(
         self,
         memory: Any,
-        source_extents: list[dict[str, Any]],
+        extents: list[dict[str, Any]],
         path: Path,
+        *,
+        file_sha256: bool = False,
+        verify_readback: bool | None = None,
     ) -> dict[str, Any]:
-        """Write one portable residual object without changing its semantics."""
-        extents = [dict(extent) for extent in source_extents]
-        required = sum(int(extent["size"]) for extent in extents)
-        if required <= 0:
-            raise RuntimeError("native residual payload is empty")
-        stage = self._stage()
+        """Write exact sources to padded file extents through the selected transport."""
+        logical_bytes = sum(int(extent["size"]) for extent in extents)
+        required = _packed_extent_bytes(extents)
+        if logical_bytes <= 0:
+            raise RuntimeError("capture extent payload is empty")
+        verify = self.verify_mode == "preverified" if verify_readback is None else verify_readback
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temporary.unlink(missing_ok=True)
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         offset = 0
+        for extent in extents:
+            extent["offset"] = offset
+            offset += _align_up(int(extent["size"]))
         started = time.perf_counter()
-        phases = {
-            "cuda_copy_s": 0.0,
-            "checksum_s": 0.0,
-            "disk_write_s": 0.0,
-            "preallocate_s": 0.0,
-            "sync_s": 0.0,
-        }
+        phases = {name: 0.0 for name in (
+            "cuda_copy_s", "checksum_s", "disk_write_s", "preallocate_s", "sync_s",
+        )}
+        transport = getattr(self, "capture_transport", None)
+        verification_s = 0.0
+        digest = None
         try:
-            phase = time.perf_counter()
-            _preallocate(fd, required)
-            phases["preallocate_s"] += time.perf_counter() - phase
-            for extent in extents:
-                extent["offset"] = offset
-                crc = 0
-                copied = 0
-                while copied < int(extent["size"]):
-                    count = min(self.chunk_bytes, int(extent["size"]) - copied)
+            if transport is not None:
+                captured = transport.capture(
+                    temporary,
+                    [CaptureExtent(
+                        file_offset=int(extent["offset"]), source=int(extent["ptr"]),
+                        length=int(extent["size"]),
+                        checksum="crc32+sha256" if file_sha256 else "crc32",
+                    ) for extent in extents],
+                    backend=self.capture_backend,
+                    chunk_bytes=self.chunk_bytes, queue_depth=self.pipeline_depth,
+                    cuda_device=int(os.environ.get("LOCAL_RANK", "0")),
+                    file_sha256=file_sha256, verify_readback=verify, pad_extents=True,
+                )
+                metrics = captured.metrics
+                if metrics.bytes != logical_bytes or metrics.file_bytes != required:
+                    raise RuntimeError("native capture extent byte count changed during write")
+                for extent, actual in zip(extents, captured.digests, strict=True):
+                    if actual.crc32 is None:
+                        raise RuntimeError("native capture omitted an extent CRC32")
+                    if file_sha256 and actual.sha256 != extent["sha256"]:
+                        raise RuntimeError("model payload extent changed during canonical write")
+                    extent["crc32"] = actual.crc32
+                digest = captured.file_sha256
+                if file_sha256 and (not isinstance(digest, str) or len(digest) != 64):
+                    raise RuntimeError("native capture omitted the file SHA-256")
+                direct = metrics.backend == "direct"
+                backend = "native-" + metrics.backend
+                phases.update({
+                    "cuda_copy_s": metrics.cuda_enqueue_s + metrics.cuda_synchronize_s,
+                    "checksum_s": metrics.checksum_s,
+                    "disk_write_s": metrics.io_service_s,
+                    "preallocate_s": metrics.initialization_s,
+                    "sync_s": metrics.durability_s,
+                    "io_wait_s": metrics.io_wait_s,
+                })
+                verification_s = metrics.verification_s
+            else:
+                stage = self._stage()
+                fd, direct = _open_blob(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, self.write_direct,
+                )
+                backend = "python-direct" if direct else "python-buffered"
+                whole = hashlib.sha256() if file_sha256 else None
+                try:
                     phase = time.perf_counter()
-                    memory.copy_to_host(stage, int(extent["ptr"]) + copied, count)
-                    phases["cuda_copy_s"] += time.perf_counter() - phase
-                    view = stage.view[:count]
+                    _preallocate(fd, required)
+                    phases["preallocate_s"] += time.perf_counter() - phase
+                    for extent in extents:
+                        crc, copied = 0, 0
+                        checksum = hashlib.sha256() if file_sha256 else None
+                        while copied < int(extent["size"]):
+                            count = min(self.chunk_bytes, int(extent["size"]) - copied)
+                            phase = time.perf_counter()
+                            memory.copy_to_host(stage, int(extent["ptr"]) + copied, count)
+                            phases["cuda_copy_s"] += time.perf_counter() - phase
+                            phase = time.perf_counter()
+                            crc = zlib.crc32(stage.view[:count], crc)
+                            if checksum is not None:
+                                checksum.update(stage.view[:count])
+                            write_count = _align_up(count)
+                            stage.view[count:write_count] = b"\0" * (write_count - count)
+                            if whole is not None:
+                                whole.update(stage.view[:write_count])
+                            phases["checksum_s"] += time.perf_counter() - phase
+                            phase = time.perf_counter()
+                            _write_all_at(fd, stage.view[:write_count], int(extent["offset"]) + copied)
+                            phases["disk_write_s"] += time.perf_counter() - phase
+                            copied += count
+                        if checksum is not None and checksum.hexdigest() != extent["sha256"]:
+                            raise RuntimeError("model payload extent changed during canonical write")
+                        extent["crc32"] = f"{crc & 0xFFFFFFFF:08x}"
                     phase = time.perf_counter()
-                    crc = zlib.crc32(view, crc)
-                    phases["checksum_s"] += time.perf_counter() - phase
-                    phase = time.perf_counter()
-                    _write_all_at(fd, view, offset)
-                    phases["disk_write_s"] += time.perf_counter() - phase
-                    copied += count
-                    offset += count
-                extent["crc32"] = f"{crc & 0xFFFFFFFF:08x}"
-            phase = time.perf_counter()
-            os.fdatasync(fd)
-            _drop_cache(fd, 0, 0)
-            phases["sync_s"] += time.perf_counter() - phase
+                    os.fdatasync(fd)
+                    if not direct:
+                        _drop_cache(fd, 0, 0)
+                    phases["sync_s"] += time.perf_counter() - phase
+                finally:
+                    os.close(fd)
+                digest = whole.hexdigest() if whole is not None else None
+            os.replace(temporary, path)
+            os.chmod(path, 0o400)
+            if verify and transport is None:
+                phase = time.perf_counter()
+                self._verify_blob(
+                    extents, required, direct=False, path=path,
+                    expected_verified_bytes=logical_bytes,
+                )
+                verification_s = time.perf_counter() - phase
         except Exception:
-            os.close(fd)
             temporary.unlink(missing_ok=True)
             raise
-        else:
-            os.close(fd)
-        if offset != required:
-            temporary.unlink(missing_ok=True)
-            raise RuntimeError("native residual payload byte count changed during write")
-        os.replace(temporary, path)
-        os.chmod(path, 0o400)
-        verification_s = 0.0
-        preverified = False
-        if self.verify_mode == "preverified":
-            phase = time.perf_counter()
-            self._verify_blob(extents, required, direct=False, path=path)
-            verification_s = time.perf_counter() - phase
-            preverified = True
         return {
-            "path": path,
-            "bytes": required,
-            "stat": _stat_identity(path),
-            "extents": extents,
-            "preverified": preverified,
+            "path": path, "bytes": required, "stat": _stat_identity(path),
+            "extents": extents, "preverified": verify, "sha256": digest,
+            "direct_io": direct, "write_io_mode": "padded-direct" if direct else "padded-buffered",
+            "capture_backend": backend, "residual_layout": RESIDUAL_LAYOUT_SHARED,
             "verification_seconds": verification_s,
-            "write_seconds": time.perf_counter() - started,
-            "phase_seconds": phases,
+            "write_seconds": time.perf_counter() - started, "phase_seconds": phases,
         }
 
     def _write_model_payload(
@@ -2081,106 +2130,34 @@ class DiskCuMemBackend:
         canonical_extents.sort(key=lambda extent: (extent["sha256"], extent["size"]))
         model_bytes = sum(int(extent["size"]) for extent in canonical_extents)
         required = _packed_extent_bytes(canonical_extents)
-        temporary = payload_path.with_name(
-            f".{payload_path.name}.{os.getpid()}.tmp"
+        fingerprint_seconds = time.perf_counter() - fingerprint_started
+        # SHA readback below also publishes the canonical receipt consumed by
+        # the controller. Do not first reread this pack for a separate CRC check.
+        written = self._write_extent_blob(
+            memory, canonical_extents, payload_path, file_sha256=True, verify_readback=False,
         )
-        fd, direct = _open_blob(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-            self.write_direct,
-        )
-        entries: list[dict[str, Any]] = []
-        offset = 0
-        payload_digest = hashlib.sha256()
-        phases = {
-            "cuda_copy_s": 0.0,
-            "checksum_s": 0.0,
-            "disk_write_s": 0.0,
-            "preallocate_s": 0.0,
-            "sync_s": 0.0,
-            "canonical_fingerprint_s": time.perf_counter() - fingerprint_started,
-        }
-        try:
-            phase = time.perf_counter()
-            _preallocate(fd, required)
-            phases["preallocate_s"] += time.perf_counter() - phase
-            for source_extent in canonical_extents:
-                extent = dict(source_extent)
-                extent_offset = offset
-                copied = 0
-                crc = 0
-                digest = hashlib.sha256()
-                while copied < int(extent["size"]):
-                    count = min(self.chunk_bytes, int(extent["size"]) - copied)
-                    phase = time.perf_counter()
-                    memory.copy_to_host(
-                        stage,
-                        int(extent["ptr"]) + copied,
-                        count,
-                    )
-                    phases["cuda_copy_s"] += time.perf_counter() - phase
-                    view = stage.view[:count]
-                    phase = time.perf_counter()
-                    crc = zlib.crc32(view, crc)
-                    digest.update(view)
-                    phases["checksum_s"] += time.perf_counter() - phase
-                    phase = time.perf_counter()
-                    write_count = count
-                    if count % 4096:
-                        write_count = _align_up(count)
-                        stage.view[count:write_count] = b"\0" * (write_count - count)
-                    payload_digest.update(stage.view[:write_count])
-                    _write_all_at(fd, stage.view[:write_count], offset)
-                    phases["disk_write_s"] += time.perf_counter() - phase
-                    copied += count
-                    offset += write_count
-                if digest.hexdigest() != extent["sha256"]:
-                    raise RuntimeError(
-                        "model payload extent changed during canonical write"
-                    )
-                entries.append(
-                    {
-                        **extent,
-                        "offset": extent_offset,
-                        "crc32": f"{crc & 0xFFFFFFFF:08x}",
-                    }
-                )
-            phase = time.perf_counter()
-            if offset != required:
-                raise RuntimeError("model payload byte count changed during write")
-            os.fdatasync(fd)
-            if not direct:
-                _drop_cache(fd, 0, 0)
-            phases["sync_s"] += time.perf_counter() - phase
-        except Exception:
-            os.close(fd)
-            temporary.unlink(missing_ok=True)
-            raise
-        else:
-            os.close(fd)
-        os.replace(temporary, payload_path)
-        os.chmod(payload_path, 0o400)
-        payload_stat = _stat_identity(payload_path)
+        entries = written["extents"]
+        direct = written["direct_io"]
+        phases = written["phase_seconds"]
+        phases["canonical_fingerprint_s"] = fingerprint_seconds
+        payload_sha256 = "sha256:" + written["sha256"]
         verification_s = 0.0
         preverified = False
+        validation = None
         if self.verify_mode == "preverified":
             phase = time.perf_counter()
-            self._verify_blob(
-                entries,
-                required,
-                direct=False,
-                path=payload_path,
-                expected_verified_bytes=model_bytes,
-            )
+            validation = validate_payload(payload_path, payload_sha256, required)
             verification_s = time.perf_counter() - phase
             preverified = True
-            payload_stat = _stat_identity(payload_path)
+        payload_stat = _stat_identity(payload_path)
         payload_seconds = time.perf_counter() - fingerprint_started
         payload_record = {
             "blob": payload_path.name,
             "manifest": manifest_path.name,
             "bytes": required,
-            "sha256": "sha256:" + payload_digest.hexdigest(),
+            "sha256": payload_sha256,
+            "capture_backend": written["capture_backend"],
+            "validation": validation,
             "blob_stat": payload_stat,
             "write_seconds": payload_seconds,
             "verification_seconds": verification_s,
@@ -2221,6 +2198,8 @@ class DiskCuMemBackend:
             "residual_blob": residual_path.name,
             "residual_blob_bytes": int(native_residual["bytes"]),
             "residual_blob_stat": native_residual["stat"],
+            "residual_layout": native_residual["residual_layout"],
+            "residual_capture_backend": native_residual["capture_backend"],
             "allocation_bytes": recovery_manifest["allocation_bytes"],
             "model_weight_bytes": model_bytes,
             "residual_bytes": residual_bytes,
@@ -2236,10 +2215,13 @@ class DiskCuMemBackend:
             # staged payload's artifact SHA-256 before it is bind-mounted.
             "portable_model_payload": True,
             "portable_residual_blob": True,
-            "verification_seconds": verification_s,
+            "verification_seconds": verification_s + native_residual["verification_seconds"],
             "entries": recovery_manifest["entries"],
-            "write_seconds": payload_seconds,
-            "phase_seconds": phases,
+            "write_seconds": payload_seconds + native_residual["write_seconds"],
+            "phase_seconds": {
+                key: phases.get(key, 0.0) + native_residual["phase_seconds"].get(key, 0.0)
+                for key in phases.keys() | native_residual["phase_seconds"].keys()
+            },
         }
         _atomic_json(manifest_path, native_manifest)
         return payload_record
@@ -2882,6 +2864,7 @@ class DiskCuMemBackend:
 
         self.residual_blob_path = residual_path
         rebound = dict(manifest)
+        rebound.pop("residual_layout", None)
         rebound.update(
             {
                 "residual_blob": residual_path.name,
@@ -2956,6 +2939,7 @@ class DiskCuMemBackend:
         *,
         allow_process_template_owner: bool = False,
         allow_materialization_layout: bool = False,
+        initial_native: bool = False,
     ) -> dict[str, Any]:
         memory = self._memory(provider)
         activation = self.snapshot_dir / ACTIVATION_PROVIDER_NAME
@@ -2985,6 +2969,11 @@ class DiskCuMemBackend:
                 self.weight_recovery_source = WEIGHT_SOURCE_SAFETENSORS
             else:
                 raise RuntimeError("activation provider must be native or recovery")
+        if initial_native and (
+            selected != "native"
+            or os.environ.get("COLDSNAP_PROCESS_TEMPLATE_RESTORED") != "1"
+        ):
+            raise RuntimeError("initial native hydration requires a restored native activation")
         manifest = json.loads(self.manifest_path.read_text())
         if not isinstance(manifest, dict):
             raise RuntimeError("live hibernation manifest must be an object")
@@ -3006,7 +2995,14 @@ class DiskCuMemBackend:
             bool(getattr(allocation, "is_released", False))
             for allocation in allocations
         )
-        if (
+        if initial_native:
+            # Validate the captured artifact in its own address space. Only its
+            # semantic model ranges will be copied into fresh, already-mapped
+            # weights. This startup path must not snapshot/replay runtime
+            # residuals or require capture-time CuMem allocation boundaries.
+            if allocations_released:
+                raise RuntimeError("initial native hydration requires resident weight allocations")
+        elif (
             selected == "native"
             and allocations_released
             and isinstance(cached_native, dict)
@@ -3117,7 +3113,7 @@ class DiskCuMemBackend:
             raise RuntimeError("snapshot allocation entries are invalid") from error
         if len(saved) != len(entries):
             raise RuntimeError("snapshot allocation entries contain duplicates")
-        if current != saved and not materialization_layout:
+        if current != saved and not (materialization_layout or initial_native):
             raise RuntimeError("snapshot allocation map differs from the live worker")
         if weight_source == WEIGHT_SOURCE_SPLIT_NATIVE:
             model_extents = manifest.get("model_weight_extents")
@@ -3143,8 +3139,8 @@ class DiskCuMemBackend:
                 or manifest.get("verify_mode") != self.verify_mode
                 or manifest.get("preverified")
                 is not (self.verify_mode == "preverified")
-                or int(manifest.get("allocation_bytes", -1))
-                != sum(item.size for item in memory.allocations("weights"))
+                or (not initial_native and int(manifest.get("allocation_bytes", -1))
+                    != sum(item.size for item in memory.allocations("weights")))
                 or int(manifest.get("allocation_bytes", -1))
                 != sum(int(entry["size"]) for entry in entries)
                 or any(
@@ -3178,6 +3174,11 @@ class DiskCuMemBackend:
                     (model_extents, "model_blob_bytes", True),
                     (residual_extents, "residual_blob_bytes", False),
                 ):
+                    if not padded:
+                        _validate_residual_file_extents(
+                            extents, int(manifest[byte_key]), manifest.get("residual_layout"),
+                        )
+                        continue
                     expected_offset = 0
                     for extent in extents:
                         if (
@@ -3246,8 +3247,18 @@ class DiskCuMemBackend:
                         manifest.get("blob_stat", {}), actual_stat
                     )
                 )
-                or manifest.get("direct_io") is not False
-                or manifest.get("write_io_mode") != "hybrid-residual-buffered"
+                or (
+                    (manifest.get("residual_layout") is None and (
+                        manifest.get("direct_io") is not False
+                        or manifest.get("write_io_mode") != "hybrid-residual-buffered"
+                    ))
+                    or (manifest.get("residual_layout") is not None and (
+                        manifest.get("residual_layout") != RESIDUAL_LAYOUT_SHARED
+                        or manifest.get("write_io_mode") != (
+                            "padded-direct" if manifest.get("direct_io") is True else "padded-buffered"
+                        )
+                    ))
+                )
                 or manifest.get("blob_reused") is not False
                 or manifest.get("verify_mode")
                 != f"model-revision+residual-{self.verify_mode}"
@@ -3286,17 +3297,9 @@ class DiskCuMemBackend:
                     if size <= 0 or pointer < start or pointer + size > end:
                         raise ValueError
                     covered[allocation_ptr].append((pointer, pointer + size))
-                expected_offset = 0
-                for extent in residual_extents:
-                    if (
-                        int(extent["offset"]) != expected_offset
-                        or not isinstance(extent.get("crc32"), str)
-                        or len(extent["crc32"]) != 8
-                    ):
-                        raise ValueError
-                    expected_offset += int(extent["size"])
-                if expected_offset != int(manifest["blob_bytes"]):
-                    raise ValueError
+                _validate_residual_file_extents(
+                    residual_extents, int(manifest["blob_bytes"]), manifest.get("residual_layout"),
+                )
                 for allocation_ptr, ranges in covered.items():
                     cursor, end = allocation_ranges[allocation_ptr]
                     for start, range_end in sorted(ranges):
@@ -3314,7 +3317,8 @@ class DiskCuMemBackend:
                 if (
                     model_weight_bytes != int(manifest["model_weight_bytes"])
                     or residual_bytes != int(manifest["residual_bytes"])
-                    or residual_bytes != int(manifest["blob_bytes"])
+                    or (manifest.get("residual_layout") is None
+                        and residual_bytes != int(manifest["blob_bytes"]))
                     or model_weight_bytes + residual_bytes
                     != int(manifest["allocation_bytes"])
                 ):
@@ -3401,6 +3405,10 @@ class DiskCuMemBackend:
                 sleep_seconds=duration,
                 write_seconds=manifest["write_seconds"],
                 verification_seconds=manifest["verification_seconds"],
+                verification_objects=manifest.get("verification_objects", {}),
+                capture_backend=manifest.get("capture_backend"),
+                unique_residual_bytes=manifest.get("unique_residual_bytes"),
+                stored_residual_bytes=manifest.get("stored_residual_bytes"),
                 unmap_seconds=unmap_s,
                 graph_unmap_seconds=graph_unmap_s,
                 cuda_graph=graph_state,
@@ -3689,9 +3697,10 @@ class DiskCuMemBackend:
                     phase = time.perf_counter()
                     _read_exact_at(fd, view, int(entry["offset"]) + copied)
                     io_seconds += time.perf_counter() - phase
-                    phase = time.perf_counter()
-                    crc = zlib.crc32(view, crc)
-                    checksum_seconds += time.perf_counter() - phase
+                    if self.verify_mode == "inline":
+                        phase = time.perf_counter()
+                        crc = zlib.crc32(view, crc)
+                        checksum_seconds += time.perf_counter() - phase
                     phase = time.perf_counter()
                     memory.copy_from_host(int(entry["ptr"]) + copied, stage, count)
                     cuda_copy_seconds += time.perf_counter() - phase
@@ -3726,6 +3735,52 @@ class DiskCuMemBackend:
             manifest["residual_extents"],
             "recovery residual",
         )
+
+    def hydrate_initial_native_weights(self) -> dict[str, Any]:
+        """Fill a freshly finalized model before warmup, preserving live runtime state."""
+        memory = self._memory()
+        memory.synchronize()
+        manifest = self._load_manifest(memory, initial_native=True)
+        semantics = tuple(self._native_model_payload_semantics)
+        live = {str(key): (int(pointer), int(size)) for pointer, size, key in semantics}
+        captured = manifest["model_weight_extents"]
+        if (
+            not semantics or len(live) != len(semantics)
+            or len({entry.get("semantic_id") for entry in captured}) != len(captured)
+            or set(live) != {entry.get("semantic_id") for entry in captured}
+        ):
+            raise RuntimeError("initial native semantic model layout differs from the captured model")
+        allocations = list(memory.allocations(PRESERVED_REGION))
+        relocated = []
+        ranges = []
+        for entry in captured:
+            pointer, size = live[entry["semantic_id"]]
+            owners = [allocation for allocation in allocations if (
+                allocation.pointer <= pointer
+                and pointer + size <= allocation.pointer + allocation.size
+                and not allocation.is_released
+            )]
+            if size != int(entry["size"]) or size <= 0 or len(owners) != 1:
+                raise RuntimeError("initial native model extent differs from the live weight allocation")
+            ranges.append((pointer, pointer + size))
+            relocated.append({**entry, "ptr": pointer, "allocation_ptr": owners[0].pointer})
+        ordered = sorted(ranges)
+        if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:], strict=False)):
+            raise RuntimeError("initial native model extents overlap")
+        # _load_manifest validates ownership and file ranges; the controller's
+        # preverified admission remains authoritative for immutable pack bytes.
+        started = time.perf_counter()
+        metrics = self._restore_exact_extents(
+            memory, self.blob_path, relocated, "initial native model payload",
+        )
+        memory.synchronize()
+        result = {
+            **metrics,
+            "bytes": sum(int(entry["size"]) for entry in relocated),
+            "seconds": time.perf_counter() - started,
+        }
+        self._write_state("running", operation="initial-native-hydration", metrics=result)
+        return result
 
     def _restore_split_native(
         self, provider: Any, manifest: dict[str, Any]

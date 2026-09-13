@@ -50,6 +50,27 @@ receipt has `state: failed`. The receipt binds the operation ID and canonical
 request SHA-256, records the selected engine and snapshot driver, and describes
 the operation's replay semantics.
 
+`request_sha256` is `sha256:` followed by the lowercase SHA-256 of
+`CanonicalJSON(json.Marshal(decodedRequest))`. The controller first strictly
+decodes the request, applies the selected driver's defaults and the documented
+presence-sensitive overrides, then serializes the resulting request struct.
+Canonical JSON recursively sorts object keys, uses compact separators, and
+escapes strings with Python's `ensure_ascii=True` convention. This is **not** a
+checksum of the submitted bytes, nor of canonicalized input before default
+resolution. Equivalent whitespace, key order, Unicode escapes, and omitted
+versus explicit defaults yield the same digest after decoding. A changed
+resolved field changes the digest even if the operation ID is reused.
+
+Clients should correlate the receipt's `operation_id`, `operation`, engine,
+and snapshot driver with the submitted request and retain `request_sha256` for
+audit and timing-stream consistency. Independently comparing this digest
+requires the same controller-version decoding, defaults, field serialization,
+and canonicalization; hashing the original input bytes is insufficient. The
+echoed ID and operation alone do not prove that every other request field
+matches, and the digest is not a signature. This control-message digest does
+not read or hash model payload files and is separate from payload-validation
+receipts used by preverified hydration.
+
 Receipt format 2 also carries a bounded `timing` envelope. It contains a span
 tree plus an explicit clock inventory rather than one flattened controller
 duration. Controller and engine-adapter phases are recorded separately, and

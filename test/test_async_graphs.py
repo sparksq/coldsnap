@@ -109,6 +109,25 @@ class AsyncGraphCaptureTest(unittest.TestCase):
         self.assertEqual(runner.capture_calls, 1)
         self.assertFalse(runner.cudagraph_dispatcher._coldsnap_force_eager)
 
+    def test_adaptive_verification_rejects_deferral_before_mutating_runner(self) -> None:
+        runner = SimpleNamespace(
+            adaptive_verification=SimpleNamespace(cost_tables=None),
+            cudagraph_dispatcher=self.Dispatcher(),
+            capture_model=lambda: 128,
+        )
+        worker = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="FULL")),
+            model_runner=runner,
+        )
+        original_capture = runner.capture_model
+        with self.assertRaisesRegex(async_graphs.VllmContractError, "async_graphs=false"):
+            async_graphs._compile_eager_first(worker, lambda _: self.fail("unexpected warmup"))
+        self.assertIs(runner.capture_model, original_capture)
+        self.assertFalse(hasattr(worker, "_coldsnap_async_graph_state"))
+        self.assertFalse(hasattr(runner.cudagraph_dispatcher, "_coldsnap_force_eager"))
+
     def test_retained_policy_captures_normal_graphs_before_snapshot(self) -> None:
         class Runner:
             def __init__(self, dispatcher) -> None:

@@ -22,6 +22,29 @@ import coldsnap_engine_exec as engine_exec  # noqa: E402
 
 
 class EngineExecTest(unittest.TestCase):
+    def test_vllm_file_limit_preserves_hard_limit_and_existing_headroom(self) -> None:
+        infinity = engine_exec.resource.RLIM_INFINITY
+        cases = (
+            ((1024, 524288), (65535, 524288)),
+            ((1024, 4096), (4096, 4096)),
+            ((1024, infinity), (65535, infinity)),
+            ((65535, 524288), None),
+            ((524288, 524288), None),
+            ((4096, 4096), None),
+            ((infinity, infinity), None),
+        )
+        for limits, expected in cases:
+            with (
+                self.subTest(limits=limits),
+                patch.object(engine_exec.resource, "getrlimit", return_value=limits),
+                patch.object(engine_exec.resource, "setrlimit") as set_limit,
+            ):
+                engine_exec._prepare_vllm_file_limit()
+                if expected is None:
+                    set_limit.assert_not_called()
+                else:
+                    set_limit.assert_called_once_with(engine_exec.resource.RLIMIT_NOFILE, expected)
+
     def test_n580_pre_exec_boundary_is_context_free_and_restore_aware(
         self,
     ) -> None:
@@ -64,6 +87,64 @@ class EngineExecTest(unittest.TestCase):
                 self.assertEqual(os.environ["COLDSNAP_PROCESS_TEMPLATE_RESTORED"], "1")
                 for name in engine_exec._PROCESS_TEMPLATE_BARRIER_ENVIRONMENT:
                     self.assertNotIn(name, os.environ)
+
+    def test_io_uring_policy_follows_the_completed_checkpoint_boundary(self) -> None:
+        for phase in (None, "pre_worker_import", "pre_load", "pre_exec"):
+            for restored in (False, True):
+                with self.subTest(phase=phase, restored=restored):
+                    self._check_io_uring_policy(phase, restored)
+
+    def _check_io_uring_policy(self, phase, restored) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            marker = root / "restore-generation"
+            release.write_text("capture-id\n", encoding="utf-8")
+            if restored:
+                marker.write_text("capture-id\n", encoding="utf-8")
+            environment = {
+                "COLDSNAP_MODEL_LOAD_GENERATION": "capture-id",
+                "COLDSNAP_MODEL_LOAD_READY_DIR": str(root / "ready"),
+                "COLDSNAP_MODEL_LOAD_RELEASE_FILE": str(release),
+                "COLDSNAP_MODEL_LOAD_TIMEOUT_SECONDS": "10",
+                "COLDSNAP_PROCESS_TEMPLATE_RESTORE_MARKER_FILE": str(marker),
+                "COLDSNAP_UNIT_INDEX": "0",
+            }
+            if phase is not None:
+                environment["COLDSNAP_PROCESS_TEMPLATE_PHASE"] = phase
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch.object(sys, "argv", ["launcher", "--", "vllm", "serve", "org/model"]),
+                patch.object(engine_exec, "_accelerator_state", return_value=([], [])),
+                patch.object(engine_exec, "_restored_placement", return_value=None),
+                patch.object(engine_exec, "_apply_restore_transport_environment", return_value=None),
+                patch.object(engine_exec, "_apply_restore_runtime_environment", return_value=None),
+                patch.object(engine_exec, "_prepare_vllm_file_limit") as prepare_limits,
+                patch.object(engine_exec, "_block_io_uring") as block,
+                patch.object(os, "execvpe", side_effect=SystemExit(0)) as execute,
+            ):
+                with self.assertRaises(SystemExit):
+                    engine_exec.main()
+                execute.assert_called_once()
+                prepare_limits.assert_called_once_with()
+                if phase == "pre_exec":
+                    block.assert_not_called()
+                    self.assertTrue((root / "ready/rank-0.json").is_file())
+                    self.assertNotIn("COLDSNAP_PROCESS_TEMPLATE_PHASE", os.environ)
+                    if restored:
+                        self.assertEqual(execute.call_args.args[1][-2:], ["--load-format", "coldsnap"])
+                else:
+                    block.assert_called_once_with()
+
+    def test_invalid_pre_exec_boundary_does_not_launch_an_unfiltered_engine(self) -> None:
+        with (
+            patch.dict(os.environ, {"COLDSNAP_PROCESS_TEMPLATE_PHASE": "pre_exec"}, clear=True),
+            patch.object(sys, "argv", ["launcher", "vllm", "serve", "org/model"]),
+            patch.object(os, "execvpe") as execute,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid pre-exec"):
+                engine_exec.main()
+            execute.assert_not_called()
 
     def test_restored_vllm_pre_exec_selects_coldsnap_load_format(self) -> None:
         command = ["vllm", "serve", "org/model", "--load-format", "instanttensor"]

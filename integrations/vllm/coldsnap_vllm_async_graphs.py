@@ -301,6 +301,12 @@ def _compile_eager_first(
     **kwargs: Any,
 ) -> Any:
     runner = _validate_worker(worker)
+    if getattr(runner, "adaptive_verification", None) is not None:
+        raise VllmContractError(
+            "Adaptive verification requires startup graph capture to initialize its "
+            "cost tables; set coldsnap.process.async_graphs=false "
+            f"({ASYNC_GRAPH_ENV}=0)"
+        )
     runner_mode = _force_runner_eager(runner, True)
     state = WorkerGraphState("initializing", runner_mode)
     worker._coldsnap_async_graph_state = state

@@ -240,7 +240,7 @@ func (adapter Adapter) constructArtifactN580(
 					payload, err := adapter.remoteModelPayloadObject(
 						unitContext, unit, snapshot.WorkerOwner(manifest.Worker),
 						filepath.Join(filepath.Dir(manifest.Path), modelPayloadName),
-						"pending-content-address", 0, "",
+						"pending-content-address", manifest.ModelPayload.Bytes, manifest.ModelPayload.SHA256,
 					)
 					if err != nil {
 						return err

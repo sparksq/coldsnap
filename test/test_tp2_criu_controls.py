@@ -964,29 +964,31 @@ class TP2CriuControlsTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 node._load_active_nccl_runtime(path)
 
-    def test_sglang_child_internalizes_stable_allocator_policy(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            active_path = self._active_runtime(root)
-            args = SimpleNamespace(engine="sglang", nccl_active_runtime=active_path)
-            with unittest.mock.patch.dict(
-                os.environ,
-                {
-                    "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,expandable_segments:True",
-                    "PYTORCH_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.8",
-                },
-                clear=True,
-            ):
-                environment = node._child_environment(args, root / "job.json")
+    def test_n610_children_internalize_stable_allocator_policy(self) -> None:
+        for engine in ("sglang", "vllm"):
+            with self.subTest(engine=engine):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    active_path = self._active_runtime(root)
+                    args = SimpleNamespace(engine=engine, nccl_active_runtime=active_path)
+                    with unittest.mock.patch.dict(
+                        os.environ,
+                        {
+                            "PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:64,expandable_segments:True",
+                            "PYTORCH_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.8",
+                        },
+                        clear=True,
+                    ):
+                        environment = node._child_environment(args, root / "job.json")
 
-            self.assertEqual(
-                environment["PYTORCH_CUDA_ALLOC_CONF"],
-                "max_split_size_mb:64,expandable_segments:False",
-            )
-            self.assertEqual(
-                environment["PYTORCH_ALLOC_CONF"],
-                "garbage_collection_threshold:0.8,expandable_segments:False",
-            )
+                    self.assertEqual(
+                        environment["PYTORCH_CUDA_ALLOC_CONF"],
+                        "max_split_size_mb:64,expandable_segments:False",
+                    )
+                    self.assertEqual(
+                        environment["PYTORCH_ALLOC_CONF"],
+                        "garbage_collection_threshold:0.8,expandable_segments:False",
+                    )
 
     def test_explicit_override_allows_only_criu_runtime_changes(self) -> None:
         captured = self._identity()

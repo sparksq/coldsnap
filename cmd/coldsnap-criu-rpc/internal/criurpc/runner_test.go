@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -892,6 +893,68 @@ func TestProbeTCPBindEndpointsRejectsOccupiedPortAndReleasesProbe(t *testing.T) 
 	}
 	if err := probeTCPBindEndpoints([]tcpBindEndpoint{endpoint}); err != nil {
 		t.Fatalf("released TCP endpoint probe: %v", err)
+	}
+}
+
+func TestProbeTCPBindEndpointsAcceptsTimeWait(t *testing.T) {
+	for _, network := range []string{"tcp4", "tcp6"} {
+		t.Run(network, func(t *testing.T) {
+			host, family := "127.0.0.1", uint32(unix.AF_INET)
+			if network == "tcp6" {
+				host, family = "::1", uint32(unix.AF_INET6)
+			}
+			listener, err := net.Listen(network, net.JoinHostPort(host, "0"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = listener.Close() }()
+			address := listener.Addr().(*net.TCPAddr)
+			client, err := net.DialTimeout(network, listener.Addr().String(), 2*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = client.Close() }()
+			if err := listener.(*net.TCPListener).SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			server, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Close the accepted server socket first and wait for its FIN so the
+			// server port enters TIME_WAIT, as after an SGLang health request.
+			if err := server.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+				t.Fatalf("server close: %v", err)
+			}
+			if err := client.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := listener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			endpoint := tcpBindEndpoint{
+				ID: 17, Family: family, Address: netip.MustParseAddr(host),
+				Port: uint32(address.Port), State: 10,
+			}
+			if err := probeTCPBindEndpoints([]tcpBindEndpoint{endpoint}); err != nil {
+				t.Fatalf("TIME_WAIT blocks a reusable restore endpoint: %v", err)
+			}
+			// The serving listener commonly uses a wildcard address even though
+			// the accepted connection uses a concrete local address.
+			endpoint.Address = netip.IPv4Unspecified()
+			if network == "tcp6" {
+				endpoint.Address = netip.IPv6Unspecified()
+			}
+			if err := probeTCPBindEndpoints([]tcpBindEndpoint{endpoint}); err != nil {
+				t.Fatalf("TIME_WAIT blocks a reusable wildcard endpoint: %v", err)
+			}
+		})
 	}
 }
 

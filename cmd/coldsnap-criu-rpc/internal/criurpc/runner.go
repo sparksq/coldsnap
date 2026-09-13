@@ -1122,6 +1122,14 @@ func probeTCPBindEndpoints(endpoints []tcpBindEndpoint) error {
 		if err != nil {
 			return fmt.Errorf("probe TCP socket %d: %w", endpoint.ID, err)
 		}
+		// CRIU enables SO_REUSEADDR while binding restored sockets. Match
+		// that behavior so TIME_WAIT from a stopped activation does not
+		// falsely occupy its serving port. Leave SO_REUSEPORT disabled:
+		// another live listener must still be reported as a collision.
+		if err := unix.SetsockoptInt(descriptor, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			_ = unix.Close(descriptor)
+			return fmt.Errorf("configure TCP socket %d address reuse: %w", endpoint.ID, err)
+		}
 		if family == unix.AF_INET6 {
 			v6Only := 0
 			if endpoint.V6Only {

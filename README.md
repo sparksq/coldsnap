@@ -172,13 +172,17 @@ storage, and cache state; rerun the matched cases for each release candidate.
 
 - vLLM is the broadest-qualified engine. SGLang has its own Go adapter and Python
   integration; Qwen TP2 native and recovery restores are qualified on both drivers.
-- Current end-to-end evidence covers ARM64 DGX Spark GB10, CUDA 13, two-host TP2,
-  and NVIDIA 580/610 driver families. The topology format represents multi-GPU
-  launch units and TP, PP, DP, EP, CP, and disaggregated groups, but broader
+- Current end-to-end evidence covers ARM64 DGX Spark GB10, CUDA 13, two-host TP2
+  on NVIDIA 580/610 driver families, and DeepSeek V4.1 Flash with DSpark on
+  four-host TP4 using the n580 snapshot driver. The topology format represents
+  multi-GPU launch units and TP, PP, DP, EP, CP, and disaggregated groups, but broader
   topologies still require qualification.
 - n610 preserves distributed CUDA graph executables while reconstructing fresh
   NCCL transport endpoints in place. n580 uses eager-first graph recreation
-  after readiness.
+  after readiness. DSpark adaptive verification reuses compatible validated
+  calibration curves before eager inference; a cache miss profiles synchronously.
+  See the [vLLM integration](integrations/vllm/README.md) for cache compatibility
+  and target-local materialization behavior.
 - NCCL integration is provider- and runtime-qualified, not a generic NCCL ABI.
 - Recovery performance depends on model replay and first-inference work.
   Every release candidate needs

@@ -18,6 +18,7 @@ from coldsnap_vllm import VllmContractError  # noqa: E402
 from coldsnap_vllm_shape_calibration import (  # noqa: E402
     SHAPE_CALIBRATION_ENV,
     calibrate_capture_shapes,
+    observe_capture_shape_coverage,
     runner_generation,
     shape_calibration_enabled,
 )
@@ -256,6 +257,34 @@ class V2ShapeCalibrationTest(unittest.TestCase):
         # The recording half must not have run.
         self.assertEqual(runner.cudagraph_manager.recorded, [])
         self.assertFalse(runner.cudagraph_manager._graphs_captured)
+
+    def test_real_capture_reports_observed_warmups_without_repeating_capture(self) -> None:
+        runner = self._runner()
+        original = FakeCudaGraphManager.capture
+        with observe_capture_shape_coverage(runner) as report:
+            runner.capture_model()
+        self.assertEqual(report["source"], "synchronous-graph-capture")
+        self.assertEqual(report["planned_shapes"], 3)
+        self.assertEqual(report["warmed_shapes"], 3)
+        self.assertEqual(report["warmup_invocations"], 3)
+        self.assertEqual(len(runner.cudagraph_manager.recorded), 3)
+        self.assertIs(FakeCudaGraphManager.capture, original)
+
+    def test_real_capture_missing_warmups_fails_coverage(self) -> None:
+        runner = self._runner()
+        original = FakeCudaGraphManager.capture
+        with self.assertRaisesRegex(VllmContractError, "warmed 0 of 0"):
+            with observe_capture_shape_coverage(runner):
+                pass
+        self.assertIs(FakeCudaGraphManager.capture, original)
+
+    def test_real_capture_failure_restores_observer(self) -> None:
+        runner = self._runner()
+        original = FakeCudaGraphManager.capture
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            with observe_capture_shape_coverage(runner):
+                raise RuntimeError("capture failed")
+        self.assertIs(FakeCudaGraphManager.capture, original)
 
     def test_v2_shape_warmup_preserves_adaptive_verification_tables(self) -> None:
         runner = self._runner()

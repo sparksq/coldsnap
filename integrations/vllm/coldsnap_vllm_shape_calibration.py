@@ -31,9 +31,10 @@ import importlib.metadata
 import logging
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from coldsnap_vllm import VllmContractError
 
@@ -380,6 +381,72 @@ def _calibrate_v2(runner: Any) -> dict[str, Any]:
         "seconds": time.perf_counter() - started,
         **_coverage_metadata(),
     }
+
+
+@contextmanager
+def observe_capture_shape_coverage(runner: Any) -> Iterator[dict[str, Any]]:
+    """Record successful real-capture warmups without repeating their CUDA work."""
+    manager = runner.cudagraph_manager
+    owner = _capture_owner(manager)
+    original = owner.__dict__["capture"]
+    expected: dict[tuple[Any, ...], tuple[str, int]] = {}
+    warmed: set[tuple[Any, ...]] = set()
+    invocations = 0
+    report: dict[str, Any] = {}
+
+    def signature(desc: Any) -> tuple[Any, ...]:
+        mode = desc.cg_mode
+        key = _descriptor_signature(mode, desc)
+        expected[key] = (getattr(mode, "name", str(mode)), int(desc.num_tokens))
+        return key
+
+    def observe(self: Any, create_forward_fn: Any, *args: Any, **kwargs: Any) -> Any:
+        descs = getattr(self, "_capture_descs", None)
+        if not isinstance(descs, dict):
+            raise VllmContractError("real graph capture lacks a descriptor plan")
+        for values in descs.values():
+            for desc in values:
+                signature(desc)
+
+        def create_observed_forward(desc: Any, *factory_args: Any, **factory_kwargs: Any) -> Any:
+            forward = create_forward_fn(desc, *factory_args, **factory_kwargs)
+            if not factory_kwargs.get("warmup", False):
+                return forward
+            key = signature(desc)
+
+            def observe_warmup(*forward_args: Any, **forward_kwargs: Any) -> Any:
+                nonlocal invocations
+                result = forward(*forward_args, **forward_kwargs)
+                warmed.add(key)
+                invocations += 1
+                return result
+
+            return observe_warmup
+
+        return original(self, create_observed_forward, *args, **kwargs)
+
+    started = time.perf_counter()
+    owner.capture = observe
+    try:
+        yield report
+    finally:
+        owner.capture = original
+    if not expected or warmed != set(expected):
+        raise VllmContractError(
+            f"real graph capture warmed {len(warmed)} of {len(expected)} planned shapes"
+        )
+    modes: dict[str, list[int]] = {}
+    for mode, tokens in expected.values():
+        modes.setdefault(mode, []).append(tokens)
+    report.update({
+        "kind": "coldsnap-shape-calibration", "schema": 1, "runner": "v2",
+        "source": "synchronous-graph-capture",
+        "shapes": len(expected), "planned_shapes": len(expected), "warmed_shapes": len(warmed),
+        "warmup_invocations": invocations, "seconds": time.perf_counter() - started,
+        "modes": [{"mode": mode, "shapes": len(tokens), "planned_shapes": len(tokens),
+                   "num_tokens": sorted(tokens)} for mode, tokens in sorted(modes.items())],
+        **_coverage_metadata(),
+    })
 
 
 def calibrate_capture_shapes(runner: Any) -> dict[str, Any]:

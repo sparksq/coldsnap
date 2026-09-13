@@ -26,6 +26,7 @@ from coldsnap_vllm import VllmContractError
 from coldsnap_vllm_calibration import calibration_status, reuse_calibration
 from coldsnap_vllm_shape_calibration import (
     calibrate_capture_shapes,
+    observe_capture_shape_coverage,
     shape_calibration_enabled,
 )
 
@@ -367,9 +368,12 @@ def _compile_synchronously(
     worker._coldsnap_async_graph_state = state
     started = time.perf_counter()
     try:
-        result = original(worker, *args, **kwargs)
-        # Normal capture already compiles the full graph envelope. A second
-        # shape-only pass would see needs_capture=False on the V2 runner.
+        if shape_calibration_enabled():
+            with observe_capture_shape_coverage(runner) as coverage:
+                result = original(worker, *args, **kwargs)
+            worker._coldsnap_shape_calibration = coverage
+        else:
+            result = original(worker, *args, **kwargs)
     except BaseException as error:
         state.phase = "failed"
         state.error = f"synchronous calibration failed: {error}"

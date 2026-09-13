@@ -279,9 +279,10 @@ def reuse_calibration(worker: Any) -> bool:
             curves = _load(state)
         except (OSError, TypeError, ValueError, RecursionError) as error:
             state["reason"] = str(error)
+    state["local_reason"] = "valid local record" if curves is not None else state["reason"]
     if not _all_workers_admit_startup_plan(worker, curves is not None):
         state["reason"] = "at least one worker lacks compatible validated curves"
-        logger.info("ColdSnap DSpark calibration cache miss; calibrating synchronously on all ranks")
+        logger.info("ColdSnap DSpark calibration cache miss; calibrating synchronously on all ranks; local reason: %s", state["local_reason"])
         return False
     digest = _digest(curves)
     if not _all_workers_admit_startup_plan(worker, _broadcast(digest) == digest):
@@ -304,7 +305,7 @@ def calibration_status(worker: Any) -> dict[str, Any] | None:
     state = getattr(worker, _STATE, None)
     if state is None:
         return None
-    return {key: state[key] for key in ("decision", "reason", "key", "saved", "curve_sha256", "save_error") if key in state}
+    return {key: state[key] for key in ("decision", "reason", "local_reason", "key", "saved", "curve_sha256", "save_error") if key in state}
 
 
 @contextmanager
@@ -331,6 +332,13 @@ def preserve_calibration_during_shape_warmup(runner: Any) -> Iterator[None]:
 
 
 def _install_worker_observer(module: Any) -> None:
+    global logger
+    try:
+        from vllm.logger import init_logger
+    except ImportError:
+        pass  # CPU-only contract tests do not require an installed vLLM.
+    else:
+        logger = init_logger(__name__)
     # Older supported images expose GPUWorker, newer images Worker (or an alias).
     worker_class = getattr(module, "Worker", None) or getattr(module, "GPUWorker", None)
     original = worker_class.compile_or_warm_up_model

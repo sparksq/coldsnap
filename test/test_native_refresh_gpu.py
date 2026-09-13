@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Scitrera LLC
 # SPDX-FileCopyrightText: 2026 Fox Engine Ltd
 # SPDX-License-Identifier: AGPL-3.0-only
+
 """Opt-in tests in the qualified V4.1 image: COLDSNAP_TEST_V41_NATIVE_REFRESH=1."""
 
 import os

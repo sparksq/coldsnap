@@ -56,6 +56,7 @@ class WorkerWarmupState:
     profile_deferred: bool = False
     kernel_deferred: bool = False
     runtime_kernel_deferred: bool = False
+    pre_kv_attention_profile_skipped: bool = False
     warmup_seconds: float = 0.0
     error: str = ""
 
@@ -137,6 +138,7 @@ def _worker_status(worker: Any) -> dict[str, Any]:
         "profile_deferred": state.profile_deferred,
         "kernel_deferred": state.kernel_deferred,
         "runtime_kernel_deferred": state.runtime_kernel_deferred,
+        "pre_kv_attention_profile_skipped": state.pre_kv_attention_profile_skipped,
         "warmup_seconds": state.warmup_seconds,
         "error": state.error,
     }
@@ -186,6 +188,51 @@ def _determine_with_deferred_profile(
             del runner.profile_run
 
 
+def _run_deferred_profile(worker: Any) -> None:
+    runner = worker.model_runner
+    attention_profile = getattr(runner, "_profile_deepseek_v4_attention", None)
+    architecture = getattr(getattr(runner, "model_config", None), "architecture", None)
+    initialized = all(
+        getattr(runner, name, None) is not None
+        for name in ("kv_cache_config", "block_tables", "cudagraph_manager")
+    )
+    if not (
+        callable(attention_profile)
+        and architecture in {"DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration"}
+        and _has_explicit_kv_artifact(worker)
+        and initialized
+    ):
+        runner.profile_run()
+        return
+
+    # V2's DeepSeek V4 memory-admission pass replaces KV state with a minimal
+    # profiling cache, then deletes block tables and the graph manager. It is
+    # only valid before production KV initialization. An explicit KV budget
+    # already fixes memory admission here; retain generic/MM profiling and the
+    # subsequent kernel warmup without tearing down the live serving state.
+    name = "_profile_deepseek_v4_attention"
+    attributes = vars(runner)
+    had_instance_hook = name in attributes
+    previous_instance_hook = attributes.get(name)
+
+    @functools.wraps(attention_profile)
+    def reuse_attention_admission(*_args: Any, **_kwargs: Any) -> None:
+        _state(worker).pre_kv_attention_profile_skipped = True
+        logger.info(
+            "Reusing explicit KV budget for DeepSeek V4 attention memory admission "
+            "during deferred warmup"
+        )
+
+    setattr(runner, name, reuse_attention_admission)
+    try:
+        runner.profile_run()
+    finally:
+        if had_instance_hook:
+            setattr(runner, name, previous_instance_hook)
+        else:
+            delattr(runner, name)
+
+
 def _run_deferred_warmup(
     worker: Any,
     original_kernel_warmup: Callable[..., Any],
@@ -206,7 +253,7 @@ def _run_deferred_warmup(
     started = time.perf_counter()
     try:
         if state.profile_deferred:
-            worker.model_runner.profile_run()
+            _run_deferred_profile(worker)
         runtime_complete = False
         if state.kernel_deferred:
             runtime_complete = bool(original_kernel_warmup(worker))

@@ -86,6 +86,110 @@ class DeferredWarmupTest(unittest.TestCase):
         self.assertEqual(events, ["determine", "profile"])
         self.assertFalse(deferred._state(fresh).profile_deferred)
 
+    def test_deepseek_v4_deferred_profile_keeps_production_kv_state(self) -> None:
+        events = []
+
+        class Runner:
+            model_config = SimpleNamespace(architecture="DeepseekV4ForCausalLM")
+
+            def profile_run(self):
+                events.extend(["generic-profile", "sampler-profile"])
+                self._profile_deepseek_v4_attention()
+
+            def _profile_deepseek_v4_attention(self):
+                events.append("temporary-attention-cache")
+                self.kv_caches.clear()
+                del self.block_tables
+                self.cudagraph_manager = None
+                self.adaptive_verification = None
+
+        runner = Runner()
+        worker = SimpleNamespace(
+            model_runner=runner,
+            cache_config=SimpleNamespace(kv_cache_memory_bytes=4096),
+        )
+
+        def determine(instance):
+            instance.model_runner.profile_run()
+            return 4096
+
+        self.assertEqual(deferred._determine_with_deferred_profile(worker, determine), 4096)
+        self.assertEqual(events, [])
+        runner.kv_cache_config = object()
+        runner.kv_caches = [object()]
+        runner.block_tables = object()
+        runner.cudagraph_manager = object()
+        runner.adaptive_verification = object()
+        serving_state = vars(runner).copy()
+        deferred._state(worker).kernel_deferred = True
+
+        def kernel(instance):
+            for name, value in serving_state.items():
+                self.assertIs(getattr(instance.model_runner, name), value)
+            self.assertEqual(len(instance.model_runner.kv_caches), 1)
+            events.append("kernel-warmup")
+
+        status = deferred._run_deferred_warmup(worker, kernel, None)
+        self.assertEqual(status["phase"], "ready")
+        self.assertTrue(status["pre_kv_attention_profile_skipped"])
+        self.assertEqual(events, ["generic-profile", "sampler-profile", "kernel-warmup"])
+        self.assertNotIn("_profile_deepseek_v4_attention", vars(runner))
+
+    def test_attention_profile_skip_requires_budget_and_initialized_v4_runner(self) -> None:
+        for architecture in ("DeepseekV4ForCausalLM", "DeepseekV4ForConditionalGeneration", "DeepseekV41ForCausalLM"):
+            for budget in (None, 4096):
+                for initialized in (False, True):
+                    with self.subTest(architecture=architecture, budget=budget, initialized=initialized):
+                        attention_profile = mock.Mock()
+
+                        class Runner:
+                            def profile_run(self):
+                                self._profile_deepseek_v4_attention()
+
+                        runner = Runner()
+                        runner.model_config = SimpleNamespace(architecture=architecture)
+                        runner._profile_deepseek_v4_attention = attention_profile
+                        if initialized:
+                            runner.kv_cache_config = object()
+                            runner.block_tables = object()
+                            runner.cudagraph_manager = object()
+                        worker = SimpleNamespace(
+                            model_runner=runner,
+                            cache_config=SimpleNamespace(kv_cache_memory_bytes=budget),
+                        )
+                        deferred._run_deferred_profile(worker)
+                        skip = architecture != "DeepseekV41ForCausalLM" and budget is not None and initialized
+                        self.assertEqual(attention_profile.call_count, 0 if skip else 1)
+                        self.assertEqual(deferred._state(worker).pre_kv_attention_profile_skipped, skip)
+                        self.assertIs(runner._profile_deepseek_v4_attention, attention_profile)
+
+    def test_attention_profile_hook_is_restored_when_generic_profile_fails(self) -> None:
+        class Runner:
+            model_config = SimpleNamespace(architecture="DeepseekV4ForCausalLM")
+            kv_cache_config = object()
+            block_tables = object()
+            cudagraph_manager = object()
+
+            def profile_run(self):
+                self._profile_deepseek_v4_attention()
+                raise RuntimeError("generic profiling failed")
+
+            def _profile_deepseek_v4_attention(self):
+                raise AssertionError("must not replace the production cache")
+
+        runner = Runner()
+        worker = SimpleNamespace(
+            model_runner=runner,
+            cache_config=SimpleNamespace(kv_cache_memory_bytes=4096),
+        )
+        deferred._state(worker).profile_deferred = True
+        status = deferred._run_deferred_warmup(worker, mock.Mock(), None)
+        self.assertEqual(status["phase"], "failed")
+        self.assertIn("generic profiling failed", status["error"])
+        self.assertTrue(status["pre_kv_attention_profile_skipped"])
+        self.assertNotIn("_profile_deepseek_v4_attention", vars(runner))
+        self.assertIs(runner.cudagraph_manager, Runner.cudagraph_manager)
+
     def test_engine_waits_for_idle_then_records_full_warm_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ready = Path(directory) / "fully-warm.json"

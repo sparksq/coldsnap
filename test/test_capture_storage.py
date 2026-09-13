@@ -17,12 +17,13 @@ import unittest
 from unittest.mock import patch
 import zlib
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations/core"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations/vllm"))
 import coldsnap_disk_backend as disk  # noqa: E402
 from coldsnap_core.memory import HostStage  # noqa: E402
 from coldsnap_core.validation import PayloadValidationError, validate_payload  # noqa: E402
-from test.test_disk_sleep import _single_worker_execution_graph  # noqa: E402
+from test_disk_sleep import _single_worker_execution_graph  # noqa: E402
 
 
 class CaptureStorageTests(unittest.TestCase):

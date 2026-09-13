@@ -457,6 +457,51 @@ def _capture_worker_graphs(worker: Any) -> dict[str, Any]:
     return _worker_status(worker)
 
 
+def _clear_graphs_for_recapture(
+    managers: list[Any], wrapper_types: tuple[Any, ...], synchronize: Any,
+) -> None:
+    """Release graphs using the manager's qualified lifetime contract."""
+
+    split_reset = bool(managers) and all(
+        callable(getattr(manager, "reset_graphs", None)) for manager in managers
+    )
+    # Validate every owner before releasing anything. New vLLM keeps graph
+    # resources alive across reset because executable destruction is deferred.
+    for wrapper in wrapper_types:
+        if not callable(getattr(wrapper, "clear_all_graphs", None)):
+            raise VllmContractError("vLLM graph wrapper lacks clear_all_graphs()")
+        if split_reset and not callable(getattr(wrapper, "reset_all_graphs", None)):
+            raise VllmContractError("vLLM graph wrapper lacks reset_all_graphs()")
+    for manager in managers:
+        if split_reset:
+            if not (
+                isinstance(getattr(manager, "graphs", None), dict)
+                and isinstance(getattr(manager, "graph_capture_resources", None), dict)
+                and isinstance(getattr(manager, "_graphs_captured", None), bool)
+            ):
+                raise VllmContractError("vLLM graph manager lacks reset resource inventory")
+        elif not callable(getattr(manager, "clear", None)):
+            raise VllmContractError("vLLM graph manager lacks clear() or reset_graphs() contract")
+
+    if split_reset:
+        for wrapper in wrapper_types:
+            wrapper.reset_all_graphs()
+        for manager in managers:
+            manager.reset_graphs()
+        synchronize()
+        for wrapper in wrapper_types:
+            wrapper.clear_all_graphs()
+        for manager in managers:
+            manager.graphs.clear()
+            manager.graph_capture_resources.clear()
+            manager._graphs_captured = False
+    else:
+        for manager in managers:
+            manager.clear()
+        for wrapper in wrapper_types:
+            wrapper.clear_all_graphs()
+
+
 def _refresh_worker_graph_pools(runner: Any) -> None:
     """Replace graph-pool tokens from the pre-snapshot CUDA allocator epoch."""
 
@@ -480,13 +525,10 @@ def _refresh_worker_graph_pools(runner: Any) -> None:
             if value is not None and value not in managers:
                 managers.append(value)
 
-    for value in managers:
-        clear = getattr(value, "clear", None)
-        if not callable(clear):
-            raise VllmContractError("vLLM CUDA graph manager lacks clear()")
-        clear()
-    CUDAGraphWrapper.clear_all_graphs()
-    BreakableCUDAGraphWrapper.clear_all_graphs()
+    _clear_graphs_for_recapture(
+        managers, (CUDAGraphWrapper, BreakableCUDAGraphWrapper),
+        torch.accelerator.synchronize,
+    )
 
     platform_type = type(current_platform)
     if not hasattr(platform_type, "_global_graph_pool"):

@@ -156,6 +156,60 @@ class AsyncGraphCaptureTest(unittest.TestCase):
         self.assertEqual(adaptive._cudagraph_limit, 36)
         self.assertTrue(worker.model_runner.cudagraph_dispatcher._coldsnap_force_eager)
 
+    def test_new_manager_reset_retains_resources_until_cuda_synchronizes(self) -> None:
+        events = []
+        managers = [SimpleNamespace(graphs={"shape": object()},
+                    graph_capture_resources={"shape": [object()]},
+                    _graphs_captured=True, _capture_descs={"FULL": [32]})
+                    for _ in range(3)]
+        def reset(name):
+            self.assertTrue(all(m.graphs and m.graph_capture_resources for m in managers))
+            events.append(name)
+        for index, manager in enumerate(managers):
+            manager.reset_graphs = lambda i=index: reset(f"manager-{i}")
+        wrappers = tuple(SimpleNamespace(
+            reset_all_graphs=lambda i=i: reset(f"wrapper-{i}-reset"),
+            clear_all_graphs=lambda i=i: events.append(f"wrapper-{i}-clear"),
+        ) for i in range(2))
+        async_graphs._clear_graphs_for_recapture(managers, wrappers, lambda: reset("sync"))
+        self.assertEqual(events, ["wrapper-0-reset", "wrapper-1-reset", "manager-0",
+            "manager-1", "manager-2", "sync", "wrapper-0-clear", "wrapper-1-clear"])
+        for manager in managers:
+            self.assertEqual(manager.graphs, {})
+            self.assertEqual(manager.graph_capture_resources, {})
+            self.assertFalse(manager._graphs_captured)
+            self.assertEqual(manager._capture_descs, {"FULL": [32]})
+
+    def test_legacy_manager_clear_remains_supported(self) -> None:
+        events = []
+        managers = [SimpleNamespace(clear=lambda: events.append("manager"))]
+        wrappers = (SimpleNamespace(clear_all_graphs=lambda: events.append("wrapper")),)
+        async_graphs._clear_graphs_for_recapture(managers, wrappers,
+            lambda: self.fail("legacy API does not require a second synchronization"))
+        self.assertEqual(events, ["manager", "wrapper"])
+
+    def test_new_manager_unknown_inventory_fails_before_mutation(self) -> None:
+        manager = SimpleNamespace(reset_graphs=lambda: self.fail("reset"),
+            graphs={}, _graphs_captured=False)
+        wrapper = SimpleNamespace(reset_all_graphs=lambda: self.fail("reset"),
+            clear_all_graphs=lambda: self.fail("clear"))
+        with self.assertRaisesRegex(async_graphs.VllmContractError, "resource inventory"):
+            async_graphs._clear_graphs_for_recapture([manager], (wrapper,), lambda: None)
+
+    def test_failed_reset_does_not_release_graph_resources(self) -> None:
+        manager = SimpleNamespace(graphs={"graph": object()},
+            graph_capture_resources={"graph": object()}, _graphs_captured=True,
+            reset_graphs=lambda: None)
+        wrapper = SimpleNamespace(reset_all_graphs=lambda: None,
+            clear_all_graphs=lambda: self.fail("resources released before synchronization"))
+        def fail_sync():
+            raise RuntimeError("CUDA reset failed")
+        with self.assertRaisesRegex(RuntimeError, "CUDA reset failed"):
+            async_graphs._clear_graphs_for_recapture([manager], (wrapper,), fail_sync)
+        self.assertTrue(manager.graphs)
+        self.assertTrue(manager.graph_capture_resources)
+        self.assertTrue(manager._graphs_captured)
+
     def test_retained_policy_captures_normal_graphs_before_snapshot(self) -> None:
         class Runner:
             def __init__(self, dispatcher) -> None:

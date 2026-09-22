@@ -12,12 +12,12 @@ members = [
 
 [[package]]
 name = "coldsnap-core"
-version = "0.3.26"
+version = "0.3.28"
 source = { editable = "integrations/core" }
 
 [[package]]
 name = "coldsnap-development"
-version = "0.3.26"
+version = "0.3.28"
 source = { virtual = "." }
 
 [[package]]

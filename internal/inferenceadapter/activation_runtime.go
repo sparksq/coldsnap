@@ -269,7 +269,7 @@ func (adapter Adapter) stageActivationRuntimeHost(
 	root string,
 	pack activationruntime.Pack,
 ) error {
-	if _, err := adapter.Remote.Run(ctx, host, "install", "-d", "-m", "0700", root); err != nil {
+	if err := adapter.ensurePrivateDirectories(ctx, host, root); err != nil {
 		return fmt.Errorf("create activation runtime cache on %s: %w", host, err)
 	}
 	if _, err := adapter.Remote.Run(ctx, host, "test", "!", "-L", root); err != nil {
@@ -295,7 +295,7 @@ func (adapter Adapter) stageActivationRuntimeHost(
 			}
 		}
 		temporary := finalPath + ".tmp." + operationID
-		if _, err := adapter.Remote.RunInput(ctx, host, item.Data, "tee", temporary); err != nil {
+		if err := adapter.writeStateFile(ctx, host, item.Data, temporary); err != nil {
 			return fmt.Errorf("stage activation runtime file %s on %s: %w", item.Name, host, err)
 		}
 		if _, err := adapter.Remote.Run(ctx, host, "chmod", "0555", temporary); err != nil {
@@ -531,11 +531,11 @@ func (adapter Adapter) hostFeatureProfile(
 		return snapshotdriver.FeatureProfile{}, false, err
 	}
 	payload = append(payload, '\n')
-	if _, err := adapter.Remote.Run(ctx, unit.Host, "install", "-d", "-m", "0700", root); err != nil {
+	if err := adapter.ensurePrivateDirectories(ctx, unit.Host, root); err != nil {
 		return snapshotdriver.FeatureProfile{}, false, fmt.Errorf("create host feature-profile cache: %w", err)
 	}
 	temporary := path + ".tmp." + request.ID
-	if _, err := adapter.Remote.RunInput(ctx, unit.Host, payload, "tee", temporary); err != nil {
+	if err := adapter.writeStateFile(ctx, unit.Host, payload, temporary); err != nil {
 		return snapshotdriver.FeatureProfile{}, false, fmt.Errorf("stage host feature profile: %w", err)
 	}
 	if _, err := adapter.Remote.Run(ctx, unit.Host, "chmod", "0600", temporary); err != nil {

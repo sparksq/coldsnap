@@ -89,7 +89,7 @@ func (adapter Adapter) captureN580(ctx context.Context, request snapshot.Request
 				if _, err := adapter.Remote.Run(unitContext, unit.Host, "test", "!", "-e", root); err != nil {
 					return fmt.Errorf("unit %s n580 capture root already exists: %s", unit.ID, root)
 				}
-				if _, err := adapter.Remote.Run(unitContext, unit.Host, "install", "-d", "-m", "0700", root); err != nil {
+				if err := adapter.ensurePrivateDirectories(unitContext, unit.Host, root); err != nil {
 					return fmt.Errorf("create unit %s n580 capture root: %w", unit.ID, err)
 				}
 				name := operationName(request.ID, "capture-n580-unit-"+unit.ID)

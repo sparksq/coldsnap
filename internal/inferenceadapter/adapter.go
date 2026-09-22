@@ -509,7 +509,7 @@ func (adapter Adapter) captureN610(ctx context.Context, request snapshot.Request
 				if _, err := adapter.Remote.Run(unitContext, unit.Host, "test", "!", "-e", root); err != nil {
 					return fmt.Errorf("unit %s capture root already exists: %s", unit.ID, root)
 				}
-				if _, err := adapter.Remote.Run(unitContext, unit.Host, "install", "-d", "-m", "0700", root); err != nil {
+				if err := adapter.ensurePrivateDirectories(unitContext, unit.Host, root); err != nil {
 					return fmt.Errorf("create unit %s capture root: %w", unit.ID, err)
 				}
 				name := operationName(request.ID, "capture-unit-"+unit.ID)
@@ -801,9 +801,8 @@ func (adapter Adapter) prepareModelPayloadMaterialization(
 	cacheRoot := filepath.Join(adapter.StateRoot, "model-payloads")
 	controlRoot := filepath.Join(adapter.StateRoot, "operations", namespace, "materialization")
 	for _, unit := range request.Launch.Units {
-		if _, err := adapter.Remote.Run(
-			ctx, unit.Host, "install", "-d", "-m", "0700",
-			cacheRoot, filepath.Join(cacheRoot, "sha256"), controlRoot,
+		if err := adapter.ensurePrivateDirectories(
+			ctx, unit.Host, cacheRoot, filepath.Join(cacheRoot, "sha256"), controlRoot,
 		); err != nil {
 			return nil, fmt.Errorf("prepare unit %s model payload cache: %w", unit.ID, err)
 		}
@@ -842,7 +841,7 @@ func (adapter Adapter) prepareModelPayloadMaterialization(
 		}
 		payload = append(payload, '\n')
 		controlPath := filepath.Join(controlRoot, unit.ID+".json")
-		if _, err := adapter.Remote.RunInput(ctx, unit.Host, payload, "tee", controlPath); err != nil {
+		if err := adapter.writeStateFile(ctx, unit.Host, payload, controlPath); err != nil {
 			return nil, fmt.Errorf("write unit %s model payload materialization: %w", unit.ID, err)
 		}
 		if _, err := adapter.Remote.Run(ctx, unit.Host, "chmod", "0600", controlPath); err != nil {
@@ -1406,7 +1405,7 @@ func (adapter Adapter) startCoordinator(
 		image = rank0.Image
 	}
 	root := filepath.Join(adapter.StateRoot, "operations", namespace)
-	if _, err := adapter.Remote.Run(ctx, rank0.Host, "install", "-d", "-m", "0700", root); err != nil {
+	if err := adapter.ensurePrivateDirectories(ctx, rank0.Host, root); err != nil {
 		return nil, "", fmt.Errorf("create coordinator state: %w", err)
 	}
 	endpoint := filepath.Join(root, "coordinator.endpoint")
@@ -1464,11 +1463,11 @@ func (adapter Adapter) startCoordinator(
 	for _, rank := range request.Launch.Units {
 		peerRoot := filepath.Join(adapter.StateRoot, "operations", namespace)
 		peerEndpoint := filepath.Join(peerRoot, "coordinator.endpoint")
-		if _, err := adapter.Remote.Run(ctx, rank.Host, "install", "-d", "-m", "0700", peerRoot); err != nil {
+		if err := adapter.ensurePrivateDirectories(ctx, rank.Host, peerRoot); err != nil {
 			return nil, "", err
 		}
 		if rank.Host != rank0.Host {
-			if _, err := adapter.Remote.RunInput(ctx, rank.Host, payload, "tee", peerEndpoint); err != nil {
+			if err := adapter.writeStateFile(ctx, rank.Host, payload, peerEndpoint); err != nil {
 				return nil, "", fmt.Errorf("stage coordinator endpoint for rank %d: %w", rank.Index, err)
 			}
 			if _, err := adapter.Remote.Run(ctx, rank.Host, "chmod", "0600", peerEndpoint); err != nil {
@@ -2567,13 +2566,13 @@ func (adapter Adapter) stageCacheSeeds(
 		if _, err := adapter.Remote.Run(ctx, rank.Host, "test", "!", "-e", root); err != nil {
 			return fmt.Errorf("rank %d cache seed root already exists: %s", rank.Index, root)
 		}
-		if _, err := adapter.Remote.Run(ctx, rank.Host, "install", "-d", "-m", "0700", root); err != nil {
+		if err := adapter.ensurePrivateDirectories(ctx, rank.Host, root); err != nil {
 			return fmt.Errorf("create rank %d cache seed root: %w", rank.Index, err)
 		}
 		roots[rank.Index] = root
 		for _, cachePath := range request.Policy.Cache.Paths {
 			destination := filepath.Join(root, strings.TrimPrefix(cachePath, "/"))
-			if _, err := adapter.Remote.Run(ctx, rank.Host, "install", "-d", "-m", "0700", filepath.Dir(destination)); err != nil {
+			if err := adapter.ensurePrivateDirectories(ctx, rank.Host, filepath.Dir(destination)); err != nil {
 				return fmt.Errorf("create rank %d cache seed parent: %w", rank.Index, err)
 			}
 			if _, err := adapter.copyWorkload(ctx, rank.Host, containers[rank.Index], cachePath, destination); err != nil {

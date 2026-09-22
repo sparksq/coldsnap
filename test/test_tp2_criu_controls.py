@@ -1010,9 +1010,31 @@ class TP2CriuControlsTest(unittest.TestCase):
         current = self._identity()
         runtime = current["runtime_sha256"]
         assert isinstance(runtime, dict)
-        runtime["target_launcher"] = "changed-target"
+        runtime["native_hydration"] = "changed-hydration"
         with self.assertRaisesRegex(RuntimeError, "outside CRIU runtime"):
             node._identity_compatibility(captured, current, True)
+
+    def test_n610_identity_accepts_activation_launcher_overlay(self) -> None:
+        for allow_criu_upgrade in (False, True):
+            with self.subTest(allow_criu_upgrade=allow_criu_upgrade):
+                captured = self._identity()
+                original = json.loads(json.dumps(captured))
+                current = json.loads(json.dumps(captured))
+                runtime = current["runtime_sha256"]
+                assert isinstance(runtime, dict)
+                runtime["target_launcher"] = "release-matched-activation-overlay"
+                self.assertEqual(
+                    node._identity_compatibility(captured, current, allow_criu_upgrade),
+                    "portable-v8-explicit-criu-runtime-upgrade"
+                    if allow_criu_upgrade else "portable-v8-placement-independent",
+                )
+                self.assertEqual(captured, original)
+                self.assertEqual(runtime["target_launcher"], "release-matched-activation-overlay")
+                runtime["engine_plugin"] = "changed-checkpointed-plugin"
+                with self.assertRaisesRegex(
+                    RuntimeError, r"identity\.runtime_sha256\.engine_plugin"
+                ):
+                    node._identity_compatibility(captured, current, allow_criu_upgrade)
 
     def test_portable_identity_accepts_placement_and_newer_driver(self) -> None:
         captured = self._identity()
@@ -1064,9 +1086,9 @@ class TP2CriuControlsTest(unittest.TestCase):
         current = json.loads(json.dumps(captured))
         runtime = current["runtime_sha256"]
         assert isinstance(runtime, dict)
-        runtime["target_launcher"] = "sensitive-current-value"
+        runtime["native_hydration"] = "sensitive-current-value"
         with self.assertRaisesRegex(
-            RuntimeError, r"identity\.runtime_sha256\.target_launcher"
+            RuntimeError, r"identity\.runtime_sha256\.native_hydration"
         ) as raised:
             node._identity_compatibility(captured, current, False)
         self.assertNotIn("sensitive-current-value", str(raised.exception))

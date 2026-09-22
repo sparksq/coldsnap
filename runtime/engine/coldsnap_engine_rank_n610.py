@@ -516,6 +516,11 @@ def _identity_compatibility(
         runtime = identity.get("runtime_sha256")
         if not isinstance(runtime, dict):
             raise RuntimeError("process artifact has invalid runtime identity")
+        # Like n580, the launcher belongs to the ABI-checked, content-addressed
+        # activation runtime supplied by the current adapter. It does not own
+        # checkpointed engine state and may be patched without recapture.
+        # Older artifacts recorded it alongside capsule-bound runtime files.
+        runtime.pop("target_launcher", None)
         if allow_criu_runtime_upgrade:
             for name in ("criu", "criu_rpc", "criu_lz4"):
                 runtime.pop(name, None)

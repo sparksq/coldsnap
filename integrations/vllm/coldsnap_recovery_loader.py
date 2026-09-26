@@ -5749,6 +5749,13 @@ def _install_worker_wake_hook() -> None:
         from vllm.logger import init_logger
 
         runtime_logger = init_logger("vllm.v1.worker.gpu_worker")
+        from coldsnap_b12x_native_state import (
+            begin_recovery_reload, capture_recovery_plans,
+            finish_recovery_reload, restore_recovery_plans,
+        )
+
+        execution_plans = capture_recovery_plans(model)
+        order_state = begin_recovery_reload(model)
         replay_plans = getattr(worker, RECOVERY_REPLAY_PLANS_ATTR, ())
         with _recovery_reload_storage(
             model,
@@ -5839,6 +5846,15 @@ def _install_worker_wake_hook() -> None:
             "ColdSnap recovery restored %d exact derived buffers (%.2f MiB)",
             len(captured_buffers),
             restored_bytes / 1024**2,
+        )
+        restored_plans = restore_recovery_plans(model, execution_plans)
+        normalized_owners = finish_recovery_reload(model, order_state)
+        runtime_logger.info(
+            "ColdSnap recovery restored %d captured B12x execution plans", restored_plans,
+        )
+        runtime_logger.info(
+            "ColdSnap recovery restored captured gate/up order for %d B12x owners",
+            normalized_owners,
         )
         sample_bytes = _model_verify_bytes()
         expected = getattr(worker, "_coldsnap_recovery_model_samples", None)

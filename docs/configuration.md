@@ -153,6 +153,14 @@ the process-local order registrations before warmup without changing hydrated
 bytes. This metadata is exported with both captures and locally materialized
 native payloads. A payload requiring this contract but lacking the record must
 be recaptured or restored through safetensors recovery.
+In-process safetensors recovery invalidates these order registrations before
+reloading checkpoint bytes, then uses B12x's own in-place normalizer to restore
+the captured order before tensor-sample validation and retained graph use.
+Captured tensor addresses must remain unchanged.
+For vLLM's layer-owned B12x experts, recovery also reattaches the captured
+execution plan when the finalizer creates a fresh execution owner. This requires
+the same prepared object, unchanged tensor storage, and matching activation,
+routing, and quantization configuration; incompatible replacements fail closed.
 
 Fresh-process native bootstrap uses positive unit values for floating-point
 quantization scales until the validated native payload hydrates their real

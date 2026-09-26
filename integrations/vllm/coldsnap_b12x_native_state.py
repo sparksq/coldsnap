@@ -87,9 +87,20 @@ def restore_native_state(model: Any, state: Any) -> int:
     normalizer would flip those bytes back to checkpoint order. Restore only
     the proven registry entries; never transform the admitted payload bytes.
     """
+    bindings = _validated_bindings(model, state)
+    by_owner = {record["owner"]: record for record in state["owners"]} if state else {}
+    for signature, storage, registry in bindings:
+        if by_owner[signature["owner"]]["normalized"]:
+            registry[_key(storage)] = (storage.w1_fp4, storage.w1_blockscale)
+        else:
+            registry.pop(_key(storage), None)
+    return len(bindings)
+
+
+def _validated_bindings(model: Any, state: Any) -> list[tuple[dict[str, Any], Any, dict[Any, Any]]]:
     bindings = _bindings(model)
     if state is None and not bindings:
-        return 0
+        return bindings
     if (
         not isinstance(state, dict) or state.get("format") != _FORMAT
         or state.get("kind") != _KIND or not isinstance(state.get("owners"), list)
@@ -116,9 +127,135 @@ def restore_native_state(model: Any, state: Any) -> int:
             raise RuntimeError(
                 f"native B12x normalization geometry changed at {signature['owner']!r}"
             )
+    return bindings
+
+
+def _normalization_mode(signature: dict[str, Any]) -> str:
+    modes = set(signature["quant_modes"])
+    if modes and modes <= {"nvfp4", "w4a8_nvfp4"}:
+        return "nvfp4"
+    if modes == {"w4a8_mx"}:
+        return "w4a8_mx"
+    raise RuntimeError(f"unsupported B12x gate/up recovery quantization modes: {sorted(modes)!r}")
+
+
+def begin_recovery_reload(model: Any) -> dict[str, Any]:
+    """Invalidate first-use proofs before checkpoint-order bytes overwrite them."""
+    metadata = capture_native_state(model)
+    bindings = _validated_bindings(model, metadata)
+    # Resolve every contract before mutating a live registry. The returned
+    # pointers also prevent recovery from replacing captured graph storage.
+    for signature, _storage, _registry in bindings:
+        _normalization_mode(signature)
+    pointers = {signature["owner"]: _key(storage) for signature, storage, _registry in bindings}
+    for _signature, storage, registry in bindings:
+        registry.pop(_key(storage), None)
+    return {"metadata": metadata, "pointers": pointers}
+
+
+def finish_recovery_reload(model: Any, saved: dict[str, Any]) -> int:
+    """Reproduce captured order before sample validation or retained graph use.
+
+    A loader may have normalized its new bytes during finalization. Respect
+    that fresh registry entry; otherwise call B12x's own bounded in-place
+    normalizer exactly once. Native hydration never takes this path.
+    """
+    metadata = saved["metadata"]
+    bindings = _validated_bindings(model, metadata)
+    records = {record["owner"]: record for record in metadata["owners"]}
     for signature, storage, registry in bindings:
-        if by_owner[signature["owner"]]["normalized"]:
-            registry[_key(storage)] = (storage.w1_fp4, storage.w1_blockscale)
-        else:
-            registry.pop(_key(storage), None)
+        name = signature["owner"]
+        if _key(storage) != saved["pointers"][name]:
+            raise RuntimeError(f"B12x recovery changed captured gate/up storage at {name!r}")
+        if not records[name]["normalized"] and _key(storage) in registry:
+            raise RuntimeError(f"B12x recovery changed captured gate/up order at {name!r}")
+        _normalization_mode(signature)
+    if bindings:
+        normalizer = importlib.import_module("b12x.moe.fused_moe._impl")._ensure_w13_kernel_order_inplace
+        for signature, storage, _registry in bindings:
+            if records[signature["owner"]]["normalized"]:
+                normalizer(
+                    storage.w1_fp4, storage.w1_blockscale,
+                    n=signature["intermediate_size"], k=signature["hidden_size"],
+                    quant_mode=_normalization_mode(signature),
+                )
     return len(bindings)
+
+
+_PLAN_FIELDS = ("_plan", "_plan_key", "_plan_activation", "_plan_route_on_input")
+_OWNER_CONFIG_FIELDS = ("_quant_mode", "_source_format", "_w13_layout", "_apply_router_weight_on_input")
+
+
+def _execution_storage(prepared: Any) -> dict[str, Any]:
+    from coldsnap_recovery_loader import B12X_PREPARED_WEIGHT_FIELDS, _b12x_weight_storage
+
+    storage = _b12x_weight_storage(prepared)
+    return {
+        name: (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype))
+        for name in B12X_PREPARED_WEIGHT_FIELDS
+        for tensor in (getattr(storage, name),)
+    }
+
+
+def capture_recovery_plans(model: Any) -> list[dict[str, Any]]:
+    """Retain warmed plans while vLLM rebuilds layer-owned execution owners."""
+    from coldsnap_recovery_loader import _b12x_prepared_owners, _is_b12x_layer_cached_expert
+
+    records = []
+    for name, layer, owner, prepared in _b12x_prepared_owners(model):
+        # Earlier B12xExperts uses a callable _plan and a lazy _plans cache.
+        # Only the newer explicitly prepared execution contract needs rebinding.
+        if (
+            not _is_b12x_layer_cached_expert(owner)
+            or not callable(getattr(owner, "_plan_for_tokens", None))
+        ):
+            continue
+        fields = {field: getattr(owner, field) for field in _PLAN_FIELDS}
+        key = fields["_plan_key"]
+        if (
+            fields["_plan"] is None or not isinstance(key, tuple) or len(key) != 4
+            or key[-1] != id(prepared)
+            or fields["_plan_activation"] != layer.activation
+            or fields["_plan_route_on_input"] != bool(layer.apply_router_weight_on_input)
+        ):
+            raise RuntimeError(f"B12x recovery lacks a captured execution plan at {name!r}")
+        records.append({
+            "name": name, "layer": layer, "prepared": prepared, "fields": fields,
+            "storage": _execution_storage(prepared),
+            "config": tuple(getattr(owner, field) for field in _OWNER_CONFIG_FIELDS),
+        })
+    return records
+
+
+def restore_recovery_plans(model: Any, records: list[dict[str, Any]]) -> int:
+    """Reattach plans only to the exact captured prepared tensor owner.
+
+    The pinned vLLM finalizer reuses packed storage and the prepared object,
+    but creates a new B12xExperts with empty execution-plan fields. Its old
+    plan still owns the warmed bindings. Identity and storage checks ensure
+    that restoring those bindings cannot silently admit replacement weights.
+    """
+    from coldsnap_recovery_loader import _b12x_prepared_owners, _is_b12x_layer_cached_expert
+
+    current = {name: (layer, owner, prepared) for name, layer, owner, prepared in _b12x_prepared_owners(model)}
+    validated = []
+    for record in records:
+        name = record["name"]
+        if name not in current:
+            raise RuntimeError(f"B12x recovery lost its execution owner at {name!r}")
+        layer, owner, prepared = current[name]
+        fields = record["fields"]
+        if (
+            layer is not record["layer"] or not _is_b12x_layer_cached_expert(owner)
+            or prepared is not record["prepared"]
+            or _execution_storage(prepared) != record["storage"]
+            or tuple(getattr(owner, field) for field in _OWNER_CONFIG_FIELDS) != record["config"]
+            or layer.activation != fields["_plan_activation"]
+            or bool(layer.apply_router_weight_on_input) != fields["_plan_route_on_input"]
+        ):
+            raise RuntimeError(f"B12x recovery changed captured execution bindings at {name!r}")
+        validated.append((owner, fields))
+    for owner, fields in validated:
+        for field, value in fields.items():
+            setattr(owner, field, value)
+    return len(validated)

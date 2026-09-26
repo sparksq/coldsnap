@@ -8,6 +8,7 @@ import copy
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "integrations/core"))
@@ -99,6 +100,131 @@ class B12xNativeStateTest(unittest.TestCase):
         self.normalize(captured)
         self.assertTrue(self.torch.equal(captured.w1_fp4, expected_weight))
         self.assertTrue(self.torch.equal(captured.w1_blockscale, expected_scale))
+
+    def test_recovery_reloads_source_order_into_captured_storage(self):
+        storage = self.weights()
+        source = (storage.w1_fp4.clone(), storage.w1_blockscale.clone())
+        self.normalize(storage)
+        expected = (storage.w1_fp4.clone(), storage.w1_blockscale.clone())
+        pointers = (storage.w1_fp4.data_ptr(), storage.w1_blockscale.data_ptr())
+        saved = state.begin_recovery_reload(self.model)
+        self.assertNotIn(pointers, self.impl._W13_NORMALIZED_STORAGES)
+        storage.w1_fp4.copy_(source[0])
+        storage.w1_blockscale.copy_(source[1])
+        self.assertEqual(state.finish_recovery_reload(self.model, saved), 1)
+        self.normalize(storage)
+        self.assertTrue(self.torch.equal(storage.w1_fp4, expected[0]))
+        self.assertTrue(self.torch.equal(storage.w1_blockscale, expected[1]))
+        self.assertEqual(pointers, (storage.w1_fp4.data_ptr(), storage.w1_blockscale.data_ptr()))
+
+    def test_recovery_respects_normalization_during_finalization(self):
+        storage = self.weights()
+        source = (storage.w1_fp4.clone(), storage.w1_blockscale.clone())
+        self.normalize(storage)
+        expected = (storage.w1_fp4.clone(), storage.w1_blockscale.clone())
+        saved = state.begin_recovery_reload(self.model)
+        storage.w1_fp4.copy_(source[0])
+        storage.w1_blockscale.copy_(source[1])
+        self.normalize(storage)
+        state.finish_recovery_reload(self.model, saved)
+        self.assertTrue(self.torch.equal(storage.w1_fp4, expected[0]))
+        self.assertTrue(self.torch.equal(storage.w1_blockscale, expected[1]))
+
+    def test_recovery_preserves_uncaptured_first_use_order(self):
+        storage = self.weights()
+        expected = storage.w1_fp4.clone()
+        saved = state.begin_recovery_reload(self.model)
+        state.finish_recovery_reload(self.model, saved)
+        self.assertTrue(self.torch.equal(storage.w1_fp4, expected))
+        self.assertNotIn((storage.w1_fp4.data_ptr(), storage.w1_blockscale.data_ptr()), self.impl._W13_NORMALIZED_STORAGES)
+
+    def test_recovery_rejects_replacement_graph_storage(self):
+        storage = self.weights()
+        self.normalize(storage)
+        saved = state.begin_recovery_reload(self.model)
+        fresh = self.weights()
+        expected = fresh.w1_fp4.clone()
+        with self.assertRaisesRegex(RuntimeError, "changed captured gate/up storage"):
+            state.finish_recovery_reload(self.model, saved)
+        self.assertTrue(self.torch.equal(fresh.w1_fp4, expected))
+
+    def test_recovery_without_b12x_owners_is_unchanged(self):
+        saved = state.begin_recovery_reload(self.model)
+        self.assertEqual(state.finish_recovery_reload(self.model, saved), 0)
+
+    def execution_owner(self, prepared, plan):
+        try:
+            from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+        except ImportError:
+            self.skipTest("image predates layer-owned B12x experts")
+        if not hasattr(B12xExperts, "_plan_for_tokens"):
+            self.skipTest("image uses the earlier lazy B12x plan cache")
+
+        owner = B12xExperts.__new__(B12xExperts)
+        owner._prepared_experts = prepared
+        owner._plan = plan
+        owner._plan_key = ((1, 16, 2048), "silu", False, id(prepared)) if plan else None
+        owner._plan_activation = "silu" if plan else None
+        owner._plan_route_on_input = False if plan else None
+        owner._quant_mode = "nvfp4"
+        owner._source_format = "modelopt_nvfp4"
+        owner._w13_layout = "w31"
+        owner._apply_router_weight_on_input = False
+        return owner
+
+    def test_recovery_reuses_captured_plan_on_rebuilt_owner(self):
+        self.weights()
+        prepared = self.owners[0][3]
+        layer = self.model
+        layer.activation, layer.apply_router_weight_on_input = "silu", False
+        plan = SimpleNamespace(warmed=True)
+        captured = self.execution_owner(prepared, plan)
+        self.owners = [("experts", layer, captured, prepared)]
+        records = state.capture_recovery_plans(self.model)
+        fresh = self.execution_owner(prepared, None)
+        self.owners = [("experts", layer, fresh, prepared)]
+        with self.assertRaisesRegex(RuntimeError, "no prepared plan"):
+            fresh._plan_for_tokens(63, activation="silu", apply_router_weight_on_input=False)
+        self.assertEqual(state.restore_recovery_plans(self.model, records), 1)
+        self.assertIs(fresh._plan_for_tokens(63, activation="silu", apply_router_weight_on_input=False), plan)
+        self.assertIs(fresh._prepared(), prepared)
+        self.assertEqual(fresh._plan_key, captured._plan_key)
+
+    def test_recovery_plan_rejects_changed_storage_and_routing(self):
+        storage = self.weights()
+        prepared = self.owners[0][3]
+        layer = self.model
+        layer.activation, layer.apply_router_weight_on_input = "silu", False
+        captured = self.execution_owner(prepared, object())
+        self.owners = [("experts", layer, captured, prepared)]
+        records = state.capture_recovery_plans(self.model)
+        fresh = self.execution_owner(prepared, None)
+        self.owners = [("experts", layer, fresh, prepared)]
+        layer.apply_router_weight_on_input = True
+        with self.assertRaisesRegex(RuntimeError, "changed captured execution bindings"):
+            state.restore_recovery_plans(self.model, records)
+        self.assertIsNone(fresh._plan)
+        layer.apply_router_weight_on_input = False
+        storage.w1_fp4.set_(storage.w1_fp4.clone())
+        with self.assertRaisesRegex(RuntimeError, "changed captured execution bindings"):
+            state.restore_recovery_plans(self.model, records)
+        self.assertIsNone(fresh._plan)
+
+    def test_recovery_plan_skips_legacy_and_unrelated_owners(self):
+        self.weights()
+        self.assertEqual(state.capture_recovery_plans(self.model), [])
+        self.assertEqual(state.restore_recovery_plans(self.model, []), 0)
+        try:
+            from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+        except ImportError:
+            return
+        if hasattr(B12xExperts, "_plan_for_tokens"):
+            return
+        prepared = self.owners[0][3]
+        legacy = B12xExperts.__new__(B12xExperts)
+        self.assertTrue(callable(legacy._plan))
+        self.owners = [("experts", self.model, legacy, prepared)]
+        self.assertEqual(state.capture_recovery_plans(self.model), [])
 
     def test_missing_state_requires_recovery_or_recapture(self):
         self.weights()

@@ -137,7 +137,34 @@ The residual is hydrated before vLLM reload so its load kernels see the captured
 auxiliary state, and once again afterward so any non-weight buffers touched
 by loading return to their exact captured contents. Its size is model- and
 allocator-dependent, but excludes every byte covered by a reload-owned model
-weight tensor.
+weight tensor. In images exposing vLLM's scoped weight-transfer API, capture
+also observes direct checkpoint copies such as B12x Engram table and scale
+shards, plus raw Torch copies into registered scalar scales. These destinations
+leave the residual only when exact observed copies
+cover the entire registered CUDA tensor. Partial writes, ambiguous aliases,
+and writes without checkpoint provenance remain residual; older images keep
+their parameter-loader observation path.
+
+Native manifests also carry execution metadata for B12x MoE gate/up order.
+B12x can normalize these weights and block scales in place during first use;
+the payload records whether that transformation has already happened. A fresh
+native worker validates the recorded owners and tensor geometry, then restores
+the process-local order registrations before warmup without changing hydrated
+bytes. This metadata is exported with both captures and locally materialized
+native payloads. A payload requiring this contract but lacking the record must
+be recaptured or restored through safetensors recovery.
+
+Fresh-process native bootstrap uses positive unit values for floating-point
+quantization scales until the validated native payload hydrates their real
+contents. Small integer and boolean checkpoint metadata (at most 64 KiB per
+tensor, excluding packed byte weights) retain their exact captured bytes in
+the bootstrap index, so model geometry validation still runs without reading
+the original checkpoint. Version 1 and 2 bootstrap indices remain readable;
+models needing these exact metadata values must be recaptured. Native startup
+also revalidates B12x's value-dependent expert input-scale sharing proof after
+hydration and before warmup, without replacing packed tensors. Speculative
+drafts outside the target's native payload load their real safetensors weights;
+they must not receive the target's bootstrap placeholders.
 
 This mode assumes the pinned Hugging Face snapshot is already available at the
 same cache path visible to the restored process. The live snapshot still owns
@@ -167,6 +194,15 @@ general tuning knobs:
   engine-native graph plans. Capture fails on incomplete coverage, and the
   artifact records planned/warmed counts, mode details, toolchain identity,
   cache root, and elapsed time for every unit.
+- ColdSnap enables supported vLLM persistent compilation paths by default:
+  standalone compilation on PyTorch 2.9+, AOT compilation on 2.10+, and combined
+  AOT artifacts on 2.12 development builds or newer when AOT and standalone
+  compilation are enabled. Only settings registered by the installed vLLM are
+  changed. Explicit recipe environment values and disabled compilation caches
+  are preserved. These defaults apply to both snapshot drivers, and do not
+  override eager execution or add compilation support to an unsupported model.
+  Shape calibration separately warms the engine's planned graph shapes; neither
+  mechanism guarantees that every possible inference shape avoids runtime JIT.
 - vLLM startup-plan persistence is enabled automatically when the canonical
   managed runtime cache is seeded. Capture records vLLM's exact admitted KV
   capacity and device-independent sizing fingerprint; restore may reuse that

@@ -5,6 +5,7 @@
 """Prepared-owner classification and reload ordering for the V4.1 lifecycle."""
 
 import contextlib
+import functools
 import sys
 import unittest
 from pathlib import Path
@@ -36,11 +37,22 @@ class Tensor:
         return True
 
 
-def fixture():
+def wrap_prepared(storage):
+    class PreparedExperts:
+        def __init__(self):
+            self._impl = storage
+            self.plan = SimpleNamespace(_impl=storage.plan)
+
+    PreparedExperts.__module__ = "b12x.moe.fused_moe.weights"
+    return PreparedExperts()
+
+
+def fixture(*, wrapped=False):
     fields = {
         name: Tensor(1200 + i * 100) for i, name in enumerate(loader.B12X_PREPARED_WEIGHT_FIELDS)
     }
-    prepared = SimpleNamespace(plan=SimpleNamespace(discards_source_parameters=True), **fields)
+    storage = SimpleNamespace(plan=SimpleNamespace(discards_source_parameters=True), **fields)
+    prepared = wrap_prepared(storage) if wrapped else storage
 
     class B12xV41Experts:
         def finalize_weights(self):
@@ -50,7 +62,8 @@ def fixture():
             for source, field in loader.B12X_SOURCE_STORAGE_FIELDS:
                 assert getattr(self, source).data_ptr() == fields[field].data_ptr()
                 setattr(self, source, Tensor(0, 0))
-            self.prepared = SimpleNamespace(plan=prepared.plan, **fields)
+            rebuilt = SimpleNamespace(plan=storage.plan, **fields)
+            self.prepared = wrap_prepared(rebuilt) if wrapped else rebuilt
             self.plan, self.local_ids = object(), object()
 
     B12xV41Experts.__module__ = "vllm.models.deepseek_v4_1.nvidia.b12x_moe"
@@ -118,6 +131,15 @@ class B12xV41Test(unittest.TestCase):
         layer.__class__.__module__ = "unrelated"
         self.assertEqual(loader._b12x_prepared_owners(model), [])
 
+    def test_wrapper_contract_is_specific_and_fails_closed(self):
+        storage = object()
+        unrelated = SimpleNamespace(_impl=storage)
+        self.assertIs(loader._b12x_weight_storage(unrelated), unrelated)
+        prepared = wrap_prepared(SimpleNamespace(plan=object()))
+        prepared._impl = None
+        with self.assertRaisesRegex(RuntimeError, "wrapper lacks its weight storage"):
+            loader._b12x_weight_storage(prepared)
+
     def test_mxfp8_head_retains_native_weights_after_source_release(self):
         kernel_type = type("B12xMxfp8LinearKernel", (), {})
         kernel_type.__module__ = "vllm.model_executor.kernels.linear.mxfp8.b12x"
@@ -148,7 +170,7 @@ class B12xV41Test(unittest.TestCase):
 
     def test_missing_prepared_field_fails_closed(self):
         model, _, prepared, *_ = fixture()
-        del prepared.w1_fp4
+        del (prepared._impl if hasattr(prepared, "_impl") else prepared).w1_fp4
         with self.assertRaisesRegex(RuntimeError, "canonical weight field"):
             loader._model_weight_tensors(model)
 
@@ -231,6 +253,16 @@ class B12xV41Test(unittest.TestCase):
         self.assertTrue(all(getattr(layer, name) is value for name, value in sources.items()))
         self.assertNotIn("finalize_weights", vars(layer))
         self.assertIs(layerwise._copy_and_restore_kernel_tensors, original_copyback)
+
+
+class B12xWrappedV41Test(B12xV41Test):
+    """Run the same layout/reload contracts against B12x's new wrapper."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = patch(__name__ + ".fixture", functools.partial(fixture, wrapped=True))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 if __name__ == "__main__":

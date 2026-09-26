@@ -74,6 +74,20 @@ class SyntheticWeightSource:
     weight_name_prefixes: tuple[str, ...] | None
 
 
+def get_worker_sleep_backend(worker: Any) -> Any:
+    """Resolve the worker-owned lazy backend across vLLM worker APIs."""
+    getter = getattr(worker, "_get_sleep_mode_backend", None)
+    if callable(getter):
+        backend = getter()
+    elif inspect.getattr_static(worker, "sleep_mode_backend", None) is not None:
+        backend = worker.sleep_mode_backend
+    else:
+        raise _contract_error("GPU worker exposes no sleep backend accessor")
+    if backend is None:
+        raise _contract_error("GPU worker sleep backend accessor returned None")
+    return backend
+
+
 def get_allocator() -> Any:
     try:
         module = importlib.import_module("vllm.device_allocator")

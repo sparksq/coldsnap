@@ -25,12 +25,14 @@ class MaterializerStats:
 
 
 class NeutralTensorMaterializer:
-    """Supply broadcast-zero views while vLLM builds its normal final layout.
+    """Supply neutral broadcast views while vLLM builds its normal final layout.
 
     The normal model ``load_weights`` implementation remains in control of
     parameter allocation, packing, and finalization. Expanded scalar sources
     carry valid neutral values without allocating checkpoint-sized CPU
-    storage. Known incompatible weight names can opt into dense zero tensors.
+    storage. Floating-point quantization scales use one so model validation
+    sees finite positive values before hydration. Known incompatible weight
+    names can opt into dense tensors.
     """
 
     def __init__(
@@ -72,12 +74,18 @@ class NeutralTensorMaterializer:
         logical_elements = 1
         for dimension in shape:
             logical_elements *= dimension
-        scalar = torch_module.zeros((), dtype=dtype, device="cpu")
+        leaf = name.rsplit(".", 1)[-1]
+        positive_scale = bool(getattr(dtype, "is_floating_point", False)) and leaf in {
+            "weight_scale", "weight_scale_2", "weight_scale_inv",
+            "input_scale", "input_scale_2",
+        }
+        factory = torch_module.ones if positive_scale else torch_module.zeros
+        scalar = factory((), dtype=dtype, device="cpu")
         element_bytes = int(scalar.element_size())
         self._tensors += 1
         self._logical_bytes += logical_elements * element_bytes
         if self.uses_dense_source(name):
-            value = torch_module.zeros(shape, dtype=dtype, device="cpu")
+            value = factory(shape, dtype=dtype, device="cpu")
             self._physical_source_bytes += logical_elements * element_bytes
             self._dense_tensors += 1
             return value

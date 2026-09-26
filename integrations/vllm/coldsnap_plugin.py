@@ -41,6 +41,9 @@ def register() -> None:
     # This must precede imports that can resolve a Qwen model class. It is a
     # no-op unless the explicit pre-worker-import process-template phase is on.
     preload_context_free_fla_platform_probe()
+    from coldsnap_startup_plan import install_aot_compilation_defaults
+
+    install_aot_compilation_defaults()
     from vllm.device_allocator.sleep_mode_backend import (
         SleepModeBackend,
         SleepModeBackendFactory,

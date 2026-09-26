@@ -616,7 +616,7 @@ def _infer(args: argparse.Namespace) -> dict[str, Any]:
     Failed attempts (including retained-graph retries) cannot leak a TTFT.
     """
     payload = {
-        "model": args.model,
+        "model": getattr(args, "served_model_name", "") or args.model,
         "messages": [{"role": "user", "content": args.prompt}],
         "max_tokens": 64,
         "temperature": 0,
@@ -673,7 +673,14 @@ def _infer(args: argparse.Namespace) -> dict[str, Any]:
     message = {field: "".join(values) for field, values in pieces.items()}
     actual = message["content"].strip()
     if actual != args.expected:
-        raise RuntimeError(f"response mismatch: expected={args.expected!r} actual={actual!r}")
+        reasoning = message["reasoning"] or message["reasoning_content"]
+        usage = response.get("usage")
+        completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        raise RuntimeError(
+            f"response mismatch: expected={args.expected!r} actual={actual!r}; "
+            f"finish_reason={finish_reason!r} completion_tokens={completion_tokens!r} "
+            f"first_token_field={first_token_field!r} reasoning_preview={reasoning[:512]!r}"
+        )
     response["object"] = "chat.completion"
     response["choices"] = [{"index": 0, "message": {"role": "assistant", **message}, "finish_reason": finish_reason}]
     response["coldsnap_acceptance"] = {

@@ -164,6 +164,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--http-port", type=int, default=8000)
     parser.add_argument("--image-id", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--served-model-name", default="")
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--expected", required=True)
     parser.add_argument("--prompt", required=True)

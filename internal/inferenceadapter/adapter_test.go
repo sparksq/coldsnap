@@ -709,6 +709,41 @@ func TestRankCommandIsTopologyNeutralAndUsesQualifiedRecoveryDefaults(t *testing
 	}
 }
 
+func TestRankCommandCarriesServedAliasSeparatelyFromModelIdentity(t *testing.T) {
+	for _, driver := range []string{snapshotdriver.N580, snapshotdriver.N610} {
+		for _, operation := range []string{"capture", "restore"} {
+			for _, alias := range []string{"", "Qwen3.8-Flash-Next"} {
+				t.Run(string(driver)+"/"+operation+"/"+alias, func(t *testing.T) {
+					request := validRequest(1)
+					request.Driver = snapshotdriver.Selection{ID: driver}
+					request.Workload.ServedModelName = alias
+					adapter := fixtureAdapter(Adapter{Remote: fakeRemote{}, Timeout: 20 * time.Minute})
+					command, err := rankCommandFixture(adapter,
+						context.Background(), request, request.Launch.Units[0], request.Launch.Units[0].Image,
+						"rank-0", operation, "activation", request.ID, "/state/rank0", "/state/endpoint",
+						"recovery", nil, request.Launch.Units[0].ImageDigest, nil, 0, nil,
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+					modelIndex := slices.Index(command, "--model")
+					if modelIndex < 0 || command[modelIndex+1] != request.Launch.Model.ID {
+						t.Fatalf("model identity changed: %v", command)
+					}
+					aliasIndex := slices.Index(command, "--served-model-name")
+					if alias == "" {
+						if aliasIndex >= 0 {
+							t.Fatalf("unexpected served alias: %v", command)
+						}
+					} else if aliasIndex < 0 || command[aliasIndex+1] != alias {
+						t.Fatalf("missing served alias: %v", command)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestCaptureAndRestorePreserveCommandWhileCheckpointForcesColdSnap(t *testing.T) {
 	request := validRequest(1)
 	request.Launch.Units[0].Command[4] =

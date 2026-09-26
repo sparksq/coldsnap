@@ -43,6 +43,7 @@ from coldsnap_vllm import (  # noqa: E402
     VllmContractError,
     allocations as vllm_allocations,
     force_cross_rank_rpc_over_tcp,
+    get_worker_sleep_backend,
     override_default_sleep_backend,
     prepare_synthetic_weight_source,
     register_sleep_backend,
@@ -1215,6 +1216,10 @@ class DiskSleepIoTest(unittest.TestCase):
             backend._stage_cache = []
             backend.memory_provider = memory
 
+            execution_state = {"format": 1, "owners": [{"owner": "experts", "normalized": True}]}
+            backend.set_native_model_execution_state(execution_state)
+            execution_state["owners"][0]["normalized"] = False
+
             recovery = backend._write_snapshot(memory)
 
             self.assertEqual(recovery["model_payload"]["bytes"], 12288)
@@ -1242,6 +1247,9 @@ class DiskSleepIoTest(unittest.TestCase):
             # and exact execution-topology rank.
             native_manifest_path = backend.snapshot_dir / disk_backend.NATIVE_MANIFEST_NAME
             portable = json.loads(native_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(portable["model_execution_state"], {
+                "format": 1, "owners": [{"owner": "experts", "normalized": True}],
+            })
             portable.update(
                 {
                     "pid": 614,
@@ -1828,33 +1836,42 @@ class DiskSleepIoTest(unittest.TestCase):
                 return self._prepared_experts
 
         fields = {name: object() for name in recovery_loader.B12X_PREPARED_WEIGHT_FIELDS}
-        prepared = SimpleNamespace(plan=SimpleNamespace(discards_source_parameters=True), **fields)
-        owner = B12xExperts()
-        owner._prepared_experts = prepared
-        owner._source_parameters_released = True
-        layer = SimpleNamespace(
-            quant_method=SimpleNamespace(moe_kernel=SimpleNamespace(fused_experts=owner)),
-            _b12x_prepared_experts=prepared,
-            b12x_warmup_provider=owner,
-            **{name: object() for name, _ in recovery_loader.B12X_SOURCE_STORAGE_FIELDS},
-        )
-        model = SimpleNamespace(named_modules=lambda: iter([("experts", layer)]))
-        self.assertEqual(recovery_loader._b12x_prepared_owners(model),
-                         [("experts", layer, owner, prepared)])
-        adapter, = recovery_loader._discover_b12x_recovery_storage(model)
-        adapter.begin_reload()
-        self.assertIsNone(owner._prepared_experts)
-        self.assertIs(layer._b12x_prepared_experts, prepared)
-        self.assertIs(adapter._live_owner(), owner)
-        adapter.abort_reload()
-        self.assertIs(owner._prepared(), prepared)
-        self.assertIs(layer._b12x_prepared_experts, prepared)
-        self.assertTrue(owner._source_parameters_released)
-        layer._b12x_prepared_experts = object()
-        with self.assertRaisesRegex(RuntimeError, "owners disagree"):
-            recovery_loader._b12x_prepared_owners(model)
-        unrelated = SimpleNamespace(_prepared=lambda: prepared, _prepared_experts=prepared)
-        self.assertIsNone(recovery_loader._b12x_prepared_experts(unrelated))
+        flat_prepared = SimpleNamespace(plan=SimpleNamespace(discards_source_parameters=True), **fields)
+        class PreparedExperts:
+            __module__ = "b12x.moe.fused_moe.weights"
+
+            def __init__(self, storage):
+                self._impl = storage
+                self.plan = SimpleNamespace(_impl=storage.plan)
+
+        for prepared in (flat_prepared, PreparedExperts(flat_prepared)):
+            with self.subTest(wrapped=isinstance(prepared, PreparedExperts)):
+                owner = B12xExperts()
+                owner._prepared_experts = prepared
+                owner._source_parameters_released = True
+                layer = SimpleNamespace(
+                    quant_method=SimpleNamespace(moe_kernel=SimpleNamespace(fused_experts=owner)),
+                    _b12x_prepared_experts=prepared,
+                    b12x_warmup_provider=owner,
+                    **{name: object() for name, _ in recovery_loader.B12X_SOURCE_STORAGE_FIELDS},
+                )
+                model = SimpleNamespace(named_modules=lambda layer=layer: iter([("experts", layer)]))
+                self.assertEqual(recovery_loader._b12x_prepared_owners(model),
+                                 [("experts", layer, owner, prepared)])
+                adapter, = recovery_loader._discover_b12x_recovery_storage(model)
+                adapter.begin_reload()
+                self.assertIsNone(owner._prepared_experts)
+                self.assertIs(layer._b12x_prepared_experts, prepared)
+                self.assertIs(adapter._live_owner(), owner)
+                adapter.abort_reload()
+                self.assertIs(owner._prepared(), prepared)
+                self.assertIs(layer._b12x_prepared_experts, prepared)
+                self.assertTrue(owner._source_parameters_released)
+                layer._b12x_prepared_experts = object()
+                with self.assertRaisesRegex(RuntimeError, "owners disagree"):
+                    recovery_loader._b12x_prepared_owners(model)
+                unrelated = SimpleNamespace(_prepared=lambda prepared=prepared: prepared, _prepared_experts=prepared)
+                self.assertIsNone(recovery_loader._b12x_prepared_experts(unrelated))
 
     def test_native_payload_layout_includes_registered_derived_model_state(self) -> None:
         class Tensor:
@@ -2912,6 +2929,53 @@ class DiskSleepIoTest(unittest.TestCase):
         self.assertEqual(model_config.max_model_len, 13_300)
         self.assertEqual(model_config.compute_hash(), "13300")
         self.assertEqual(ModelConfig().compute_hash(), "13300")
+
+    def test_startup_plan_supports_config_backed_read_only_model_state_limit(self) -> None:
+        class ModelConfig:
+            max_model_len = 4096
+
+            def compute_hash(self):
+                return self.max_model_len
+
+        class ModelState:
+            def __init__(self, model_config):
+                self.model_config = model_config
+
+            @property
+            def max_model_len(self):
+                return self.model_config.max_model_len
+
+        class Qwen4ExpModelState(ModelState):
+            pass
+
+        class Worker:
+            def compile_or_warm_up_model(self):
+                return (
+                    self.model_runner.model_state.max_model_len,
+                    self.vllm_config.model_config.compute_hash(),
+                )
+
+        _install_compile_cache_identity_hook(SimpleNamespace(Worker=Worker))
+        for configured in (4096, 8192):
+            with self.subTest(configured=configured):
+                config = ModelConfig()
+                state = Qwen4ExpModelState(config)
+                worker = Worker()
+                worker.vllm_config = SimpleNamespace(
+                    model_config=config,
+                    compilation_config=SimpleNamespace(cache_dir=""),
+                )
+                worker.model_runner = SimpleNamespace(max_model_len=4096, model_state=state)
+                setattr(worker, _CONFIGURED_MODEL_LEN_ATTR, configured)
+
+                self.assertEqual(worker.compile_or_warm_up_model(), (4096, configured))
+                self.assertEqual(config.compute_hash(), 4096)
+                # The derived property follows later KV fitting without a
+                # ColdSnap assignment or a shadowing instance attribute.
+                config.max_model_len = worker.model_runner.max_model_len = 2048
+                self.assertEqual(worker.compile_or_warm_up_model(), (2048, configured))
+                self.assertEqual(config.compute_hash(), 2048)
+                self.assertNotIn("max_model_len", vars(state))
 
     def test_startup_plan_leaves_unrelated_model_state_limits_unchanged(self) -> None:
         class Worker:
@@ -5002,6 +5066,42 @@ class DiskSleepIoTest(unittest.TestCase):
                 disk_backend._portable_identity_matches(identity, "worker-1", 0, os.getpid())
             )
 
+    def test_worker_sleep_backend_supports_legacy_getter_and_lazy_property(self) -> None:
+        backend = object()
+        legacy = SimpleNamespace(_get_sleep_mode_backend=lambda: backend)
+        self.assertIs(get_worker_sleep_backend(legacy), backend)
+
+        class Worker:
+            def __init__(self):
+                self._sleep_mode_backend = None
+                self.creations = 0
+
+            @property
+            def sleep_mode_backend(self):
+                if self._sleep_mode_backend is None:
+                    self.creations += 1
+                    self._sleep_mode_backend = backend
+                return self._sleep_mode_backend
+
+        worker = Worker()
+        self.assertIs(get_worker_sleep_backend(worker), backend)
+        self.assertIs(get_worker_sleep_backend(worker), backend)
+        self.assertEqual(worker.creations, 1)
+
+    def test_worker_sleep_backend_rejects_missing_contract_and_propagates_errors(self) -> None:
+        for worker in (SimpleNamespace(_sleep_mode_backend=object()),
+                       SimpleNamespace(_get_sleep_mode_backend=lambda: None)):
+            with self.assertRaises(VllmContractError):
+                get_worker_sleep_backend(worker)
+
+        class Worker:
+            @property
+            def sleep_mode_backend(self):
+                raise RuntimeError("backend initialization failed")
+
+        with self.assertRaisesRegex(RuntimeError, "backend initialization failed"):
+            get_worker_sleep_backend(Worker())
+
     def test_process_template_compile_materializes_after_layout_is_complete(self) -> None:
         events = []
 
@@ -5065,7 +5165,8 @@ class DiskSleepIoTest(unittest.TestCase):
                 self.backend = Backend()
                 self.model_runner = SimpleNamespace(get_model=lambda: model)
 
-            def _get_sleep_mode_backend(self):
+            @property
+            def sleep_mode_backend(self):
                 return self.backend
 
             def compile_or_warm_up_model(self):

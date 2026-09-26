@@ -188,7 +188,7 @@ class FileBackedWeightsTest(unittest.TestCase):
 
     def test_bootstrap_records_without_phase_and_keeps_file_contract(self):
         path = self.record([self.file_entry()])
-        self.assertEqual(json.loads(path.read_text())["format"], 2)
+        self.assertEqual(json.loads(path.read_text())["format"], 3)
         [(name, tensor)] = self.bootstrap()
         self.assertEqual(name, "model." + self.name)
         self.assertTrue(tensor.is_meta)
@@ -279,6 +279,57 @@ class InitialNativeHydrationTest(unittest.TestCase):
             self.assertTrue(model._coldsnap_native_bootstrap_loaded)
             self.assertGreater(loader.counter_before_loading_weights, 0)
             logger.init_logger.assert_any_call("vllm.model_executor.model_loader.default_loader")
+
+    def test_registered_loader_isolates_draft_even_when_get_model_was_imported_early(self):
+        target, draft = object(), object()
+        load_config = SimpleNamespace(load_format=recovery.LOAD_FORMAT)
+        config = SimpleNamespace(model_config=target, load_config=load_config,
+                                 speculative_config=SimpleNamespace(draft_model_config=draft))
+        calls = []
+
+        class DefaultLoader:
+            def __init__(self, load_config):
+                self.load_config = load_config
+
+            def load_model(self, *, vllm_config, model_config=None, prefix=""):
+                calls.append((self.load_config, model_config, prefix,
+                              recovery._INITIAL_NATIVE_BOOTSTRAP.get()))
+                return model_config
+
+        module = ModuleType("vllm.model_executor.model_loader.default_loader")
+        module.DefaultModelLoader = DefaultLoader
+        config_module = ModuleType("vllm.config")
+        config_module.replace = lambda value, **changes: SimpleNamespace(**(vars(value) | changes))
+        registered = {}
+        def register(name, cls):
+            registered[name] = cls
+            return True
+
+        with patch.dict(sys.modules, {module.__name__: module, config_module.__name__: config_module}), \
+             patch.dict(os.environ, {}, clear=True), \
+             patch.object(recovery, "recovery_weights_enabled", return_value=True), \
+             patch.object(recovery, "register_model_loader", side_effect=register), \
+             patch.object(recovery, "_install_capture_loader_observer"), \
+             patch.object(recovery, "_install_recovery_hybrid_draft_bridge"), \
+             patch.object(recovery, "_install_worker_wake_hook"):
+            recovery.install_recovery_aware_loader()
+            loader = registered[recovery.LOAD_FORMAT](load_config)
+            for native in (False, True):
+                with self.subTest(native=native):
+                    token = recovery._INITIAL_NATIVE_BOOTSTRAP.set(native)
+                    try:
+                        self.assertIs(loader.load_model(vllm_config=config, model_config=target), target)
+                        self.assertIs(loader.load_model(vllm_config=config, model_config=draft, prefix="mtp."), draft)
+                        self.assertEqual(recovery._INITIAL_NATIVE_BOOTSTRAP.get(), native)
+                    finally:
+                        recovery._INITIAL_NATIVE_BOOTSTRAP.reset(token)
+                    main_call, draft_call = calls[-2:]
+                    self.assertIs(main_call[0], load_config)
+                    self.assertEqual(main_call[3], native)
+                    self.assertEqual(draft_call[0].load_format, "safetensors")
+                    self.assertEqual(draft_call[0].safetensors_load_strategy, "lazy")
+                    self.assertEqual(draft_call[2:], ("mtp.", False))
+            self.assertEqual(load_config.load_format, recovery.LOAD_FORMAT)
 
     def test_native_semantics_do_not_depend_on_adjacent_tensor_placement(self):
         def tensor(pointer):
@@ -382,7 +433,7 @@ class InitialNativeHydrationTest(unittest.TestCase):
              patch.object(synthetic, "_native_bootstrap_requested", return_value=True), \
              patch.object(recovery, "_bind_native_model_payload_layout") as bind, \
              patch.object(recovery, "_refresh_initial_native_model", side_effect=lambda model: (
-                 events.append("refresh") or {"block32_linears": 1, "block128_linears": 0, "wo_projections": 0, "mhc_broadcasts": 1})):
+                 events.append("refresh") or {"block32_linears": 1, "block128_linears": 0, "wo_projections": 0, "mhc_broadcasts": 1, "expert_scale_proofs": 0})):
             recovery._install_worker_wake_hook()
             self.assertEqual(Worker().load_model(), 42)
             self.assertEqual(events, [("load", True), "hydrate", "refresh"])

@@ -2013,6 +2013,9 @@ func (adapter Adapter) rankWorkloadSpec(
 			"--nvml-dlopen-shim", "/opt/coldsnap/native/libcoldsnap_nvml_dlopen_shim.so",
 		)
 	}
+	if request.Workload.ServedModelName != "" {
+		command = append(command, "--served-model-name", request.Workload.ServedModelName)
+	}
 	command = append(command, operation, "--")
 	if operation == "restore" {
 		insert := len(command) - 2

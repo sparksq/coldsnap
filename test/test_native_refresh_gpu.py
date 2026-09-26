@@ -65,7 +65,7 @@ class NativeRefreshGpuTests(unittest.TestCase):
                 torch.cuda.synchronize()
                 self.assertFalse(torch.equal(stale, correct))
                 counts = _refresh_initial_native_model(model)
-                self.assertEqual(counts, {"block32_linears": 1, "block128_linears": 0, "wo_projections": 0, "mhc_broadcasts": 1})
+                self.assertEqual(counts, {"block32_linears": 1, "block128_linears": 0, "wo_projections": 0, "mhc_broadcasts": 1, "expert_scale_proofs": 0})
                 self.assertIs(layer.b12x_weight, prepared)
                 self.assertIs(layer.b12x_plans, plans)
                 for field, pointer in pointers.items():
@@ -395,7 +395,7 @@ class Dsv4NativeRefreshGpuTests(unittest.TestCase):
             self.assertFalse(torch.equal(stale_wo, expected_wo))
             counts = _refresh_initial_native_model(model)
             self.assertEqual(counts, {"block32_linears": 0, "block128_linears": int(packed is not None),
-                                      "wo_projections": 1, "mhc_broadcasts": 1})
+                                      "wo_projections": 1, "mhc_broadcasts": 1, "expert_scale_proofs": 0})
             self.assertIs(getattr(layer, "b12x_packed_weight", None), packed)
             self.assertEqual(linear_pointers, (layer.weight.data_ptr(), layer.weight_scale_inv.data_ptr()))
             self.assertIs(attention._b12x_wo_projection_weights, wo)

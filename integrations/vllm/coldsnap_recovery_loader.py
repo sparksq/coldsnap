@@ -24,6 +24,7 @@ import os
 import struct
 import threading
 import time
+from bisect import bisect_right
 from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
@@ -33,7 +34,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from coldsnap_core.hydration import HydrationExtent, NativeHydrator
-from coldsnap_vllm import prepare_synthetic_weight_source, register_model_loader
+from coldsnap_vllm import (
+    get_worker_sleep_backend,
+    prepare_synthetic_weight_source,
+    register_model_loader,
+)
 
 
 LOAD_FORMAT = "coldsnap"
@@ -119,6 +124,9 @@ _INITIAL_NATIVE_BOOTSTRAP: ContextVar[bool] = ContextVar(
 _ACTIVE_RECOVERY_SOURCE: ContextVar[Any | None] = ContextVar(
     "coldsnap_active_recovery_source",
     default=None,
+)
+_CAPTURE_PARAMETER_LOADER: ContextVar[bool] = ContextVar(
+    "coldsnap_capture_parameter_loader", default=False,
 )
 _RECOVERY_SKIP_SOURCE_NAMES: ContextVar[frozenset[str]] = ContextVar(
     "coldsnap_recovery_skip_source_names",
@@ -715,6 +723,25 @@ def _b12x_prepared_experts(owner: Any) -> Any | None:
     return None
 
 
+def _b12x_weight_storage(prepared: Any) -> Any:
+    """Resolve the known B12x weight wrapper without replacing its live owner.
+
+    Recent B12x separates the public PreparedExperts/WeightPlan from their
+    implementation. The tensor fields and source-transfer policy still live
+    together in the implementation; older images expose them directly.
+    """
+    if any(
+        cls.__module__ == "b12x.moe.fused_moe.weights"
+        and cls.__name__ == "PreparedExperts"
+        for cls in type(prepared).__mro__
+    ):
+        storage = getattr(prepared, "_impl", None)
+        if storage is None:
+            raise RuntimeError("B12x prepared expert wrapper lacks its weight storage")
+        return storage
+    return prepared
+
+
 def _b12x_prepared_owners(
     model: Any,
 ) -> list[tuple[str, Any, Any, Any]]:
@@ -778,7 +805,7 @@ def _model_weight_tensors(model: Any) -> list[tuple[str, Any]]:
         # deliberately left in the small residual blob so recovery does not
         # zero a cache that its normal preparation path expects to reuse.
         for field_name in B12X_RELOAD_WEIGHT_FIELDS:
-            tensor = getattr(prepared, field_name, None)
+            tensor = getattr(_b12x_weight_storage(prepared), field_name, None)
             if tensor is None:
                 raise RuntimeError(
                     "B12x prepared expert owner is missing canonical weight "
@@ -800,7 +827,7 @@ def _model_semantic_tensors(model: Any) -> list[tuple[str, Any]]:
     for module_name, _module, _owner, prepared in _b12x_prepared_owners(model):
         prefix = module_name or "<root>"
         for field_name in B12X_PREPARED_WEIGHT_FIELDS:
-            tensor = getattr(prepared, field_name, None)
+            tensor = getattr(_b12x_weight_storage(prepared), field_name, None)
             if tensor is None:
                 raise RuntimeError(
                     "B12x prepared expert owner is missing runtime "
@@ -963,7 +990,7 @@ class _B12xRecoveryStorageAdapter:
         restore_parameters = restore_metadata[0]
         for source_name, prepared_name in B12X_SOURCE_STORAGE_FIELDS:
             meta_tensor = restore_parameters.get(source_name)
-            stable_tensor = getattr(self.prepared, prepared_name, None)
+            stable_tensor = getattr(_b12x_weight_storage(self.prepared), prepared_name, None)
             if meta_tensor is None or stable_tensor is None:
                 raise RuntimeError(f"{self.name} cannot bind {source_name!r} to {prepared_name!r}")
             alias = _alias_meta_tensor_from_storage(
@@ -1010,8 +1037,8 @@ class _B12xRecoveryStorageAdapter:
 
     def _validate_stable_prepared(self, prepared: Any) -> None:
         for field_name in B12X_RELOAD_WEIGHT_FIELDS:
-            before = getattr(self.prepared, field_name, None)
-            after = getattr(prepared, field_name, None)
+            before = getattr(_b12x_weight_storage(self.prepared), field_name, None)
+            after = getattr(_b12x_weight_storage(prepared), field_name, None)
             if before is None or after is None:
                 raise RuntimeError(f"{self.name} prepared owner is missing {field_name!r}")
             before_bytes = int(before.numel() * before.element_size())
@@ -1208,7 +1235,7 @@ def _discover_b12x_recovery_storage(model: Any) -> list[Any]:
     """Return B12x adapters only for its transferred-storage lifecycle."""
     adapters: list[Any] = []
     for module_name, module, owner, prepared in _b12x_prepared_owners(model):
-        plan = getattr(prepared, "plan", None)
+        plan = getattr(_b12x_weight_storage(prepared), "plan", None)
         if not bool(getattr(plan, "discards_source_parameters", False)):
             continue
         adapter_class = (
@@ -2095,7 +2122,7 @@ def _native_model_payload_layout(model: Any, backend: Any) -> list[tuple[int, in
     for module_name, _module, _owner, prepared in _b12x_prepared_owners(model):
         prefix = module_name or "<root>"
         for field_name in B12X_PREPARED_WEIGHT_FIELDS:
-            tensor = getattr(prepared, field_name, None)
+            tensor = getattr(_b12x_weight_storage(prepared), field_name, None)
             if tensor is None:
                 raise RuntimeError(
                     "B12x prepared expert owner is missing native payload "
@@ -2136,6 +2163,14 @@ def _bind_native_model_payload_layout(model: Any, backend: Any) -> list[tuple[in
     if not callable(setter):
         raise RuntimeError("recovery backend cannot bind native model payload semantics")
     setter(layout)
+    from coldsnap_b12x_native_state import capture_native_state
+
+    state = capture_native_state(model)
+    set_state = getattr(backend, "set_native_model_execution_state", None)
+    if callable(set_state):
+        set_state(state)
+    elif state["owners"]:
+        raise RuntimeError("native backend cannot preserve B12x execution state")
     return [(pointer, size) for pointer, size, _semantic_id in layout]
 
 
@@ -5434,6 +5469,31 @@ def _refresh_native_fp8_rows(current: Any, rebuilt: Any, *, name: str) -> None:
             target.copy_(source)
 
 
+def _refresh_native_expert_scale_proofs(model: Any) -> int:
+    """Revalidate B12x's value-dependent input-sharing proof after raw I/O.
+
+    Native hydration writes CUDA storage without advancing Torch's mutation
+    counter. A uniform-scale proof made from bootstrap placeholders can thus
+    appear valid after unequal checkpoint scales arrive. Re-run the known
+    prepared owner's validator before any execution bindings/graphs exist;
+    this preserves all tensors and packed representations without repacking.
+    """
+    count = 0
+    for _name, _module, _owner, prepared in _b12x_prepared_owners(model):
+        storage = _b12x_weight_storage(prepared)
+        if not hasattr(storage, "_uniform_a1_scale"):
+            continue
+        if not any(
+            cls.__module__ in {"b12x.moe.fused_moe", "b12x.moe.fused_moe._impl"}
+            and cls.__name__ == "B12XFP4ExpertWeights"
+            for cls in type(storage).__mro__
+        ) or not callable(getattr(storage, "__post_init__", None)):
+            raise RuntimeError("native B12x expert scale-proof contract changed")
+        storage.__post_init__()
+        count += 1
+    return count
+
+
 def _refresh_initial_native_model(model: Any) -> dict[str, int]:
     """Rebuild known load-time derivatives after fresh-process native hydration.
 
@@ -5447,7 +5507,7 @@ def _refresh_initial_native_model(model: Any) -> dict[str, int]:
     import torch
 
     counts = {"block32_linears": 0, "block128_linears": 0,
-              "wo_projections": 0, "mhc_broadcasts": 0}
+              "wo_projections": 0, "mhc_broadcasts": 0, "expert_scale_proofs": 0}
     modules = tuple(_named_module_items(model))
     wo_owners = {
         id(module): module for _, module in modules
@@ -5552,6 +5612,7 @@ def _refresh_initial_native_model(model: Any) -> dict[str, int]:
                         raise RuntimeError(f"native mHC broadcast contract changed at {name!r}")
                     target.copy_(broadcast)
                     counts["mhc_broadcasts"] += 1
+        counts["expert_scale_proofs"] = _refresh_native_expert_scale_proofs(model)
     return counts
 
 
@@ -5587,21 +5648,28 @@ def _install_worker_wake_hook() -> None:
                     model = self.model_runner.get_model()
                     if getattr(model, "_coldsnap_native_bootstrap_loaded", False) is not True:
                         raise RuntimeError("native startup did not use the native bootstrap loader")
-                    backend = self._get_sleep_mode_backend()
+                    backend = get_worker_sleep_backend(self)
                     hydrate = getattr(backend, "hydrate_initial_native_weights", None)
                     if not callable(hydrate):
                         raise RuntimeError("native startup requires the ColdSnap initial hydration backend")
                     _bind_native_model_payload_layout(model, backend)
                     metrics = hydrate()
+                    from coldsnap_b12x_native_state import restore_native_state
+
+                    normalized_owners = restore_native_state(
+                        model, metrics.get("model_execution_state"),
+                    )
                     refreshed = _refresh_initial_native_model(model)
                     from vllm.logger import init_logger
 
                     init_logger("vllm.model_executor.model_loader.default_loader").info(
                         "ColdSnap native startup hydrated %.2f GiB from the model pack in %.3f s (%s); "
-                        "refreshed %d block32/%d block128 linears, %d WO projections and %d mHC broadcasts",
+                        "refreshed %d block32/%d block128 linears, %d WO projections, %d mHC broadcasts "
+                        "and %d expert scale proofs; restored %d gate/up order registrations",
                         metrics["bytes"] / 1024**3, metrics["seconds"], metrics["backend"],
                         refreshed["block32_linears"], refreshed["block128_linears"],
                         refreshed["wo_projections"], refreshed["mhc_broadcasts"],
+                        refreshed["expert_scale_proofs"], normalized_owners,
                     )
                 return result
             finally:
@@ -5633,7 +5701,7 @@ def _install_worker_wake_hook() -> None:
             result = original_compile(self, *args, **kwargs)
             if not initial_materialization_requested():
                 return result
-            backend = self._get_sleep_mode_backend()
+            backend = get_worker_sleep_backend(self)
             materialize = getattr(backend, "materialize_initial_recovery_payload", None)
             if not callable(materialize):
                 raise RuntimeError(
@@ -5801,7 +5869,7 @@ def _install_worker_wake_hook() -> None:
             if not callable(get_model):
                 raise RuntimeError("recovery capture cannot access the live vLLM model")
             model = get_model()
-            backend = self._get_sleep_mode_backend()
+            backend = get_worker_sleep_backend(self)
             bind_reload_layout, bind_native_layout = _sleep_layout_binding_policy(backend)
             if bind_reload_layout:
                 model_weight_ranges = _bind_model_weight_layout(model, backend)
@@ -5981,7 +6049,7 @@ def _install_worker_wake_hook() -> None:
 
     @functools.wraps(original)
     def wake_up_with_recovery(self: Any, tags: list[str] | None = None) -> Any:
-        backend = self._get_sleep_mode_backend()
+        backend = get_worker_sleep_backend(self)
         uses_recovery = bool(getattr(backend, "uses_model_weight_recovery", False))
         wake_weights = tags is None or "weights" in tags
         if not uses_recovery or not wake_weights:
@@ -6036,7 +6104,7 @@ def install_model_payload_capture_hook() -> None:
         get_model = getattr(self.model_runner, "get_model", None)
         if not callable(get_model):
             raise RuntimeError("model payload capture cannot access the live vLLM model")
-        backend = self._get_sleep_mode_backend()
+        backend = get_worker_sleep_backend(self)
         if bool(getattr(backend, "exports_model_payload", False)):
             model = get_model()
             ranges = _bind_model_weight_layout(model, backend)
@@ -6223,6 +6291,9 @@ def _observed_capture_iterator(
                 active = RecoverySourceTensor(
                     name=name, path=path, descriptor=descriptor, pointer=int(tensor.data_ptr()),
                 )
+            from coldsnap_synthetic_loader import native_bootstrap_tensor_metadata
+
+            entry = native_bootstrap_tensor_metadata(name, descriptor, tensor)
             token = _ACTIVE_RECOVERY_SOURCE.set(active)
             try:
                 yield name, tensor
@@ -6230,12 +6301,6 @@ def _observed_capture_iterator(
                 _ACTIVE_RECOVERY_SOURCE.reset(token)
             logical_bytes += descriptor.length
             tensors += 1
-            entry = {
-                "name": name,
-                "dtype": descriptor.dtype_name,
-                "shape": list(descriptor.shape),
-                "length": descriptor.length,
-            }
             if file_backed:
                 file_backed_bytes += descriptor.length
                 entry["file_source"] = {"path": path, "offset": descriptor.file_offset}
@@ -6301,6 +6366,122 @@ def _combine_capture_metrics(metrics: Sequence[RecoveryLoadMetrics]) -> Recovery
     )
 
 
+@contextmanager
+def _observe_direct_weight_transfers(
+    destinations: Sequence[tuple[str, Any]],
+    record: Callable[[str, Any, Any, Any], None],
+    reject: Callable[[str, str], None],
+) -> Iterator[None]:
+    """Observe vLLM copies that bypass per-parameter weight_loader callbacks.
+
+    Use the scoped transport so modules which imported copy_weight earlier
+    participate too. Preserve any installed writer and its flush/finish/value
+    materialization hooks. Older images without this API retain the ordinary
+    parameter-loader observer.
+    """
+    try:
+        transfer = importlib.import_module("vllm.model_executor.weight_transfer")
+    except ImportError:
+        yield
+        return
+    writer_slot = getattr(transfer, "_writer", None)
+    scoped_transfer = getattr(transfer, "weight_transfer", None)
+    if not isinstance(writer_slot, ContextVar) or not callable(scoped_transfer):
+        yield
+        return
+
+    intervals = []
+    for name, tensor in destinations:
+        if (
+            not bool(getattr(tensor, "is_cuda", False))
+            or bool(getattr(tensor, "is_meta", False))
+            or not tensor.is_contiguous()
+            or int(tensor.numel()) == 0
+        ):
+            continue
+        start = int(tensor.data_ptr())
+        end = start + int(tensor.numel()) * int(tensor.element_size())
+        intervals.append((start, end, name, tensor))
+    intervals.sort(key=lambda item: (item[0], item[1], item[2]))
+    starts = [item[0] for item in intervals]
+    max_ends: list[int] = []
+    for _start, end, _name, _tensor in intervals:
+        max_ends.append(max(end, max_ends[-1] if max_ends else end))
+    delegate = writer_slot.get()
+
+    def matching_destinations(target: Any) -> list[tuple[str, Any]]:
+        if target.is_meta or not int(target.numel()):
+            return []
+        start = int(target.data_ptr())
+        end = start + _view_span_bytes(target)
+        index = bisect_right(starts, start) - 1
+        matches = []
+        while index >= 0 and max_ends[index] > start:
+            left, right, name, tensor = intervals[index]
+            if (
+                left <= start < end <= right
+                and tensor.device == target.device
+                and int(tensor.data_ptr()) == left
+                and int(tensor.numel()) * int(tensor.element_size()) == right - left
+            ):
+                matches.append((name, tensor))
+            index -= 1
+        return matches
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class ScalarCopyObserver(TorchDispatchMode):
+        def __torch_dispatch__(
+            self,
+            func: Any,
+            types: Any,
+            args: tuple[Any, ...] = (),
+            kwargs: dict[str, Any] | None = None,
+        ) -> Any:
+            result = func(*args, **(kwargs or {}))
+            if _CAPTURE_PARAMETER_LOADER.get() or not args:
+                return result
+            schema = getattr(func, "_schema", None)
+            if not bool(getattr(schema, "is_mutable", False)):
+                return result
+            target = args[0]
+            if not hasattr(target, "numel") or int(target.numel()) != 1:
+                return result
+            matches = matching_destinations(target)
+            if len(matches) != 1 or int(matches[0][1].numel()) != 1:
+                return result
+            name, tensor = matches[0]
+            operation = str(getattr(schema, "name", ""))
+            if operation == "aten::copy_" and len(args) >= 2:
+                record(name, tensor, target, args[1])
+            else:
+                reject(name, f"direct-scalar-mutation:{operation or '<unknown>'}")
+            return result
+
+    class ObservedWriter:
+        def __call__(self, target: Any, source: Any) -> bool:
+            if not _CAPTURE_PARAMETER_LOADER.get():
+                matches = matching_destinations(target)
+                # Ambiguous aliases stay residual. Do not guess which owner
+                # the framework's reload lifecycle must reconstruct.
+                if len(matches) == 1:
+                    name, tensor = matches[0]
+                    # Scalar scales can bypass copy_weight with a raw copy_.
+                    # Observe their actual Torch mutation instead, including
+                    # writers that perform it synchronously, without counting
+                    # the same copy twice. Deferred writers without an observed
+                    # mutation conservatively retain those scalars as residual.
+                    if int(tensor.numel()) != 1:
+                        record(name, tensor, target, source)
+            return bool(delegate(target, source)) if delegate is not None else False
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(delegate, name)
+
+    with ScalarCopyObserver(), scoped_transfer(ObservedWriter()):
+        yield
+
+
 def _load_weights_with_recovery_observer(
     loader: Any,
     model: Any,
@@ -6310,6 +6491,7 @@ def _load_weights_with_recovery_observer(
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
     destination_names: set[str] = set()
+    direct_destination_names: set[str] = set()
     replay_copies: list[RecoveryCopy] = []
     unsupported_destinations: set[str] = set()
     rejection_reasons: Counter[str] = Counter()
@@ -6330,14 +6512,18 @@ def _load_weights_with_recovery_observer(
             source = _ACTIVE_RECOVERY_SOURCE.get()
             if source is None:
                 return _loader(*args, **kwargs)
-            result, copies, unsupported, reasons = _observe_weight_loader_copy(
-                source,
-                _name,
-                _destination,
-                _loader,
-                args,
-                kwargs,
-            )
+            token = _CAPTURE_PARAMETER_LOADER.set(True)
+            try:
+                result, copies, unsupported, reasons = _observe_weight_loader_copy(
+                    source,
+                    _name,
+                    _destination,
+                    _loader,
+                    args,
+                    kwargs,
+                )
+            finally:
+                _CAPTURE_PARAMETER_LOADER.reset(token)
             replay_copies.extend(copies)
             rejection_reasons.update(reasons)
             if unsupported:
@@ -6350,9 +6536,31 @@ def _load_weights_with_recovery_observer(
         recording_loader.__wrapped__ = destination_loader
         destination.weight_loader = recording_loader
         wrapped.append((destination, had_loader, destination_loader))
+
+    def reject_direct_copy(name: str, reason: str) -> None:
+        unsupported_destinations.add(name)
+        rejection_reasons[reason] += 1
+
+    def record_direct_copy(name: str, destination: Any, target: Any, copied_from: Any) -> None:
+        source = _ACTIVE_RECOVERY_SOURCE.get()
+        if source is None:
+            copy, reason = None, "direct-source-unavailable"
+        else:
+            copy, reason = _observed_recovery_copy(
+                source, name, destination, target, copied_from,
+            )
+        if copy is None:
+            reject_direct_copy(name, reason or "direct-copy-rejected")
+        else:
+            direct_destination_names.add(name)
+            replay_copies.append(copy)
+
     try:
         loader._coldsnap_capture_source_metrics = []
-        result = load_weights()
+        with _observe_direct_weight_transfers(
+            destinations, record_direct_copy, reject_direct_copy,
+        ):
+            result = load_weights()
         metrics = _combine_capture_metrics(loader._coldsnap_capture_source_metrics)
         if metrics is None and _last_metrics is not None:
             metrics = _last_metrics
@@ -6361,19 +6569,23 @@ def _load_weights_with_recovery_observer(
             _publish_process_template_load_metrics(metrics)
         return result
     finally:
+        plan = RecoveryCopyPlan(
+            copies=tuple(replay_copies),
+            unsupported_destinations=frozenset(unsupported_destinations),
+        )
+        # A direct writer does not provide the parameter loader's ordinary
+        # reload contract. Remove only completely reconstructed destinations
+        # from the residual, never a whole tensor based on a partial write.
+        if direct_destination_names:
+            destination_names.update(
+                direct_destination_names & _fully_covered_replay_destinations(model, plan)
+            )
         setattr(
             model,
             CHECKPOINT_DESTINATION_TENSOR_NAMES_ATTR,
             frozenset(destination_names),
         )
-        setattr(
-            model,
-            CHECKPOINT_COPY_PLAN_ATTR,
-            RecoveryCopyPlan(
-                copies=tuple(replay_copies),
-                unsupported_destinations=frozenset(unsupported_destinations),
-            ),
-        )
+        setattr(model, CHECKPOINT_COPY_PLAN_ATTR, plan)
         from vllm.logger import init_logger
 
         init_logger("vllm.model_executor.model_loader.default_loader").info(
@@ -6436,6 +6648,34 @@ def install_recovery_aware_loader() -> None:
 
     class ColdSnapRecoveryModelLoader(DefaultModelLoader):
         """Default vLLM loader with a recovery-aware safetensors source."""
+
+        def load_model(
+            self: Any, vllm_config: Any, model_config: Any = None, prefix: str = "",
+        ) -> Any:
+            resolved = model_config if model_config is not None else vllm_config.model_config
+            speculative = getattr(vllm_config, "speculative_config", None)
+            draft = getattr(speculative, "draft_model_config", None)
+            if draft is not None and resolved is draft:
+                # Some runners import get_model before plugin registration,
+                # bypassing the helper bridge. Enforce target-only hydration
+                # at the registered loader boundary as well. A draft has no
+                # native payload binding and must never receive placeholders.
+                from vllm.config import replace
+
+                config = replace(
+                    self.load_config, load_format="safetensors",
+                    safetensors_load_strategy="lazy",
+                )
+                token = _INITIAL_NATIVE_BOOTSTRAP.set(False)
+                try:
+                    return DefaultModelLoader(config).load_model(
+                        vllm_config=vllm_config, model_config=resolved, prefix=prefix,
+                    )
+                finally:
+                    _INITIAL_NATIVE_BOOTSTRAP.reset(token)
+            return super().load_model(
+                vllm_config=vllm_config, model_config=resolved, prefix=prefix,
+            )
 
         def load_weights(self: Any, model: Any, model_config: Any) -> Any:
             if _INITIAL_NATIVE_BOOTSTRAP.get():

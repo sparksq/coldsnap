@@ -1123,6 +1123,7 @@ class DiskCuMemBackend:
         self._model_weight_ranges = ()
         self._model_weight_semantics = ()
         self._native_model_payload_semantics = ()
+        self._native_model_execution_state = None
         self._model_payload_exported = False
         self._materialization_thread: threading.Thread | None = None
         self._initial_model_payload_materialization_result: dict[str, Any] | None = None
@@ -1219,6 +1220,12 @@ class DiskCuMemBackend:
         ):
             raise ValueError("model weight semantic layout is invalid")
         self._model_weight_semantics = tuple(normalized)
+
+    def set_native_model_execution_state(self, state: dict[str, Any]) -> None:
+        """Bind portable execution metadata to the next exported native pack."""
+        if not isinstance(state, dict):
+            raise TypeError("native model execution state must be a JSON object")
+        self._native_model_execution_state = json.loads(json.dumps(state, allow_nan=False))
 
     def set_native_model_payload_semantics(
         self,
@@ -2204,6 +2211,7 @@ class DiskCuMemBackend:
             "model_weight_bytes": model_bytes,
             "residual_bytes": residual_bytes,
             "model_weight_extents": entries,
+            "model_execution_state": getattr(self, "_native_model_execution_state", None),
             "residual_extents": residual_extents,
             "direct_io": direct,
             "write_io_mode": "padded-direct" if direct else "padded-buffered",
@@ -3780,7 +3788,7 @@ class DiskCuMemBackend:
             "seconds": time.perf_counter() - started,
         }
         self._write_state("running", operation="initial-native-hydration", metrics=result)
-        return result
+        return {**result, "model_execution_state": manifest.get("model_execution_state")}
 
     def _restore_split_native(
         self, provider: Any, manifest: dict[str, Any]

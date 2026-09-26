@@ -44,6 +44,18 @@ class StreamingAcceptanceTest(unittest.TestCase):
         self.assertLessEqual(timing["request_started_unix_ns"], timing["first_token_unix_ns"])
         self.assertLessEqual(timing["request_ttft_seconds"], timing["response_seconds"])
 
+    def test_acceptance_uses_served_alias_without_changing_model_identity(self):
+        for alias in ("Qwen3.8-Flash-Next", "", None):
+            with self.subTest(alias=alias):
+                args = self.args()
+                args.served_model_name = alias
+                payload = event({"content": "OK"}, finish="stop") + b"data: [DONE]\n\n"
+                with patch.object(runtime, "_local_http_open", return_value=io.BytesIO(payload)) as send:
+                    runtime._infer(args)
+                request = json.loads(send.call_args.args[0].data)
+                self.assertEqual(request["model"], alias or "test")
+                self.assertEqual(args.model, "test")
+
     def test_empty_wrong_truncated_error_and_oversize_streams_fail(self):
         for payload in (
             event(finish="stop") + b"data: [DONE]\n\n",
@@ -57,6 +69,20 @@ class StreamingAcceptanceTest(unittest.TestCase):
                 with patch.object(runtime, "_local_http_open", return_value=io.BytesIO(payload)):
                     with self.assertRaises(RuntimeError):
                         runtime._infer(self.args())
+
+    def test_reasoning_only_mismatch_reports_bounded_evidence(self):
+        payload = event({"reasoning": "Thinking " * 100}, finish="length")
+        payload += b'data: {"choices": [], "usage": {"completion_tokens": 64}}\n\ndata: [DONE]\n\n'
+        with patch.object(runtime, "_local_http_open", return_value=io.BytesIO(payload)):
+            with self.assertRaises(RuntimeError) as caught:
+                runtime._infer(self.args())
+        message = str(caught.exception)
+        self.assertIn("actual=''", message)
+        self.assertIn("finish_reason='length'", message)
+        self.assertIn("completion_tokens=64", message)
+        self.assertIn("first_token_field='reasoning'", message)
+        self.assertIn("Thinking ", message)
+        self.assertLess(len(message), 750)
 
     def test_failed_attempt_cannot_leak_timing_into_successful_retry(self):
         streams = [io.BytesIO(event({"content": "wrong"}, finish="stop") + b"data: [DONE]\n\n"),

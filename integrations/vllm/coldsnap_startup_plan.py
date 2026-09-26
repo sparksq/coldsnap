@@ -38,6 +38,46 @@ _COMPILE_CACHE_MARKER = "coldsnap-compile-cache.json"
 _COMPILE_CACHE_NAMESPACE = re.compile(r"^[0-9a-f]{10}$")
 
 
+def install_aot_compilation_defaults() -> None:
+    """Enable supported persistent compiler paths before vLLM builds its config.
+
+    Keep explicit recipe choices and disabled compile caches intact. Feature
+    registration and PyTorch floors protect older images; CUDA graph shape
+    coverage remains the separate calibration policy.
+    """
+    try:
+        from vllm import envs
+        from vllm.utils.torch_utils import is_torch_equal_or_newer
+    except ImportError:
+        return
+    registered = getattr(envs, "environment_variables", {})
+    disabled = registered.get("VLLM_DISABLE_COMPILE_CACHE")
+    if callable(disabled) and disabled():
+        return
+    defaults = (
+        ("VLLM_USE_STANDALONE_COMPILE", "2.9.0"),
+        ("VLLM_USE_AOT_COMPILE", "2.10.0"),
+        ("VLLM_USE_MEGA_AOT_ARTIFACT", "2.12.0.dev"),
+    )
+    enabled = []
+    for name, minimum_torch in defaults:
+        if name not in registered or name in os.environ:
+            continue
+        if not is_torch_equal_or_newer(minimum_torch):
+            continue
+        if name == "VLLM_USE_MEGA_AOT_ARTIFACT" and not all(
+            registered.get(dependency, lambda: False)()
+            for dependency in ("VLLM_USE_AOT_COMPILE", "VLLM_USE_STANDALONE_COMPILE")
+        ):
+            continue
+        os.environ[name] = "1"
+        enabled.append(name)
+    if enabled:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info("ColdSnap enabled compiler defaults: %s", ", ".join(enabled))
+
+
 def _all_workers_admit_startup_plan(worker: Any, locally_admitted: bool) -> bool:
     """Require every distributed worker to make the same profiling decision.
 
@@ -318,6 +358,8 @@ def _install_compile_cache_identity_hook(module: Any) -> None:
         # KV fitting but leave ModelState's cached limit at the original value.
         # Graph metadata reads that cache, while attention buffers use the
         # fitted config. Keep these views consistent before any warmup.
+        # Newer runners derive the limit from model_config through a
+        # read-only property; avoid assigning an already-correct value.
         runner = getattr(worker, "model_runner", None)
         model_state = getattr(runner, "model_state", None)
         if (
@@ -326,6 +368,7 @@ def _install_compile_cache_identity_hook(module: Any) -> None:
             and getattr(model_state, "model_config", None) is model_config
             and isinstance(getattr(model_state, "max_model_len", None), int)
             and getattr(runner, "max_model_len", None) == current
+            and model_state.max_model_len != current
         ):
             model_state.max_model_len = current
         use_configured_model_len = (

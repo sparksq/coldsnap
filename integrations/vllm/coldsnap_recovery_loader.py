@@ -6621,18 +6621,85 @@ def _load_weights_with_recovery_observer(
             del loader._coldsnap_capture_source_metrics
 
 
+def _capture_staging_iterator(iterator: Any) -> Iterator[Any]:
+    """Keep disposable InstantTensor buffers out of the model's CuMem pool.
+
+    Only advancing the source iterator uses this pool. Model weight callbacks
+    run after the context exits, under their original checkpointable allocator.
+    A private ordinary CUDA pool can release its staging cache as soon as the
+    iterator closes, including when model loading raises or stops early.
+    """
+    import torch
+
+    pool = torch.cuda.MemPool()
+    source = iter(iterator)
+    try:
+        while True:
+            with torch.cuda.use_mem_pool(pool):
+                try:
+                    item = next(source)
+                except StopIteration:
+                    return
+            yield item
+            del item
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            with torch.cuda.use_mem_pool(pool):
+                close()
+        # Fast loader objects can form cycles around their reusable buffers.
+        # Collect them while the pool still has a live owning reference.
+        import gc
+
+        gc.collect()
+
+
 def _install_capture_loader_observer(default_loader: type[Any]) -> None:
     """Observe fast capture loaders without changing their I/O implementation."""
     if getattr(default_loader, "_coldsnap_capture_observer_installed", False):
         return
     original_iterator = default_loader._get_weights_iterator
     original_load_weights = default_loader.load_weights
+    original_load_model = default_loader.load_model
+
+    @functools.wraps(original_load_model)
+    def load_model_with_capture_draft_split(
+        self: Any, vllm_config: Any, model_config: Any = None, prefix: str = "",
+    ) -> Any:
+        resolved = model_config if model_config is not None else vllm_config.model_config
+        speculative = getattr(vllm_config, "speculative_config", None)
+        draft = getattr(speculative, "draft_model_config", None)
+        if (
+            _capture_observer_enabled(self)
+            and _loader_format(self) in {"instanttensor", "fastsafetensors"}
+            and draft is not None
+            and resolved is draft
+        ):
+            # Draft construction follows the much larger target model. A fast
+            # loader's staging buffer can exceed the remaining device budget.
+            # Apply this at the loader boundary: runners may have imported
+            # get_model before ColdSnap installs its helper bridge.
+            from vllm.config import replace
+
+            config = replace(
+                self.load_config, load_format="safetensors",
+                safetensors_load_strategy="lazy",
+            )
+            return original_load_model(
+                default_loader(config), vllm_config=vllm_config,
+                model_config=resolved, prefix=prefix,
+            )
+        return original_load_model(
+            self, vllm_config=vllm_config, model_config=model_config, prefix=prefix,
+        )
 
     @functools.wraps(original_iterator)
     def observed_iterator(self: Any, source: Any) -> Any:
         iterator = original_iterator(self, source)
         if not _capture_observer_enabled(self):
             return iterator
+        if _loader_format(self) == "instanttensor":
+            iterator = _capture_staging_iterator(iterator)
         return _observed_capture_iterator(self, source, iterator)
 
     @functools.wraps(original_load_weights)
@@ -6645,6 +6712,7 @@ def _install_capture_loader_observer(default_loader: type[Any]) -> None:
             lambda: original_load_weights(self, model, model_config),
         )
 
+    default_loader.load_model = load_model_with_capture_draft_split
     default_loader._get_weights_iterator = observed_iterator
     default_loader.load_weights = observed_load_weights
     default_loader._coldsnap_capture_observer_installed = True

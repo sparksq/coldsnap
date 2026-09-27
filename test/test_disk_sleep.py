@@ -5219,6 +5219,9 @@ class DiskSleepIoTest(unittest.TestCase):
                 self.load_config = SimpleNamespace(load_format=RECOVERY_LOAD_FORMAT)
                 self.counter_before_loading_weights = 0.0
 
+            def load_model(self, vllm_config, model_config=None, prefix=""):
+                raise AssertionError("model construction is not used by this test")
+
             def load_weights(self, model, _model_config):
                 events.append("default-load")
                 return model.load_weights(self.get_all_weights(_model_config, model))
@@ -5415,6 +5418,102 @@ class DiskSleepIoTest(unittest.TestCase):
 
         observer.assert_called_once_with(DefaultModelLoader)
         self.assertTrue(Worker._coldsnap_model_payload_capture_installed)
+
+    def test_capture_staging_pool_excludes_consumers_and_closes_on_failure(self) -> None:
+        from contextlib import contextmanager
+
+        events = []
+        active = False
+
+        @contextmanager
+        def use_pool(pool):
+            nonlocal active
+            self.assertFalse(active)
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+        def source():
+            try:
+                self.assertTrue(active)
+                events.append("allocate-source")
+                yield object()
+                self.assertTrue(active)
+                events.append("advance-source")
+                yield object()
+            finally:
+                self.assertTrue(active)
+                events.append("close-source")
+
+        torch = ModuleType("torch")
+        torch.cuda = SimpleNamespace(MemPool=object, use_mem_pool=use_pool)
+        with patch.dict(sys.modules, {"torch": torch}):
+            iterator = recovery_loader._capture_staging_iterator(source())
+            next(iterator)
+            self.assertFalse(active)
+            events.append("model-copy")
+            iterator.close()
+            self.assertFalse(active)
+            self.assertEqual(events, ["allocate-source", "model-copy", "close-source"])
+            events.clear()
+            for _ in recovery_loader._capture_staging_iterator(source()):
+                self.assertFalse(active)
+                events.append("model-copy")
+            self.assertEqual(events, [
+                "allocate-source", "model-copy", "advance-source", "model-copy", "close-source",
+            ])
+            self.assertFalse(active)
+
+    def test_capture_fast_loader_splits_only_the_speculative_draft(self) -> None:
+        target, draft = object(), object()
+        config_module = ModuleType("vllm.config")
+        config_module.replace = lambda value, **changes: SimpleNamespace(**(vars(value) | changes))
+
+        for selected in ("instanttensor", "fastsafetensors"):
+            class DefaultModelLoader:
+                def __init__(self, config):
+                    self.load_config = config
+
+                def load_model(self, vllm_config, model_config=None, prefix=""):
+                    return self.load_config, model_config, prefix
+
+                def load_weights(self, model, model_config):
+                    raise AssertionError("not used")
+
+                def _get_weights_iterator(self, source):
+                    raise AssertionError("not used")
+
+            original_config = SimpleNamespace(load_format=selected, safetensors_load_strategy="eager")
+            vllm_config = SimpleNamespace(
+                model_config=target, load_config=original_config,
+                speculative_config=SimpleNamespace(draft_model_config=draft),
+            )
+            with self.subTest(selected=selected), patch.dict(sys.modules, {"vllm.config": config_module}):
+                # A get_model imported before plugin registration still
+                # resolves the patched class method at model construction time.
+                def get_model(config, model, cls=DefaultModelLoader, vc=vllm_config):
+                    return cls(config).load_model(vc, model, prefix="draft")
+
+                recovery_loader._install_capture_loader_observer(DefaultModelLoader)
+                with patch.dict(os.environ, {"COLDSNAP_CAPTURE_LOAD_FORMAT": selected}, clear=True):
+                    self.assertIs(get_model(original_config, target)[0], original_config)
+                    self.assertIs(get_model(original_config, None)[0], original_config)
+                    config, resolved, prefix = get_model(original_config, draft)
+                    self.assertEqual(config.load_format, "safetensors")
+                    self.assertEqual(config.safetensors_load_strategy, "lazy")
+                    self.assertIs(resolved, draft)
+                    self.assertEqual(prefix, "draft")
+                    self.assertEqual(original_config.load_format, selected)
+                    explicit = SimpleNamespace(load_format="safetensors", safetensors_load_strategy="eager")
+                    self.assertIs(get_model(explicit, draft)[0], explicit)
+                    no_draft = vllm_config.speculative_config
+                    vllm_config.speculative_config = None
+                    self.assertIs(get_model(original_config, draft)[0], original_config)
+                    vllm_config.speculative_config = no_draft
+                with patch.dict(os.environ, {}, clear=True):
+                    self.assertIs(get_model(original_config, draft)[0], original_config)
 
     def test_recovery_loader_preserves_existing_hybrid_draft_selection(self) -> None:
         calls = []

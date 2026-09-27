@@ -2255,6 +2255,71 @@ class DiskSleepIoTest(unittest.TestCase):
         self.assertEqual(meta.SKIP_LOAD_TENSORS, set())
         self.assertEqual(meta.SKIP_TENSORS, {"bias"})
 
+    def test_recovery_copyback_refreshes_new_quant_owner_and_restores_hooks(self) -> None:
+        stable = object()
+        owner_type = type("B12xExperts", (), {
+            "__module__": "vllm.model_executor.layers.fused_moe.b12x",
+        })
+        old_owner = owner_type()
+        old_owner._source_parameters_released = False
+        old_owner._refresh_quant_config = lambda _layer: self.fail("old owner refreshed")
+        layer = SimpleNamespace(quant_method=SimpleNamespace(
+            moe_kernel=SimpleNamespace(fused_experts=old_owner),
+        ))
+        model = SimpleNamespace(named_modules=lambda: iter((("layer", layer),)))
+        layerwise = ModuleType("vllm.model_executor.model_loader.reload.layerwise")
+        for name in ("materialize_layer", "restore_layer_on_meta", "get_layer_size",
+                     "_wrap_parameters_weight_loader"):
+            setattr(layerwise, name, lambda *_args: None)
+        events = []
+
+        def original_copyback(target, _info):
+            events.append("copyback")
+            target.scale = stable
+            return "copied"
+
+        layerwise._copy_and_restore_kernel_tensors = original_copyback
+        modules = {
+            "torch": ModuleType("torch"),
+            "vllm.model_executor.model_loader.reload.layerwise": layerwise,
+            "vllm.model_executor.model_loader.reload.meta": ModuleType("meta"),
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(recovery_loader, "_recovery_storage_adapters", return_value=[]),
+            patch.object(recovery_loader, "_residual_tensor_names_by_layer", return_value={}),
+            patch.object(recovery_loader, "_partially_reloaded_destination_tensors", return_value={}),
+            patch.object(recovery_loader, "_b12x_prepared_owners", return_value=[
+                ("layer", layer, old_owner, object()),
+            ]),
+        ):
+            for fail in (False, True):
+                events.clear()
+                replacement = owner_type()
+
+                def refresh(target, *, fail=fail):
+                    self.assertIs(target.scale, stable)
+                    events.append("refresh")
+                    if fail:
+                        raise ValueError("refresh failed")
+
+                replacement._refresh_quant_config = refresh
+                try:
+                    with recovery_loader._recovery_reload_storage(model):
+                        # The finalizer installs a new expert during reload.
+                        layer.quant_method.moe_kernel.fused_experts = replacement
+                        self.assertEqual(layerwise._copy_and_restore_kernel_tensors(
+                            layer, object()), "copied")
+                except ValueError:
+                    self.assertTrue(fail)
+                else:
+                    self.assertFalse(fail)
+                self.assertEqual(events, ["copyback", "refresh"])
+                self.assertIs(layerwise._copy_and_restore_kernel_tensors, original_copyback)
+            old_owner._source_parameters_released = True
+            with recovery_loader._recovery_reload_storage(model):
+                self.assertIs(layerwise._copy_and_restore_kernel_tensors, original_copyback)
+
     def test_recovery_context_aliases_preloaded_and_partial_weights_to_stable_storage(self) -> None:
         stable = SimpleNamespace(is_meta=False)
         restored_meta = SimpleNamespace(is_meta=True)

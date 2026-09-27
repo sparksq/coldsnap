@@ -570,6 +570,106 @@ class Dsv4NativeRefreshGpuTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("COLDSNAP_TEST_RECOVERY_MEMORY_GPU"), "CUDA vLLM image required")
 class RecoveryMemoryGpuTests(unittest.TestCase):
+    def test_layerwise_copyback_rebinds_live_moe_scale_references(self):
+        import gc
+        from contextlib import nullcontext
+        import torch
+        from torch import nn
+        from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+        from vllm.model_executor.layers.quantization import modelopt
+        from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+        from vllm.model_executor.model_loader.reload import layerwise
+        import coldsnap_recovery_loader as loader
+
+        class ConfigFinalizer(QuantizeMethodBase):
+            def create_weights(self, *args, **kwargs):
+                raise AssertionError("not used")
+
+            def apply(self, *args, **kwargs):
+                raise AssertionError("not used")
+
+            def process_weights_after_loading(self, layer):
+                # Use the image's real config factory and expert refresh. The
+                # packed-weight conversion is orthogonal to this lifetime bug.
+                config = modelopt.make_nvfp4_moe_quant_config(
+                    backend=modelopt.NvFp4MoeBackend.B12X,
+                    w13_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale,
+                    w13_scale_2=layer.w13_weight_scale_2, w2_scale_2=layer.w2_weight_scale_2,
+                    a13_scale=layer.w13_input_scale, a2_scale=layer.w2_input_scale,
+                    layer=layer, use_a16=False,
+                )
+                owner = B12xExperts.__new__(B12xExperts)
+                owner.quant_config = config
+                owner._source_format, owner._quant_mode = "modelopt_nvfp4", "nvfp4"
+                owner._source_parameters_released = False
+                owner._prepared_experts = layer._b12x_prepared_experts
+                owner._refresh_quant_config(layer)
+                self.moe_quant_config = config
+                self.moe_kernel = SimpleNamespace(fused_experts=owner)
+
+        with torch.no_grad(), torch.device("cuda"):
+            model = nn.Module()
+            layer = model.layer = nn.Module()
+            layer.quant_method = ConfigFinalizer()
+            layer._b12x_prepared_experts = SimpleNamespace(
+                plan=SimpleNamespace(discards_source_parameters=False),
+            )
+            names = ("w13_weight_scale", "w2_weight_scale", "w13_weight_scale_2",
+                     "w2_weight_scale_2", "w13_input_scale", "w2_input_scale")
+            for name in names:
+                large = name in names[:2]
+                layer.register_parameter(name, nn.Parameter(torch.ones(
+                    (2, 4096, 4096) if large else (2,),
+                    dtype=torch.float8_e4m3fn if large else torch.float32,
+                ), requires_grad=False))
+            setattr(model, loader.CHECKPOINT_DESTINATION_TENSOR_NAMES_ATTR,
+                    frozenset("layer." + name for name in names))
+            originals = {name: getattr(layer, name) for name in names}
+            pointers = {name: tensor.data_ptr() for name, tensor in originals.items()}
+            layerwise.record_metadata_for_reloading(model)
+            layer.quant_method.process_weights_after_loading(layer)
+            original_copyback = layerwise._copy_and_restore_kernel_tensors
+
+            def allocated():
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                return torch.cuda.memory_allocated()
+
+            baseline = allocated()
+            for preserve in (False, True):
+                with self.subTest(preserve=preserve):
+                    context = loader._recovery_reload_storage(model) if preserve else nullcontext()
+                    with context:
+                        layerwise.initialize_layerwise_reload(model)
+                        for name in names:
+                            param = getattr(layer, name)
+                            source = torch.full(param.shape, 2, device="cpu", dtype=param.dtype)
+                            param.weight_loader(param, source)
+                            del param, source
+                        layerwise.finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.bfloat16))
+                    self.assertIs(layerwise._copy_and_restore_kernel_tensors, original_copyback)
+                    self.assertTrue(all(getattr(layer, name) is tensor for name, tensor in originals.items()))
+                    self.assertEqual(pointers, {name: getattr(layer, name).data_ptr() for name in names})
+                    owner = layer.quant_method.moe_kernel.fused_experts
+                    self.assertIs(owner.quant_config, layer.quant_method.moe_quant_config)
+                    actual = [owner.quant_config._w1.scale.data_ptr(), owner.quant_config._w2.scale.data_ptr()]
+                    expected = [pointers[name] for name in names[:2]]
+                    after = allocated()
+                    if preserve:
+                        self.assertEqual(actual, expected)
+                        self.assertLessEqual(after, baseline + 4096)
+                    else:
+                        self.assertNotEqual(actual, expected)
+                        self.assertGreaterEqual(after - baseline, 64 * 1024**2)
+                        owner._refresh_quant_config(layer)
+                        self.assertLessEqual(allocated(), baseline + 4096)
+                    self.assertTrue(bool(torch.all(layer.w13_weight_scale.float() == 2)))
+                    del owner
+            print({"stale_moe_scale_references_reproduced": True,
+                   "live_scale_storage_rebound_after_copyback": True,
+                   "captured_parameter_addresses_preserved": True}, flush=True)
+
     def test_reclaims_reload_cache_without_replacing_live_or_graph_storage(self):
         import gc
         import torch

@@ -1852,7 +1852,17 @@ def _recovery_reload_storage(
     adapters = _recovery_storage_adapters(model)
     residual_by_layer = _residual_tensor_names_by_layer(model)
     partial_destinations = _partially_reloaded_destination_tensors(model)
-    if not adapters and not residual_by_layer and not partial_destinations and not prepare_preloaded:
+    refresh_quantization_layers = {
+        id(layer)
+        for _name, layer, owner, _prepared in _b12x_prepared_owners(model)
+        if _is_b12x_layer_cached_expert(owner)
+        and callable(getattr(owner, "_refresh_quant_config", None))
+        and not bool(getattr(owner, "_source_parameters_released", False))
+    }
+    if (
+        not adapters and not residual_by_layer and not partial_destinations
+        and not prepare_preloaded and not refresh_quantization_layers
+    ):
         yield ()
         return
 
@@ -1866,7 +1876,7 @@ def _recovery_reload_storage(
     finalize_adapters = [
         adapter for adapter in adapters if callable(getattr(adapter, "finalize_layer_reload", None))
     ]
-    if finalize_adapters and not callable(original_copyback):
+    if (finalize_adapters or refresh_quantization_layers) and not callable(original_copyback):
         raise RuntimeError("recovery storage requires vLLM layerwise copyback hook")
     if not all(
         callable(value)
@@ -1995,9 +2005,24 @@ def _recovery_reload_storage(
             for adapter in finalize_adapters:
                 if adapter.owns_layer(layer):
                     adapter.finalize_layer_reload(torch, info)
-            return original_copyback(layer, info)
+            result = original_copyback(layer, info)
+            if id(layer) in refresh_quantization_layers:
+                # The finalizer built its quantization config while the layer
+                # held newly materialized Parameters. Copyback restores the
+                # captured Parameters, but those config references otherwise
+                # keep a second copy of every block scale alive. Rebind at each
+                # layer boundary to bound the peak and preserve graph storage.
+                owner = getattr(
+                    getattr(getattr(layer, "quant_method", None), "moe_kernel", None),
+                    "fused_experts", None,
+                )
+                refresh = getattr(owner, "_refresh_quant_config", None)
+                if not _is_b12x_layer_cached_expert(owner) or not callable(refresh):
+                    raise RuntimeError("B12x recovery lost its quantization config refresh hook")
+                refresh(layer)
+            return result
 
-        if finalize_adapters:
+        if finalize_adapters or refresh_quantization_layers:
             layerwise._copy_and_restore_kernel_tensors = copyback_recovery_layer
         layerwise.restore_layer_on_meta = restore_recovery_layer
         layerwise.get_layer_size = recovery_layer_size
@@ -2014,7 +2039,7 @@ def _recovery_reload_storage(
         layerwise.restore_layer_on_meta = original_restore
         layerwise.get_layer_size = original_get_size
         layerwise._wrap_parameters_weight_loader = original_wrap
-        if finalize_adapters:
+        if finalize_adapters or refresh_quantization_layers:
             layerwise._copy_and_restore_kernel_tensors = original_copyback
         if not succeeded:
             for adapter in reversed(started):
@@ -6749,9 +6774,10 @@ def _capture_staging_iterator(iterator: Any) -> Iterator[Any]:
 def _reclaim_recovery_temporary_memory() -> int:
     """Release reload scratch before restoring KV cache and accepting requests.
 
-    Initialized recovery skips vLLM's startup cache cleanup. Layerwise reload
-    and quantization can leave several GiB of freed blocks reserved by the
-    ordinary CUDA allocator. Collection and synchronization retire temporary
+    This boundary precedes the second residual hydration and also covers a
+    weights-only wake; the backend's later cleanup runs when waking discard
+    regions. Layerwise reload can leave freed blocks reserved by the ordinary
+    CUDA allocator. Collection and synchronization retire temporary
     owners and queued work; empty_cache releases only unused blocks, preserving
     live model storage and graph-owned allocations at their existing addresses.
     """

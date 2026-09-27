@@ -75,6 +75,45 @@ class DirectWeightTransferTest(unittest.TestCase):
     def plan(self, model):
         return getattr(model, loader.CHECKPOINT_COPY_PLAN_ATTR)
 
+    def test_partial_checkpoint_destinations_preserve_unwritten_padding(self):
+        torch = self.torch
+        weight = self.parameter((8, 4))
+        weight.data.fill_(173)
+        weight.weight_loader = lambda param, source, start: self.transfer.copy_weight(
+            param.data.narrow(0, start, source.shape[0]), source,
+        )
+        model = self.model(weight=weight)
+
+        def load():
+            for name, start, rows in (("down", 0, 3), ("inject", 4, 2)):
+                source = torch.arange(rows * 4, dtype=torch.uint8).reshape(rows, 4)
+                with self.source(name, source):
+                    weight.weight_loader(weight, source, start)
+
+        self.observe(model, load)
+        expected = loader._capture_model_samples(torch, model, 64)
+        views = loader._model_weight_tensors(model)
+        self.assertEqual(
+            [(tensor.data_ptr() - weight.data_ptr(), tensor.numel()) for _, tensor in views],
+            [(0, 12), (16, 8)],
+        )
+        self.assertEqual(len(views), 2)
+        residual = weight.detach().clone()
+        # Simulate excluding reload-owned spans from the preserved residual.
+        for _, tensor in views:
+            offset = tensor.data_ptr() - weight.data_ptr()
+            residual.view(-1)[offset:offset + tensor.numel()].zero_()
+        weight.data.copy_(residual)
+        load()
+        self.assertEqual(loader._compare_model_samples(torch, model, expected, 64), [])
+        self.assertTrue(torch.all(weight[3] == 173))
+        self.assertTrue(torch.all(weight[6:] == 173))
+        # The old whole-Parameter ownership erased padding and failed the
+        # exact same sample check, despite reloading every checkpoint source.
+        weight.data.zero_()
+        load()
+        self.assertEqual(len(loader._compare_model_samples(torch, model, expected, 64)), 1)
+
     def test_sharded_table_and_scales_leave_residual_only_after_full_coverage(self):
         torch = self.torch
         table, scales, runtime = self.parameter((8, 4)), self.parameter((8, 2)), self.parameter((4,))

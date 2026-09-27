@@ -778,6 +778,53 @@ def _b12x_prepared_owners(
     return result
 
 
+def _checkpoint_destination_views(
+    name: str, tensor: Any, copies: Sequence[RecoveryCopy],
+) -> list[tuple[str, Any]]:
+    """Exclude only observed reload bytes when an unchanged tensor has gaps.
+
+    Fused/padded Parameters can contain bytes never written by the checkpoint
+    loader. Those bytes must remain in the residual, even though adjacent rows
+    are model weights. Native payloads still own the complete runtime tensor.
+    """
+    if not copies or not tensor.is_contiguous():
+        return [(name, tensor)]
+    element_size = int(tensor.element_size())
+    tensor_bytes = int(tensor.numel()) * element_size
+    ranges = []
+    for copy in copies:
+        start = copy.destination_view_offset_bytes
+        end = start + copy.copy_bytes
+        if (
+            copy.destination_shape != tuple(tensor.shape)
+            or copy.destination_dtype != str(tensor.dtype)
+            or copy.destination_view_stride != _contiguous_stride(copy.destination_view_shape)
+            or not 0 <= start < end <= tensor_bytes
+            or start % element_size
+            or end % element_size
+        ):
+            # A transformed destination keeps its existing backend reload
+            # contract; its original copy offsets no longer describe it.
+            return [(name, tensor)]
+        ranges.append((start, end))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    if merged == [(0, tensor_bytes)]:
+        return [(name, tensor)]
+    flat = tensor.view(-1)
+    return [
+        (
+            f"{name}:checkpoint-bytes:{start}:{end - start}",
+            flat.narrow(0, start // element_size, (end - start) // element_size),
+        )
+        for start, end in merged
+    ]
+
+
 def _model_weight_tensors(model: Any) -> list[tuple[str, Any]]:
     """Return observed checkpoint destinations plus backend-owned weights."""
     destination_names = _model_checkpoint_destination_names(model)
@@ -793,11 +840,19 @@ def _model_weight_tensors(model: Any) -> list[tuple[str, Any]]:
         ):
             raise RuntimeError("recovery checkpoint destination tensor names are invalid")
         tensors = []
+        plan = _model_checkpoint_copy_plan(model)
+        copies_by_name: dict[str, list[RecoveryCopy]] = {}
+        if plan is not None:
+            for copy in plan.copies:
+                if copy.destination_name not in plan.unsupported_destinations:
+                    copies_by_name.setdefault(copy.destination_name, []).append(copy)
         named_buffers = getattr(model, "named_buffers", lambda: ())
         for named_tensors in (model.named_parameters, named_buffers):
-            tensors.extend(
-                (name, tensor) for name, tensor in named_tensors() if name in destination_names
-            )
+            for name, tensor in named_tensors():
+                if name in destination_names:
+                    tensors.extend(_checkpoint_destination_views(
+                        name, tensor, copies_by_name.get(name, ()),
+                    ))
     for module_name, _module, _owner, prepared in _b12x_prepared_owners(model):
         prefix = module_name or "<root>"
         # Only source-checkpoint-backed weight/scale allocations belong here.

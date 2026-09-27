@@ -6654,6 +6654,51 @@ def _capture_staging_iterator(iterator: Any) -> Iterator[Any]:
         gc.collect()
 
 
+@contextmanager
+def _model_load_memory_pool() -> Iterator[None]:
+    """End each model's weight-allocation phase before constructing the next.
+
+    vLLM's outer weights pool spans target and draft loading. Temporary weight
+    transforms remain reserved until that pool exits, even after collection.
+    Nested pools let vLLM reclaim their unused allocations at each model boundary.
+    All live allocations retain the weights tag for sleep and recovery. Retain
+    every pool/allocator pair in vLLM's owning registry until its usual teardown.
+    """
+    try:
+        from vllm.device_allocator.cumem import CuMemAllocator
+    except ImportError:
+        yield
+        return
+    allocator = getattr(CuMemAllocator, "instance", None)
+    pools = getattr(allocator, "allocator_and_pools", None)
+    if (
+        not isinstance(pools, dict)
+        or "weights" not in pools
+        or getattr(allocator, "current_tag", None) != "weights"
+    ):
+        yield
+        return
+    outer = pools["weights"]
+    current = None
+    try:
+        with allocator.use_memory_pool(tag="weights"):
+            current = pools["weights"]
+            try:
+                yield
+            finally:
+                import gc
+                import torch
+
+                gc.collect()
+                # vLLM unmaps unused pool allocations on context exit. Finish
+                # queued copies and transforms before it releases their pages.
+                torch.cuda.synchronize()
+    finally:
+        if current is not None:
+            pools[f"coldsnap_model_{id(current[0])}"] = current
+        pools["weights"] = outer
+
+
 def _install_capture_loader_observer(default_loader: type[Any]) -> None:
     """Observe fast capture loaders without changing their I/O implementation."""
     if getattr(default_loader, "_coldsnap_capture_observer_installed", False):
@@ -6712,7 +6757,12 @@ def _install_capture_loader_observer(default_loader: type[Any]) -> None:
             lambda: original_load_weights(self, model, model_config),
         )
 
-    default_loader.load_model = load_model_with_capture_draft_split
+    @functools.wraps(load_model_with_capture_draft_split)
+    def load_model_in_weight_pool(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with _model_load_memory_pool():
+            return load_model_with_capture_draft_split(self, *args, **kwargs)
+
+    default_loader.load_model = load_model_in_weight_pool
     default_loader._get_weights_iterator = observed_iterator
     default_loader.load_weights = observed_load_weights
     default_loader._coldsnap_capture_observer_installed = True

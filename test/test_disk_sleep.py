@@ -5419,6 +5419,86 @@ class DiskSleepIoTest(unittest.TestCase):
         observer.assert_called_once_with(DefaultModelLoader)
         self.assertTrue(Worker._coldsnap_model_payload_capture_installed)
 
+    def test_model_load_pools_preserve_weight_tags_and_allocator_lifetimes(self) -> None:
+        from contextlib import contextmanager
+
+        events = []
+        outer = (object(), object())
+        allocator = SimpleNamespace(current_tag="weights", allocator_and_pools={"weights": outer})
+
+        @contextmanager
+        def use_pool(tag):
+            self.assertEqual(tag, "weights")
+            pair = (object(), object())
+            allocator.allocator_and_pools[tag] = pair
+            events.append("begin")
+            try:
+                yield
+            finally:
+                events.append("end")
+
+        allocator.use_memory_pool = use_pool
+        module = SimpleNamespace(CuMemAllocator=SimpleNamespace(instance=allocator))
+        with (
+            patch.dict(sys.modules, {
+                "vllm.device_allocator.cumem": module,
+                "torch": SimpleNamespace(cuda=SimpleNamespace(
+                    synchronize=lambda: events.append("sync"),
+                )),
+            }),
+            patch("gc.collect", side_effect=lambda: events.append("collect")),
+        ):
+            for fail in (False, True):
+                try:
+                    with recovery_loader._model_load_memory_pool():
+                        self.assertIsNot(allocator.allocator_and_pools["weights"], outer)
+                        self.assertEqual(allocator.current_tag, "weights")
+                        events.append("load")
+                        if fail:
+                            raise ValueError("load failed")
+                except ValueError:
+                    self.assertTrue(fail)
+                self.assertIs(allocator.allocator_and_pools["weights"], outer)
+            self.assertEqual(len(allocator.allocator_and_pools), 3)
+            self.assertEqual(events, ["begin", "load", "collect", "sync", "end"] * 2)
+            allocator.current_tag = "kv_cache"
+            with recovery_loader._model_load_memory_pool():
+                self.assertEqual(len(allocator.allocator_and_pools), 3)
+            self.assertEqual(len(events), 10)
+            module.CuMemAllocator.instance = None
+            with recovery_loader._model_load_memory_pool():
+                self.assertEqual(len(events), 10)
+
+    def test_preparation_cleanup_reclaims_between_rounds_and_keeps_result(self) -> None:
+        from coldsnap_startup_plan import _install_preparation_cache_cleanup
+
+        events = []
+        incomplete, complete = {"done": False}, {"done": True}
+
+        class Worker:
+            def advance_b12x_preparation(self, *, cancel_tuning=False):
+                events.append(("advance", cancel_tuning))
+                return complete if cancel_tuning else incomplete
+
+        fake_torch = SimpleNamespace(cuda=SimpleNamespace(
+            synchronize=lambda: events.append("sync"),
+            empty_cache=lambda: events.append("clear"),
+        ))
+        module = SimpleNamespace(Worker=Worker, GPUWorker=Worker)
+        with patch.dict(sys.modules, {"torch": fake_torch}), patch(
+            "gc.collect", side_effect=lambda: events.append("collect"),
+        ):
+            _install_preparation_cache_cleanup(module)
+            installed = Worker.advance_b12x_preparation
+            _install_preparation_cache_cleanup(module)
+            self.assertIs(Worker.advance_b12x_preparation, installed)
+            self.assertIs(Worker().advance_b12x_preparation(), incomplete)
+            self.assertEqual(events, [("advance", False), "collect", "sync", "clear"])
+            self.assertIs(Worker().advance_b12x_preparation(cancel_tuning=True), complete)
+            self.assertEqual(events[-1], ("advance", True))
+            self.assertEqual(len(events), 5)
+            _install_preparation_cache_cleanup(SimpleNamespace(Worker=type("OlderWorker", (), {})))
+
     def test_capture_staging_pool_excludes_consumers_and_closes_on_failure(self) -> None:
         from contextlib import contextmanager
 

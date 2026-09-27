@@ -564,6 +564,39 @@ def _install_phase_stable_startup_plan_fingerprint(
     startup_plan_module.maybe_save_startup_plan = maybe_save_startup_plan
 
 
+def _install_preparation_cache_cleanup(module: Any) -> None:
+    """Release transient tuning buffers between vLLM's preparation rounds.
+
+    A single-node model can leave little shared-memory headroom. Keeping freed
+    benchmark buffers cached until every kernel is prepared can exhaust the
+    host before the CUDA allocator observes a device allocation failure.
+    """
+    for name in ("Worker", "GPUWorker"):
+        worker_class = getattr(module, name, None)
+        original = getattr(worker_class, "advance_b12x_preparation", None)
+        if not callable(original) or getattr(original, "_coldsnap_cache_cleanup", False):
+            continue
+
+        def wrap(advance: Any) -> Any:
+            @functools.wraps(advance)
+            def advance_with_cleanup(self: Any, *args: Any, **kwargs: Any) -> Any:
+                result = advance(self, *args, **kwargs)
+                # vLLM already performs this cleanup on the completed round.
+                if not result.get("done", False):
+                    import gc
+                    import torch
+
+                    gc.collect()
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                return result
+
+            advance_with_cleanup._coldsnap_cache_cleanup = True
+            return advance_with_cleanup
+
+        worker_class.advance_b12x_preparation = wrap(original)
+
+
 def install_startup_plan_memory_fallback() -> None:
     from vllm.platforms import current_platform
     from vllm.third_party.pynvml import NVMLError_NotSupported
@@ -585,3 +618,6 @@ def install_startup_plan_memory_fallback() -> None:
     _install_startup_plan_shortfall_adjustment()
     _install_deferred_free_memory_admission()
     _install_deferred_compile_cache_identity()
+    after_module_import(
+        _GPU_WORKER_MODULE, "preparation-cache-cleanup", _install_preparation_cache_cleanup,
+    )

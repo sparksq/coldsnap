@@ -127,14 +127,25 @@ class EngineExecTest(unittest.TestCase):
                     engine_exec.main()
                 execute.assert_called_once()
                 prepare_limits.assert_called_once_with()
+                block.assert_not_called()
+                self.assertEqual(os.environ["COLDSNAP_CHECKPOINT_IO_URING"], "managed")
                 if phase == "pre_exec":
-                    block.assert_not_called()
                     self.assertTrue((root / "ready/rank-0.json").is_file())
                     self.assertNotIn("COLDSNAP_PROCESS_TEMPLATE_PHASE", os.environ)
                     if restored:
                         self.assertEqual(execute.call_args.args[1][-2:], ["--load-format", "coldsnap"])
-                else:
-                    block.assert_called_once_with()
+    def test_other_engines_retain_io_uring_filter(self) -> None:
+        with (
+            patch.dict(os.environ, {"COLDSNAP_ENGINE": "sglang"}, clear=True),
+            patch.object(sys, "argv", ["launcher", "--", "sglang", "serve", "org/model"]),
+            patch.object(engine_exec, "_sglang_startup_provider", return_value=None),
+            patch.object(engine_exec, "_block_io_uring") as block,
+            patch.object(os, "execvpe", side_effect=SystemExit(0)),
+        ):
+            with self.assertRaises(SystemExit):
+                engine_exec.main()
+            block.assert_called_once_with()
+            self.assertNotIn("COLDSNAP_CHECKPOINT_IO_URING", os.environ)
 
     def test_invalid_pre_exec_boundary_does_not_launch_an_unfiltered_engine(self) -> None:
         with (

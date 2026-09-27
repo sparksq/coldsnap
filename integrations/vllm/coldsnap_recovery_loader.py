@@ -5932,7 +5932,9 @@ def _install_worker_wake_hook() -> None:
             skip_token = _RECOVERY_SKIP_SOURCE_NAMES.set(skip_sources)
             preloaded_token = _RECOVERY_PRELOADED_DESTINATION_NAMES.set(preloaded_destinations)
             try:
-                with _defer_recovery_model_finalizers(model):
+                from coldsnap_b12x_checkpoint import replay_immutable_sources
+
+                with replay_immutable_sources(), _defer_recovery_model_finalizers(model):
                     model_runner.reload_weights()
             finally:
                 _RECOVERY_PRELOADED_DESTINATION_NAMES.reset(preloaded_token)

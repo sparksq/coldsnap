@@ -21,6 +21,7 @@ coldsnap = "coldsnap_plugin:register"
 
 [tool.setuptools]
 py-modules = [
+  "coldsnap_b12x_checkpoint",
   "coldsnap_b12x_native_state",
   "coldsnap_cache_bootstrap",
   "coldsnap_cuda_epoch",
@@ -49,6 +50,7 @@ py-modules = [
   "coldsnap_vllm_memory",
   "coldsnap_vllm_nccl_checkpoint",
   "coldsnap_vllm_process_template",
+  "coldsnap_vllm_resources",
   "coldsnap_vllm_shape_calibration",
   "coldsnap_vllm_worker_reexec",
   "sitecustomize",

@@ -650,13 +650,14 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
-    # The n580 pre-exec template has already been checkpointed, and both
-    # capture acceptance and restore construct the engine from scratch after
-    # this boundary. Its disk-backed loaders may create fresh io_uring rings.
-    # Later checkpoint boundaries still need the CRIU-safe syscall filter.
+    # vLLM's registered resource adapters suspend supported readers before an
+    # initialized checkpoint. The controller rejects any remaining io_uring
+    # descriptors across the entire process tree. The n580 pre-exec boundary
+    # still completes before readers are constructed.
     if engine == "vllm":
         _prepare_vllm_file_limit()
-    if not checkpoint_before_exec:
+        os.environ["COLDSNAP_CHECKPOINT_IO_URING"] = "managed"
+    elif not checkpoint_before_exec:
         _block_io_uring()
     os.execvpe(command[0], command, os.environ)
     return 127

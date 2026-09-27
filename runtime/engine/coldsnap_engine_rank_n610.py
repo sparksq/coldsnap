@@ -1085,6 +1085,9 @@ def capture(args: argparse.Namespace) -> dict[str, Any]:
             for rank in range(args.world_size):
                 _coordinator_wait(coordinator, f"{barrier}:{rank}", args.timeout)
             tree = base._process_tree(target.pid)
+            from coldsnap_core.checkpoint import assert_no_io_uring
+
+            assert_no_io_uring(tree)
             rss_bytes = sum(base._rss_bytes(pid) for pid in tree)
             regular_backings = _capture_regular_backings(args, tree)
             # Keep the already-collected preparation evidence even if the CUDA

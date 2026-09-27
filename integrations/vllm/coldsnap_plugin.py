@@ -38,6 +38,10 @@ def register() -> None:
         preload_context_free_fla_platform_probe,
     )
 
+    from coldsnap_vllm_resources import install_reader_adapters, install_checkpoint_resource_hooks
+
+    install_reader_adapters()
+
     # This must precede imports that can resolve a Qwen model class. It is a
     # no-op unless the explicit pre-worker-import process-template phase is on.
     preload_context_free_fla_platform_probe()
@@ -74,6 +78,7 @@ def register() -> None:
     install_startup_plan_memory_fallback()
     install_process_template_hook()
     install_nccl_checkpoint_hooks()
+    install_checkpoint_resource_hooks()
     install_instanttensor_nccl_unwrap()
     _force_cross_rank_rpc_over_tcp()
 

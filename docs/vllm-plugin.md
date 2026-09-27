@@ -68,12 +68,29 @@ ColdSnap records a compiler-cache namespace only when vLLM exposes one; an
 empty namespace clears an old marker instead of making capture fail. Nonempty
 cache paths still require the qualified directory layout.
 
-The default n580 pre-exec checkpoint precedes the inference engine. Once that
-validated boundary is released, capture acceptance and restore may create fresh
-`io_uring` readers for disk-backed Engram tables. Later checkpoint boundaries,
-including n610, retain the CRIU-compatible `io_uring` filter. This does not add
-checkpoint/restore support for live `io_uring` state.
+vLLM uses managed external-resource checkpointing. The shared
+`coldsnap_core.checkpoint` registry suspends registered resources after the
+engine and NCCL prepare hooks, then reconstructs their handles after CUDA
+restoration and before weight recovery. Preparation rejects unmanaged
+`io_uring` descriptors and kernel workers; n610 also checks the full process
+tree before CRIU. Other engines retain the syscall filter.
 
+The B12x adapter supports ABI-1 `DiskRowCache` readers used by PLE and Engram.
+It drains the current transaction, closes the native ring and source FDs, and
+retires the dedicated CPU submission thread. That thread is necessary because
+closing a ring alone can leave an `io-wq` worker attached to the submitting
+thread. Mapped host allocations, tensor aliases and graph-visible addresses
+stay intact. Restore reopens the same source ranges; the next read starts a
+fresh submission thread. CUDA stream and event operations remain on the
+original engine thread. GDS readers are rejected at this checkpoint boundary.
+
+Select disk tables with `VLLM_PLE_TABLE_MEMORY=disk` in supported B12x images;
+the legacy `VLLM_PLE_CPU_OFFLOAD=1` selects mapped host memory, not disk.
+Both native and recovery restores need the pinned original checkpoint shards
+for disk tables. The adapter checks source paths, offsets and file sizes;
+content verification remains the model-staging contract and is not repeated
+at checkpoint. Recovery may replay identical immutable registrations but
+cannot substitute different source ranges.
 The engine launcher also applies vLLM's 65,535-descriptor soft-limit target to
 headless ranks, which bypass the API server's limit adjustment. It preserves
 the host hard limit and any higher existing soft limit.

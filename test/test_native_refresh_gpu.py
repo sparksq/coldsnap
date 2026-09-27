@@ -578,6 +578,7 @@ class RecoveryMemoryGpuTests(unittest.TestCase):
         from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
         from vllm.model_executor.layers.quantization import modelopt
         from vllm.model_executor.layers.fused_moe.b12x import B12xExperts
+        from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import NvFp4MoeBackend
         from vllm.model_executor.model_loader.reload import layerwise
         import coldsnap_recovery_loader as loader
 
@@ -592,7 +593,7 @@ class RecoveryMemoryGpuTests(unittest.TestCase):
                 # Use the image's real config factory and expert refresh. The
                 # packed-weight conversion is orthogonal to this lifetime bug.
                 config = modelopt.make_nvfp4_moe_quant_config(
-                    backend=modelopt.NvFp4MoeBackend.B12X,
+                    backend=NvFp4MoeBackend.B12X,
                     w13_scale=layer.w13_weight_scale, w2_scale=layer.w2_weight_scale,
                     w13_scale_2=layer.w13_weight_scale_2, w2_scale_2=layer.w2_weight_scale_2,
                     a13_scale=layer.w13_input_scale, a2_scale=layer.w2_input_scale,

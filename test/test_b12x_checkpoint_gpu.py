@@ -25,6 +25,15 @@ class B12xCheckpointGpuTest(unittest.TestCase):
         from coldsnap_core.checkpoint import CheckpointResourceError, ResourceRegistry, assert_no_io_uring
         import coldsnap_b12x_checkpoint as adapter
 
+        import uvloop
+        from coldsnap_vllm_resources import _install_event_loop_hooks
+        _install_event_loop_hooks(uvloop)
+        loop = uvloop.new_event_loop()
+        self.addCleanup(loop.close)
+        import signal
+        loop.add_signal_handler(signal.SIGUSR1, lambda: None)
+        loop.remove_signal_handler(signal.SIGUSR1)
+        assert_no_io_uring()
         registry = ResourceRegistry()
         with tempfile.TemporaryDirectory() as directory, patch.object(adapter, "REGISTRY", registry), patch.dict(os.environ, {"B12X_DISK_BACKEND": "io_uring"}):
             adapter.install_disk_row_cache_adapter(disk_table)
@@ -73,6 +82,11 @@ class B12xCheckpointGpuTest(unittest.TestCase):
                         if time.monotonic() > deadline:
                             self.fail("timed out waiting for external checkpoint controller")
                         time.sleep(0.1)
+                async def loop_alive():
+                    import asyncio
+                    await asyncio.sleep(0)
+                    return type(asyncio.get_running_loop()).__module__
+                self.assertEqual(loop.run_until_complete(loop_alive()), "uvloop")
                 restored = registry.restore()
                 self.assertEqual(adapter._buffer_identity(cache), before)
                 ids.copy_(torch.tensor([1, 6, 2, 0], dtype=torch.int64, device="cuda"))

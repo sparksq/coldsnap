@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -117,6 +118,30 @@ class CheckpointResourcesTest(unittest.TestCase):
         with patch.object(Path, "iterdir", entries), patch.object(Path, "read_text", return_value="iou-wrk-9\n"):
             with self.assertRaisesRegex(checkpoint.CheckpointResourceError, "PID 9 thread 12"):
                 checkpoint.assert_no_io_uring([9])
+
+    def test_event_loop_factory_restricts_only_a_joined_constructor_thread(self):
+        from coldsnap_core import io_uring
+        caller = threading.get_ident()
+        calls = []
+        def restrict():
+            calls.append(("filter", threading.current_thread()))
+        def factory():
+            calls.append(("factory", threading.current_thread()))
+            return "epoll-loop"
+        def run(main, *, loop_factory, debug=False):
+            return main, loop_factory(), debug
+        module = SimpleNamespace(new_event_loop=factory, run=run)
+        self.assertTrue(vllm_resources._install_event_loop_hooks(module))
+        self.assertFalse(vllm_resources._install_event_loop_hooks(module))
+        with patch.object(io_uring, "block_io_uring_for_current_thread", restrict):
+            self.assertEqual(module.new_event_loop(), "epoll-loop")
+            self.assertEqual(module.run("coroutine", debug=True), ("coroutine", "epoll-loop", True))
+            with self.assertRaisesRegex(ValueError, "constructor failed"):
+                io_uring.without_io_uring(lambda: (_ for _ in ()).throw(ValueError("constructor failed")))
+        self.assertEqual([kind for kind, _ in calls], ["filter", "factory", "filter", "factory", "filter"])
+        for _, thread in calls:
+            self.assertNotEqual(thread.ident, caller)
+            self.assertFalse(thread.is_alive())
 
     def test_worker_wrapper_preserves_engine_evidence_and_orders_resources(self):
         calls = self.calls

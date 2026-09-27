@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from typing import Any
 
 from coldsnap_core.checkpoint import CheckpointResourceError, REGISTRY
@@ -60,3 +61,32 @@ def install_checkpoint_resource_hooks() -> bool:
     return after_module_import(
         "vllm.v1.worker.gpu_worker", "coldsnap-checkpoint-resources", _install_worker_hooks,
     )
+
+
+def _install_event_loop_hooks(module: Any) -> bool:
+    if getattr(module, "__coldsnap_checkpoint_epoll__", False):
+        return False
+    from coldsnap_core.io_uring import without_io_uring
+
+    original_factory = module.new_event_loop
+    original_run = module.run
+
+    @functools.wraps(original_factory)
+    def new_event_loop() -> Any:
+        return without_io_uring(original_factory)
+
+    @functools.wraps(original_run)
+    def run(main: Any, *, loop_factory: Any = None, **kwargs: Any) -> Any:
+        factory = original_factory if loop_factory in (None, new_event_loop) else loop_factory
+        return original_run(main, loop_factory=lambda: without_io_uring(factory), **kwargs)
+
+    module.new_event_loop = new_event_loop
+    module.run = run
+    module.__coldsnap_checkpoint_epoll__ = True
+    return True
+
+
+def install_checkpoint_event_loops() -> bool:
+    if os.environ.get("COLDSNAP_CHECKPOINT_EVENT_LOOP") != "epoll":
+        return False
+    return after_module_import("uvloop", "coldsnap-checkpoint-epoll", _install_event_loop_hooks)

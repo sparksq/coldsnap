@@ -129,6 +129,7 @@ class EngineExecTest(unittest.TestCase):
                 prepare_limits.assert_called_once_with()
                 block.assert_not_called()
                 self.assertEqual(os.environ["COLDSNAP_CHECKPOINT_IO_URING"], "managed")
+                self.assertEqual(os.environ.get("COLDSNAP_CHECKPOINT_EVENT_LOOP"), None if phase == "pre_exec" else "epoll")
                 if phase == "pre_exec":
                     self.assertTrue((root / "ready/rank-0.json").is_file())
                     self.assertNotIn("COLDSNAP_PROCESS_TEMPLATE_PHASE", os.environ)

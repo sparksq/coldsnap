@@ -7,9 +7,6 @@
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
-import errno
 import importlib.util
 import ipaddress
 import json
@@ -537,43 +534,9 @@ def _prepare_vllm_file_limit() -> None:
 
 
 def _block_io_uring() -> None:
-    library_name = ctypes.util.find_library("seccomp")
-    if library_name is None:
-        raise RuntimeError("libseccomp is required to block io_uring")
-    seccomp = ctypes.CDLL(library_name, use_errno=True)
-    seccomp.seccomp_init.argtypes = [ctypes.c_uint32]
-    seccomp.seccomp_init.restype = ctypes.c_void_p
-    seccomp.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
-    seccomp.seccomp_syscall_resolve_name.restype = ctypes.c_int
-    seccomp.seccomp_rule_add.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.c_int,
-        ctypes.c_uint,
-    ]
-    seccomp.seccomp_rule_add.restype = ctypes.c_int
-    seccomp.seccomp_load.argtypes = [ctypes.c_void_p]
-    seccomp.seccomp_load.restype = ctypes.c_int
-    seccomp.seccomp_release.argtypes = [ctypes.c_void_p]
+    from coldsnap_core.io_uring import block_io_uring_for_current_thread
 
-    allow = 0x7FFF0000
-    deny = 0x00050000 | errno.EPERM
-    context = seccomp.seccomp_init(allow)
-    if not context:
-        raise OSError(ctypes.get_errno(), "seccomp_init failed")
-    try:
-        for name in (b"io_uring_setup", b"io_uring_enter", b"io_uring_register"):
-            number = seccomp.seccomp_syscall_resolve_name(name)
-            if number < 0:
-                raise RuntimeError(f"libseccomp cannot resolve {name.decode()}")
-            result = seccomp.seccomp_rule_add(context, deny, number, 0)
-            if result != 0:
-                raise OSError(-result, f"seccomp_rule_add failed for {name.decode()}")
-        result = seccomp.seccomp_load(context)
-        if result != 0:
-            raise OSError(-result, "seccomp_load failed")
-    finally:
-        seccomp.seccomp_release(context)
+    block_io_uring_for_current_thread()
 
 
 def main() -> int:
@@ -657,6 +620,10 @@ def main() -> int:
     if engine == "vllm":
         _prepare_vllm_file_limit()
         os.environ["COLDSNAP_CHECKPOINT_IO_URING"] = "managed"
+        if checkpoint_before_exec:
+            os.environ.pop("COLDSNAP_CHECKPOINT_EVENT_LOOP", None)
+        else:
+            os.environ["COLDSNAP_CHECKPOINT_EVENT_LOOP"] = "epoll"
     elif not checkpoint_before_exec:
         _block_io_uring()
     os.execvpe(command[0], command, os.environ)

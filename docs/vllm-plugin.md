@@ -75,6 +75,14 @@ restoration and before weight recovery. Preparation rejects unmanaged
 `io_uring` descriptors and kernel workers; n610 also checks the full process
 tree before CRIU. Other engines retain the syscall filter.
 
+At initialized-process boundaries, ColdSnap constructs uvloop event loops on a
+short-lived thread whose io_uring syscalls are disabled. Libuv selects its
+normal epoll fallback; the loop then runs on the engine/API thread as usual.
+The helper is joined before returning, and its filter never applies to the
+calling thread or B12x readers. This also covers libuv versions that create
+batching rings regardless of `UV_USE_IO_URING`. The n580 pre-exec path does not
+need this event-loop policy.
+
 The B12x adapter supports ABI-1 `DiskRowCache` readers used by PLE and Engram.
 It drains the current transaction, closes the native ring and source FDs, and
 retires the dedicated CPU submission thread. That thread is necessary because

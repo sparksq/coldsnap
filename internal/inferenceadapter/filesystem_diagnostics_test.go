@@ -154,6 +154,11 @@ func TestFilesystemSpaceProbeResolvesAncestorAndEffectiveUserAvailability(t *tes
 	if err := os.Mkdir(target, 0700); err != nil {
 		t.Fatal(err)
 	}
+	// Resolve ancestor symlinks too: macOS /tmp is /private/tmp.
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
 	link := filepath.Join(root, "cache-link")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
@@ -177,7 +182,7 @@ os.geteuid = lambda: ` + strconv.Itoa(uid) + "\n"
 				t.Fatalf("decode: %s %v", output, err)
 			}
 			observed := observations[0]
-			if observed.Path != missing || observed.ExistingPath != target || *observed.UID != uint32(uid) {
+			if observed.Path != missing || observed.ExistingPath != resolvedTarget || *observed.UID != uint32(uid) {
 				t.Fatalf("wrong target/identity: %+v", observed)
 			}
 			wantBytes, wantInodes := int64(0), int64(0)

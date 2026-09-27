@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import gc
+import os
 from pathlib import Path
 import sys
 import threading
@@ -142,6 +143,37 @@ class CheckpointResourcesTest(unittest.TestCase):
         for _, thread in calls:
             self.assertNotEqual(thread.ident, caller)
             self.assertFalse(thread.is_alive())
+
+    def test_tcp_store_factory_preserves_arguments_and_backend_on_restricted_thread(self):
+        from coldsnap_core import io_uring
+        caller = threading.current_thread()
+        calls = []
+        result = object()
+        def factory(*args, **kwargs):
+            calls.append((threading.current_thread(), args, kwargs))
+            return result
+        module = SimpleNamespace(_create_c10d_store=factory)
+        self.assertTrue(vllm_resources._install_tcp_store_hooks(module))
+        self.assertFalse(vllm_resources._install_tcp_store_hooks(module))
+        with patch.object(io_uring, "block_io_uring_for_current_thread") as restrict:
+            self.assertIs(module._create_c10d_store("host", 42, use_libuv=True), result)
+        restrict.assert_called_once_with()
+        thread, args, kwargs = calls[0]
+        self.assertIsNot(thread, caller)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(args, ("host", 42))
+        self.assertEqual(kwargs, {"use_libuv": True})
+        with self.assertRaisesRegex(checkpoint.CheckpointResourceError, "TCP-store factory"):
+            vllm_resources._install_tcp_store_hooks(SimpleNamespace())
+
+    def test_event_loop_and_tcp_store_hooks_only_apply_to_initialized_checkpoints(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(vllm_resources, "after_module_import") as hook:
+            self.assertFalse(vllm_resources.install_checkpoint_event_loops())
+            hook.assert_not_called()
+            os.environ["COLDSNAP_CHECKPOINT_EVENT_LOOP"] = "epoll"
+            hook.return_value = True
+            self.assertTrue(vllm_resources.install_checkpoint_event_loops())
+            self.assertEqual([call.args[0] for call in hook.call_args_list], ["uvloop", "torch.distributed.rendezvous"])
 
     def test_worker_wrapper_preserves_engine_evidence_and_orders_resources(self):
         calls = self.calls

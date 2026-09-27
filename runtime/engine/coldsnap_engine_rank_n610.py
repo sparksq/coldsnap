@@ -225,26 +225,16 @@ def _daemon_request(
 
 
 def _checkpoint(args: argparse.Namespace, operation: str) -> Any:
-    deadline = time.monotonic() + args.timeout
-    last_error: BaseException | None = None
-    while time.monotonic() < deadline:
-        remaining = max(0.001, deadline - time.monotonic())
-        wait = min(_COORDINATOR_MAX_WAIT_SECONDS, remaining)
-        try:
-            return _request(
-                args,
-                "POST",
-                "/collective_rpc",
-                {
-                    "method": f"checkpoint_{operation}",
-                    "timeout": max(1, int(wait)),
-                },
-                timeout=wait,
-            )
-        except (OSError, urllib.error.URLError) as error:
-            last_error = error
-        time.sleep(0.25)
-    raise TimeoutError(f"checkpoint_{operation} failed: {last_error}")
+    # This RPC mutates worker/NCCL state. Even a lost response can mean the
+    # operation completed; replaying it is unsafe and hides the first failure.
+    wait = min(_COORDINATOR_MAX_WAIT_SECONDS, max(0.001, args.timeout))
+    return _request(
+        args,
+        "POST",
+        "/collective_rpc",
+        {"method": f"checkpoint_{operation}", "timeout": max(1, int(wait))},
+        timeout=wait,
+    )
 
 
 def _checkpoint_max_seconds(response: Any, key: str) -> float | None:

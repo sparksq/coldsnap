@@ -86,7 +86,30 @@ def _install_event_loop_hooks(module: Any) -> bool:
     return True
 
 
+def _install_tcp_store_hooks(module: Any) -> bool:
+    original = getattr(module, "_create_c10d_store", None)
+    if not callable(original):
+        raise CheckpointResourceError("PyTorch rendezvous has no TCP-store factory")
+    if getattr(original, "__coldsnap_checkpoint_epoll__", False):
+        return False
+    from coldsnap_core.io_uring import without_io_uring
+
+    @functools.wraps(original)
+    def create_store(*args: Any, **kwargs: Any) -> Any:
+        # The libuv server thread inherits the constructor's local filter.
+        # TCPStore is thread-safe; keep its backend and rendezvous semantics.
+        return without_io_uring(lambda: original(*args, **kwargs))
+
+    create_store.__coldsnap_checkpoint_epoll__ = True
+    module._create_c10d_store = create_store
+    return True
+
+
 def install_checkpoint_event_loops() -> bool:
     if os.environ.get("COLDSNAP_CHECKPOINT_EVENT_LOOP") != "epoll":
         return False
-    return after_module_import("uvloop", "coldsnap-checkpoint-epoll", _install_event_loop_hooks)
+    event_loop = after_module_import("uvloop", "coldsnap-checkpoint-epoll", _install_event_loop_hooks)
+    tcp_store = after_module_import(
+        "torch.distributed.rendezvous", "coldsnap-checkpoint-epoll", _install_tcp_store_hooks,
+    )
+    return event_loop or tcp_store

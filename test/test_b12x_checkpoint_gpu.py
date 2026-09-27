@@ -26,13 +26,21 @@ class B12xCheckpointGpuTest(unittest.TestCase):
         import coldsnap_b12x_checkpoint as adapter
 
         import uvloop
-        from coldsnap_vllm_resources import _install_event_loop_hooks
+        from coldsnap_vllm_resources import _install_event_loop_hooks, _install_tcp_store_hooks
         _install_event_loop_hooks(uvloop)
         loop = uvloop.new_event_loop()
         self.addCleanup(loop.close)
         import signal
         loop.add_signal_handler(signal.SIGUSR1, lambda: None)
         loop.remove_signal_handler(signal.SIGUSR1)
+        assert_no_io_uring()
+        import importlib
+        from datetime import timedelta
+        rendezvous = importlib.import_module("torch.distributed.rendezvous")
+        _install_tcp_store_hooks(rendezvous)
+        store = rendezvous._create_c10d_store("127.0.0.1", 0, 0, 1, timedelta(seconds=5), use_libuv=True)
+        store.set("before", "checkpoint")
+        self.assertEqual(store.get("before"), b"checkpoint")
         assert_no_io_uring()
         registry = ResourceRegistry()
         with tempfile.TemporaryDirectory() as directory, patch.object(adapter, "REGISTRY", registry), patch.dict(os.environ, {"B12X_DISK_BACKEND": "io_uring"}):
@@ -87,6 +95,9 @@ class B12xCheckpointGpuTest(unittest.TestCase):
                     await asyncio.sleep(0)
                     return type(asyncio.get_running_loop()).__module__
                 self.assertEqual(loop.run_until_complete(loop_alive()), "uvloop")
+                self.assertEqual(store.get("before"), b"checkpoint")
+                store.set("after", "restored")
+                self.assertEqual(store.get("after"), b"restored")
                 restored = registry.restore()
                 self.assertEqual(adapter._buffer_identity(cache), before)
                 ids.copy_(torch.tensor([1, 6, 2, 0], dtype=torch.int64, device="cuda"))
@@ -96,7 +107,7 @@ class B12xCheckpointGpuTest(unittest.TestCase):
                 torch.cuda.synchronize()
                 self.assertTrue(torch.equal(output.cpu(), weights[[1, 6, 2, 0]]))
                 self.assertTrue(torch.equal(scale_output.cpu(), scales[[1, 6, 2, 0]]))
-                print(json.dumps({"phase": "restored", "resources": restored, "graph_replay": True,
+                print(json.dumps({"phase": "restored", "resources": restored, "graph_replay": True, "tcp_store_restored": True,
                                   "weights_and_scales_correct": True, "addresses_preserved": True}), flush=True)
                 if pause:
                     (Path(pause)/"passed.json").write_text(json.dumps({"passed": True, "resources": restored}))

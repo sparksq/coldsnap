@@ -58,8 +58,9 @@ def without_io_uring(factory: Callable[[], Any]) -> Any:
     not expose a switch for disabling epoll-batching rings. The seccomp filter
     is thread-local (no TSYNC); caller and reader threads remain unrestricted.
     Only use factories whose results permit use on another thread, such as an
-    event loop that has not yet run. Joining also removes the helper before a
-    process checkpoint.
+    event loop that has not yet run or a thread-safe TCP store. Native threads
+    spawned by the factory inherit its filter. Joining removes the constructor
+    helper before a process checkpoint.
     """
     def create() -> Any:
         block_io_uring_for_current_thread()

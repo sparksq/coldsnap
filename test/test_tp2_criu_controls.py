@@ -34,6 +34,21 @@ N580_SPEC.loader.exec_module(n580_node)
 
 
 class TP2CriuControlsTest(unittest.TestCase):
+    def test_checkpoint_rpc_never_replays_a_stateful_operation(self) -> None:
+        import urllib.error
+        args = SimpleNamespace(timeout=17.5)
+        for operation in ("prepare", "restore"):
+            for error in (urllib.error.HTTPError("url", 500, "worker failed", {}, None),
+                          urllib.error.URLError("connection lost"), TimeoutError("response lost")):
+                with self.subTest(operation=operation, error=error), mock.patch.object(node, "_request", side_effect=error) as request:
+                    with self.assertRaises(type(error)) as caught:
+                        node._checkpoint(args, operation)
+                    self.assertIs(caught.exception, error)
+                    request.assert_called_once_with(args, "POST", "/collective_rpc",
+                                                    {"method": f"checkpoint_{operation}", "timeout": 17}, timeout=17.5)
+        with mock.patch.object(node, "_request", return_value={"results": ["prepared"]}):
+            self.assertEqual(node._checkpoint(args, "prepare"), {"results": ["prepared"]})
+
     def test_n580_requires_current_process_template_placement_abi(self) -> None:
         n580_node._require_process_template_placement_abi(
             {"process_template_placement_abi": (n580_node.PROCESS_TEMPLATE_PLACEMENT_ABI)}

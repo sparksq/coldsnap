@@ -2255,7 +2255,7 @@ class DiskSleepIoTest(unittest.TestCase):
         self.assertEqual(meta.SKIP_LOAD_TENSORS, set())
         self.assertEqual(meta.SKIP_TENSORS, {"bias"})
 
-    def test_recovery_context_aliases_preloaded_weight_to_stable_storage(self) -> None:
+    def test_recovery_context_aliases_preloaded_and_partial_weights_to_stable_storage(self) -> None:
         stable = SimpleNamespace(is_meta=False)
         restored_meta = SimpleNamespace(is_meta=True)
         layer = SimpleNamespace(
@@ -2284,7 +2284,13 @@ class DiskSleepIoTest(unittest.TestCase):
 
         layerwise.materialize_layer = materialize_layer
         layerwise.restore_layer_on_meta = restore_layer_on_meta
-        layerwise.get_layer_size = lambda _layer: 0
+        load_skips = []
+
+        def get_layer_size(_layer):
+            load_skips.append(set(meta.SKIP_LOAD_TENSORS))
+            return 0
+
+        layerwise.get_layer_size = get_layer_size
         layerwise._wrap_parameters_weight_loader = lambda _layer: None
         meta = ModuleType("vllm.model_executor.model_loader.reload.meta")
         meta.SKIP_LOAD_TENSORS = set()
@@ -2301,32 +2307,47 @@ class DiskSleepIoTest(unittest.TestCase):
             "vllm.model_executor.model_loader.reload.meta": meta,
         }
 
-        token = recovery_loader._RECOVERY_PRELOADED_DESTINATION_NAMES.set(
-            frozenset({"layer.weight"})
-        )
-        try:
-            with (
-                patch.dict(sys.modules, modules),
-                patch.object(
-                    recovery_loader,
-                    "_alias_meta_tensor_from_storage",
-                    return_value=("stable-alias", stable),
-                ) as alias,
-                recovery_loader._recovery_reload_storage(model, prepare_preloaded=True),
-            ):
-                layerwise.restore_layer_on_meta(layer, object())
-                layerwise.materialize_layer(layer, object())
-        finally:
-            recovery_loader._RECOVERY_PRELOADED_DESTINATION_NAMES.reset(token)
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                layer.weight = stable
+                layer._parameters["weight"] = stable
+                materialized.clear()
+                load_skips.clear()
+                token = recovery_loader._RECOVERY_PRELOADED_DESTINATION_NAMES.set(
+                    frozenset() if partial else frozenset({"layer.weight"})
+                )
+                try:
+                    with (
+                        patch.dict(sys.modules, modules),
+                        patch.object(
+                            recovery_loader,
+                            "_partially_reloaded_destination_tensors",
+                            return_value={"layer.weight": stable} if partial else {},
+                        ),
+                        patch.object(
+                            recovery_loader,
+                            "_alias_meta_tensor_from_storage",
+                            return_value=("stable-alias", stable),
+                        ) as alias,
+                        recovery_loader._recovery_reload_storage(model, prepare_preloaded=not partial),
+                    ):
+                        layerwise.restore_layer_on_meta(layer, object())
+                        layerwise.get_layer_size(layer)
+                        layerwise.materialize_layer(layer, object())
+                finally:
+                    recovery_loader._RECOVERY_PRELOADED_DESTINATION_NAMES.reset(token)
 
-        alias.assert_called_once_with(
-            modules["torch"],
-            restored_meta,
-            stable,
-            label="preloaded:weight",
-        )
-        self.assertEqual(materialized, [("stable-alias", stable)])
-        self.assertIs(layerwise.materialize_layer, materialize_layer)
+                alias.assert_called_once_with(
+                    modules["torch"], restored_meta, stable, label="preloaded:weight",
+                )
+                self.assertEqual(materialized, [("stable-alias", stable)])
+                # Partial destinations still need all ordinary weight-loader
+                # calls, unlike tensors populated by direct checkpoint replay.
+                self.assertEqual(load_skips, [set() if partial else {"weight"}])
+                self.assertIs(layerwise.materialize_layer, materialize_layer)
+                self.assertIs(layerwise.get_layer_size, get_layer_size)
+                self.assertEqual(meta.SKIP_LOAD_TENSORS, set())
+                self.assertEqual(meta.SKIP_TENSORS, set())
 
     def test_recovery_b12x_adapter_accepts_relocated_derived_runtime_state(
         self,

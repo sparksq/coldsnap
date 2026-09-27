@@ -413,6 +413,100 @@ class Dsv4NativeRefreshGpuTests(unittest.TestCase):
                    "execution_storage_preserved": True}, flush=True)
 
 
+    def test_real_layerwise_reload_preserves_partial_parameter_padding(self):
+        from contextlib import nullcontext
+        from unittest.mock import patch
+
+        import torch
+        from torch import nn
+        from vllm.model_executor import weight_transfer
+        from vllm.model_executor.model_loader.reload import layerwise
+        import coldsnap_recovery_loader as loader
+
+        with torch.no_grad(), torch.device("cuda"):
+            model = nn.Module()
+            model.layer = nn.Module()
+            model.layer.weight = nn.Parameter(torch.full((8, 4), 173.0), requires_grad=False)
+            stable = model.layer.weight
+            pointer = stable.data_ptr()
+
+            def weight_loader(param, loaded_weight, start):
+                weight_transfer.copy_weight(
+                    param.data.narrow(0, start, loaded_weight.shape[0]), loaded_weight,
+                )
+
+            stable.weight_loader = weight_loader
+            sources = [("down", 0, torch.arange(12.0).reshape(3, 4)),
+                       ("inject", 4, torch.arange(8.0).reshape(2, 4))]
+
+            def load_weights(observe=False):
+                for name, start, source in sources:
+                    token = None
+                    if observe:
+                        descriptor = loader.SafetensorDescriptor(
+                            name=name, dtype_name="F32", shape=tuple(source.shape),
+                            file_offset=64, length=source.numel() * source.element_size(),
+                        )
+                        token = loader._ACTIVE_RECOVERY_SOURCE.set(loader.RecoverySourceTensor(
+                            name=name, path="/checkpoint/model.safetensors", descriptor=descriptor,
+                            pointer=source.data_ptr(),
+                        ))
+                    try:
+                        param = model.layer.weight
+                        param.weight_loader(param, source, start)
+                    finally:
+                        if token is not None:
+                            loader._ACTIVE_RECOVERY_SOURCE.reset(token)
+
+            loader._load_weights_with_recovery_observer(
+                SimpleNamespace(), model, lambda: load_weights(observe=True),
+            )
+            expected = stable.clone()
+            samples = loader._capture_model_samples(torch, model, 256)
+            self.assertEqual(set(loader._partially_reloaded_destination_tensors(model)), {"layer.weight"})
+            original_materialize = layerwise.materialize_layer
+
+            def initialize_fresh_storage(layer, info):
+                # Make unwritten bytes deterministic instead of relying on
+                # torch.empty happening to reuse differently-valued memory.
+                fresh = getattr(getattr(layer, "weight", None), "is_meta", False)
+                result = original_materialize(layer, info)
+                if fresh:
+                    layer.weight.zero_()
+                return result
+
+            for preserve in (False, True):
+                with self.subTest(preserve=preserve):
+                    stable.copy_(expected)
+                    # Simulate native residual hydration: only checkpoint
+                    # destinations are discarded, never the unwritten gaps.
+                    for _, view in loader._model_weight_tensors(model):
+                        view.zero_()
+                    layerwise.record_metadata_for_reloading(model)
+                    disabled = nullcontext() if preserve else patch.object(
+                        loader, "_partially_reloaded_destination_tensors", return_value={},
+                    )
+                    with disabled, patch.object(layerwise, "materialize_layer", initialize_fresh_storage):
+                        with loader._recovery_reload_storage(model):
+                            layerwise.initialize_layerwise_reload(model)
+                            self.assertTrue(model.layer.weight.is_meta)
+                            load_weights()
+                            layerwise.finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.float32))
+                    torch.cuda.synchronize()
+                    self.assertIs(model.layer.weight, stable)
+                    self.assertEqual(stable.data_ptr(), pointer)
+                    mismatches = loader._compare_model_samples(torch, model, samples, 256)
+                    if preserve:
+                        self.assertEqual(mismatches, [])
+                        self.assertTrue(torch.equal(stable, expected))
+                    else:
+                        self.assertEqual(len(mismatches), 1)
+                        self.assertTrue(torch.all(stable[3] == 0))
+                        self.assertTrue(torch.all(stable[6:] == 0))
+            print({"real_layerwise_padding_overwrite_reproduced": True,
+                   "partial_parameter_padding_preserved": True,
+                   "execution_storage_preserved": True}, flush=True)
+
     def test_real_layerwise_reload_defers_model_finalizer(self):
         import torch
         from torch import nn

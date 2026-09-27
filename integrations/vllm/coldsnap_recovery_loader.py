@@ -870,6 +870,35 @@ def _model_weight_tensors(model: Any) -> list[tuple[str, Any]]:
     return tensors
 
 
+
+def _partially_reloaded_destination_tensors(model: Any) -> dict[str, Any]:
+    """Keep unwritten residual spans in place through vLLM materialization.
+
+    Layerwise reload otherwise allocates an empty replacement Parameter and
+    copies it back wholesale, overwriting padding preserved in the residual.
+    Partially loaded tensors still run every ordinary checkpoint loader; only
+    their materialization uses captured storage, as for direct replay.
+    """
+    plan = _model_checkpoint_copy_plan(model)
+    if plan is None:
+        return {}
+    copies_by_name: dict[str, list[RecoveryCopy]] = {}
+    for copy in plan.copies:
+        if copy.destination_name not in plan.unsupported_destinations:
+            copies_by_name.setdefault(copy.destination_name, []).append(copy)
+    partial: dict[str, Any] = {}
+    named_buffers = getattr(model, "named_buffers", lambda: ())
+    for named_tensors in (model.named_parameters, named_buffers):
+        for name, tensor in named_tensors():
+            copies = copies_by_name.get(name)
+            if not copies:
+                continue
+            views = _checkpoint_destination_views(name, tensor, copies)
+            if len(views) != 1 or views[0][0] != name:
+                partial[name] = tensor
+    return partial
+
+
 def _model_semantic_tensors(model: Any) -> list[tuple[str, Any]]:
     """Return all registered parameters plus backend-owned runtime state.
 
@@ -1822,7 +1851,8 @@ def _recovery_reload_storage(
     """Install per-backend source materializers around vLLM's normal reload."""
     adapters = _recovery_storage_adapters(model)
     residual_by_layer = _residual_tensor_names_by_layer(model)
-    if not adapters and not residual_by_layer and not prepare_preloaded:
+    partial_destinations = _partially_reloaded_destination_tensors(model)
+    if not adapters and not residual_by_layer and not partial_destinations and not prepare_preloaded:
         yield ()
         return
 
@@ -1897,11 +1927,12 @@ def _recovery_reload_storage(
                 for tensor_name in (owner[1],)
             )
 
-        def generic_preloaded_tensors(layer: Any) -> dict[str, Any]:
+        def generic_stable_tensors(layer: Any) -> dict[str, Any]:
             layer_id = id(layer)
+            stable_names = _RECOVERY_PRELOADED_DESTINATION_NAMES.get() | partial_destinations.keys()
             return {
                 owner[1]: owner[2]
-                for full_name in _RECOVERY_PRELOADED_DESTINATION_NAMES.get()
+                for full_name in stable_names
                 if full_name not in adapter_destination_names
                 and (owner := tensor_owners.get(full_name)) is not None
                 and owner[0] == layer_id
@@ -1932,7 +1963,7 @@ def _recovery_reload_storage(
             with _vllm_residual_tensor_skip(meta, residual_names(layer)):
                 if matches:
                     matches[0].materialize_layer(torch, info)
-                for tensor_name, stable_tensor in generic_preloaded_tensors(layer).items():
+                for tensor_name, stable_tensor in generic_stable_tensors(layer).items():
                     current = getattr(layer, tensor_name, None)
                     if current is None:
                         raise RuntimeError(

@@ -104,10 +104,12 @@ class CheckpointResourcesTest(unittest.TestCase):
         self.assertEqual(resource.calls, [("managed", "prepare"), ("managed", "restore")])
 
     def test_descriptor_guard_checks_each_process_and_ignores_vanished_fds(self):
-        with patch.object(Path, "iterdir", return_value=[Path("/proc/9/fd/12")]), patch.object(checkpoint.os, "readlink", return_value="anon_inode:[io_uring]"):
-            with self.assertRaisesRegex(checkpoint.CheckpointResourceError, "PID 9 fd 12"):
-                checkpoint.assert_no_io_uring([9])
-        with patch.object(Path, "iterdir", return_value=[Path("/proc/9/fd/12")]), patch.object(checkpoint.os, "readlink", side_effect=FileNotFoundError):
+        def entries(path):
+            return [path / "12"] if path.name == "fd" else []
+        with patch.object(Path, "iterdir", entries), patch.object(checkpoint.os, "readlink", return_value="anon_inode:[io_uring]"):
+            with self.assertRaisesRegex(checkpoint.CheckpointResourceError, "PID 9 fd 12, PID 10 fd 12"):
+                checkpoint.assert_no_io_uring([9, 10])
+        with patch.object(Path, "iterdir", entries), patch.object(checkpoint.os, "readlink", side_effect=FileNotFoundError):
             checkpoint.assert_no_io_uring([9])
         with patch.object(Path, "iterdir", side_effect=PermissionError("denied")):
             with self.assertRaisesRegex(checkpoint.CheckpointResourceError, "cannot inspect"):

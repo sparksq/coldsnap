@@ -5963,6 +5963,12 @@ def _install_worker_wake_hook() -> None:
                     + json.dumps(mismatches, separators=(",", ":"))
                 )
 
+        reclaimed = _reclaim_recovery_temporary_memory()
+        runtime_logger.info(
+            "ColdSnap recovery released %.2f GiB of unused CUDA allocator cache",
+            reclaimed / 1024**3,
+        )
+
     if callable(original_sleep):
 
         @functools.wraps(original_sleep)
@@ -6738,6 +6744,25 @@ def _capture_staging_iterator(iterator: Any) -> Iterator[Any]:
         import gc
 
         gc.collect()
+
+
+def _reclaim_recovery_temporary_memory() -> int:
+    """Release reload scratch before restoring KV cache and accepting requests.
+
+    Initialized recovery skips vLLM's startup cache cleanup. Layerwise reload
+    and quantization can leave several GiB of freed blocks reserved by the
+    ordinary CUDA allocator. Collection and synchronization retire temporary
+    owners and queued work; empty_cache releases only unused blocks, preserving
+    live model storage and graph-owned allocations at their existing addresses.
+    """
+    import gc
+    import torch
+
+    gc.collect()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_reserved()
+    torch.cuda.empty_cache()
+    return max(0, before - torch.cuda.memory_reserved())
 
 
 @contextmanager

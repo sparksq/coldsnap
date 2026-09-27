@@ -568,5 +568,47 @@ class Dsv4NativeRefreshGpuTests(unittest.TestCase):
                    "execution_storage_preserved": True}, flush=True)
 
 
+@unittest.skipUnless(os.environ.get("COLDSNAP_TEST_RECOVERY_MEMORY_GPU"), "CUDA vLLM image required")
+class RecoveryMemoryGpuTests(unittest.TestCase):
+    def test_reclaims_reload_cache_without_replacing_live_or_graph_storage(self):
+        import gc
+        import torch
+        from vllm.device_allocator.cumem import CuMemAllocator
+        from coldsnap_recovery_loader import _reclaim_recovery_temporary_memory
+
+        allocator = CuMemAllocator.get_instance()
+        with torch.no_grad():
+            with allocator.use_memory_pool(tag="weights"):
+                weight = torch.full((64 * 1024**2,), 3, dtype=torch.uint8, device="cuda")
+            pointers = set(allocator.pointer_to_data)
+            source = torch.ones(1024**2, device="cuda")
+            output = torch.empty_like(source)
+            graph = torch.cuda.CUDAGraph()
+            torch.cuda.synchronize()
+            with torch.cuda.graph(graph):
+                torch.mul(source, 2, out=output)
+            addresses = (weight.data_ptr(), source.data_ptr(), output.data_ptr())
+            scratch = torch.empty(256 * 1024**2, dtype=torch.uint8, device="cuda")
+            scratch.fill_(7)
+            cycle = [scratch]
+            cycle.append(cycle)
+            del scratch, cycle
+            gc.collect()
+            torch.cuda.synchronize()
+            unused = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            self.assertGreaterEqual(unused, 256 * 1024**2)
+            reclaimed = _reclaim_recovery_temporary_memory()
+            self.assertGreaterEqual(reclaimed, 256 * 1024**2)
+            self.assertEqual(set(allocator.pointer_to_data), pointers)
+            self.assertEqual((weight.data_ptr(), source.data_ptr(), output.data_ptr()), addresses)
+            self.assertTrue(bool(torch.all(weight == 3)))
+            source.fill_(5)
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(bool(torch.all(output == 10)))
+            print({"reclaimed_bytes": reclaimed, "live_weight_storage_preserved": True,
+                   "graph_storage_and_replay_preserved": True}, flush=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

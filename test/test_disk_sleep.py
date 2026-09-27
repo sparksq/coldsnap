@@ -5298,7 +5298,8 @@ class DiskSleepIoTest(unittest.TestCase):
 
             def wake_up(self, tags=None):
                 events.append(("wake", tags))
-                self.backend.callback()
+                if self.backend.callback is not None:
+                    self.backend.callback()
                 return "awake"
 
         default_module = ModuleType("vllm.model_executor.model_loader.default_loader")
@@ -5333,6 +5334,10 @@ class DiskSleepIoTest(unittest.TestCase):
                 {"COLDSNAP_RECOVERY_WEIGHT_SOURCE": "safetensors"},
                 clear=True,
             ),
+            patch.object(
+                recovery_loader, "_reclaim_recovery_temporary_memory",
+                side_effect=lambda: events.append("reclaim") or 256,
+            ),
         ):
             install_recovery_aware_loader()
             loader = registered[RECOVERY_LOAD_FORMAT]()
@@ -5348,12 +5353,16 @@ class DiskSleepIoTest(unittest.TestCase):
             loader._get_weights_iterator(source)
             worker = Worker()
             self.assertEqual(worker.wake_up(["weights"]), "awake")
+            self.assertEqual(worker.wake_up(["kv_cache"]), "awake")
+            worker.backend.uses_model_weight_recovery = False
+            self.assertEqual(worker.wake_up(["weights"]), "awake")
 
         self.assertEqual(events[0], ("prepare-format", "safetensors"))
         self.assertEqual(loader.load_config.load_format, RECOVERY_LOAD_FORMAT)
         self.assertEqual(
             events[1:],
-            [("callback", True), ("wake", ["weights"]), "reload", ("callback", False)],
+            [("callback", True), ("wake", ["weights"]), "reload", "reclaim", ("callback", False),
+             ("wake", ["kv_cache"]), ("wake", ["weights"])],
         )
 
         checkpoint_parameter = SimpleNamespace()

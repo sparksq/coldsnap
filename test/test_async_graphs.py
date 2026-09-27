@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import sys
+import os
 import json
 import tempfile
 import unittest
@@ -381,6 +382,102 @@ class AsyncGraphCaptureTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_initialized_restore_refreshes_generation_and_respects_graph_policy(self) -> None:
+        for policy in ("recreate-from-plan", "preserve-nccl-exec"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                ready = root / "graphs.json"
+                arm = root / "graphs.arm"
+                handoff = root / "restore-runtime-environment.json"
+                events = []
+                phase = "ready" if policy == "recreate-from-plan" else "retained_ready"
+
+                class Executor:
+                    def collective_rpc(self, method, args=(), events=events):
+                        nonlocal phase
+                        if method == "coldsnap_prepare_cuda_graph_retry":
+                            events.append("gate")
+                            phase = "eager"
+                        elif method == "coldsnap_capture_cuda_graphs":
+                            events.append("capture")
+                            phase = "ready"
+                        elif method != "coldsnap_async_graph_status":
+                            raise AssertionError(method)
+                        return [{"phase": phase}]
+
+                class EngineCoreProc:
+                    def __init__(self, initial_phase=phase):
+                        self.scheduler = SimpleNamespace(has_requests=lambda: False)
+                        self.batch_queue = None
+                        self.input_queue = SimpleNamespace(empty=lambda: True)
+                        self.model_executor = Executor()
+                        self._coldsnap_async_graph_phase = initial_phase
+                        self._coldsnap_async_graph_eager_steps = 100
+                        self._coldsnap_async_graph_step_timings = [{"index": 99}]
+
+                    def wake_up(self, tags=None, events=events):
+                        events.append("wake")
+                        return "awake"
+
+                    def _process_engine_step(self):
+                        return True
+
+                settings = async_graphs.AsyncGraphSettings(
+                    True, str(ready), "capture-generation", str(arm), policy,
+                )
+                async_graphs._install_engine_hook(
+                    settings, SimpleNamespace(EngineCoreProc=EngineCoreProc),
+                )
+                engine = EngineCoreProc()
+                environment = {
+                    "COLDSNAP_EXPECTED_UNIT": "unit-0",
+                    "COLDSNAP_HIBERNATE_STATE_DIR": str(root / "hibernate-states"),
+                    "COLDSNAP_RESTORE_RUNTIME_ENVIRONMENT_PATH": str(handoff),
+                }
+                with patch.dict(os.environ, environment, clear=True):
+                    # A normal sleep/wake before checkpointing is unchanged.
+                    self.assertEqual(engine.wake_up(), "awake")
+                    self.assertEqual(events, ["wake"])
+                    self.assertFalse(ready.exists())
+                    events.clear()
+                    handoff.write_text(json.dumps({
+                        "format": 1,
+                        "kind": "coldsnap-restore-runtime-environment",
+                        "unit": "unit-0",
+                        "variables": {
+                            "COLDSNAP_ASYNC_CUDA_GRAPHS": "1",
+                            "COLDSNAP_ASYNC_CUDA_GRAPHS_READY_FILE": str(ready),
+                            "COLDSNAP_ASYNC_CUDA_GRAPHS_ARM_FILE": str(arm),
+                            "COLDSNAP_ASYNC_CUDA_GRAPHS_GENERATION": "restore-generation",
+                            "COLDSNAP_GRAPH_POLICY": policy,
+                            "COLDSNAP_SHAPE_CALIBRATION": "0",
+                        },
+                    }))
+                    self.assertEqual(engine.wake_up(), "awake")
+                    payload = json.loads(ready.read_text())
+                    self.assertEqual(payload["generation"], "restore-generation")
+                    self.assertEqual(payload["eager_steps"], 0)
+                    self.assertEqual(payload["eager_step_timings"], [])
+                    self.assertEqual(os.environ["COLDSNAP_SHAPE_CALIBRATION"], "0")
+                    engine._process_engine_step()
+                    self.assertNotIn("capture", events)
+                    if policy == "recreate-from-plan":
+                        self.assertEqual(events, ["gate", "wake"])
+                        self.assertEqual(payload["phase"], "eager")
+                        arm.touch()
+                        engine._process_engine_step()
+                        payload = json.loads(ready.read_text())
+                        self.assertEqual(payload["generation"], "restore-generation")
+                        self.assertEqual(payload["phase"], "ready")
+                        self.assertEqual(events, ["gate", "wake", "capture"])
+                    else:
+                        self.assertEqual(events, ["wake"])
+                        self.assertEqual(payload["phase"], "retained_ready")
+                    # Repeated wakes in the same activation do not reset graphs.
+                    prior = list(events)
+                    engine.wake_up()
+                    self.assertEqual(events, prior + ["wake"])
 
     def test_worker_failure_rolls_every_rank_back_to_eager(self) -> None:
         events: list[object] = []

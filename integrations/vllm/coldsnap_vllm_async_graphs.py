@@ -230,7 +230,11 @@ def _worker_status(worker: Any) -> dict[str, Any]:
     effective = os.environ.get("COLDSNAP_GRAPH_POLICY", "recreate-from-plan")
     decision = "requested_policy_is_supported"
     if requested == "preserve-nccl-exec":
-        decision = "experimental_exact_nccl_in_place"
+        decision = (
+            "experimental_exact_nccl_in_place"
+            if effective == "preserve-nccl-exec"
+            else "graph_exec_preservation_is_unqualified"
+        )
     elif requested == "preserve-exec":
         decision = (
             "provider_reconstructs_communicator"
@@ -728,6 +732,36 @@ def _maybe_capture_after_step(
     logger.info("All CUDA graph workers transitioned from eager to replay mode")
 
 
+def _prepare_initialized_graph_restore(
+    engine: Any, initial: AsyncGraphSettings,
+) -> AsyncGraphSettings | None:
+    from coldsnap_vllm_process_template import apply_initialized_restore_runtime_environment
+
+    variables = apply_initialized_restore_runtime_environment()
+    if variables is None:
+        return None
+    current = getattr(engine, "_coldsnap_async_graph_settings", initial)
+    restored = async_graph_settings_from_env()
+    if not restored.generation or restored.generation == current.generation:
+        return None
+    if not restored.enabled or restored.policy != current.policy:
+        raise VllmContractError("initialized restore cannot change the captured graph policy")
+    if restored.policy == "recreate-from-plan":
+        # Gate dispatch before weights/KV wake. Recreate executables through
+        # the normal scheduler-idle path after the first eager request.
+        statuses = engine.model_executor.collective_rpc("coldsnap_prepare_cuda_graph_retry")
+        if not statuses or any(status.get("phase") != "eager" for status in statuses):
+            raise VllmContractError("initialized restore failed to gate every graph worker")
+        engine._coldsnap_async_graph_phase = "eager"
+        engine._coldsnap_async_graph_statuses = statuses
+    engine._coldsnap_async_graph_settings = restored
+    engine._coldsnap_async_graph_error = ""
+    engine._coldsnap_async_graph_eager_steps = 0
+    engine._coldsnap_async_graph_retries = 0
+    engine._coldsnap_async_graph_step_timings = []
+    return restored
+
+
 def _install_engine_hook(settings: AsyncGraphSettings, module: Any | None = None) -> None:
     module = module or importlib.import_module(_ENGINE_MODULE)
     engine_class = getattr(module, "EngineCoreProc", None)
@@ -741,7 +775,8 @@ def _install_engine_hook(settings: AsyncGraphSettings, module: Any | None = None
 
     @functools.wraps(original)
     def process_step_then_capture(engine: Any, *args: Any, **kwargs: Any) -> bool:
-        if not settings.enabled:
+        current_settings = getattr(engine, "_coldsnap_async_graph_settings", settings)
+        if not current_settings.enabled:
             return bool(original(engine, *args, **kwargs))
         started_ns = time.time_ns()
         started = time.perf_counter()
@@ -762,11 +797,23 @@ def _install_engine_hook(settings: AsyncGraphSettings, module: Any | None = None
                         "wall_seconds": wall_seconds,
                     }
                 )
-        _maybe_capture_after_step(engine, model_executed, settings)
+        _maybe_capture_after_step(engine, model_executed, current_settings)
         return model_executed
 
     setattr(process_step_then_capture, _ENGINE_MARKER, True)
     engine_class._process_engine_step = process_step_then_capture
+    original_wake = getattr(engine_class, "wake_up", None)
+    if callable(original_wake):
+        @functools.wraps(original_wake)
+        def wake_with_restore_policy(engine: Any, *args: Any, **kwargs: Any) -> Any:
+            restored = _prepare_initialized_graph_restore(engine, settings)
+            result = original_wake(engine, *args, **kwargs)
+            if restored is not None:
+                statuses = engine.model_executor.collective_rpc("coldsnap_async_graph_status")
+                _publish_engine_status(engine, restored, statuses)
+            return result
+
+        engine_class.wake_up = wake_with_restore_policy
 
 
 def install_async_graph_capture_hooks(

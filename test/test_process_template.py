@@ -201,6 +201,39 @@ class ProcessTemplateTest(unittest.TestCase):
             ):
                 process_template._restored_runtime_environment(settings)
 
+    def test_initialized_runtime_handoff_rejects_wrong_unit_symlink_and_unknown_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / process_template.RESTORE_RUNTIME_ENVIRONMENT_FILENAME
+            payload = {
+                "format": 1,
+                "kind": "coldsnap-restore-runtime-environment",
+                "unit": "unit-other",
+                "variables": {"COLDSNAP_SHAPE_CALIBRATION": "0"},
+            }
+            environment = {
+                "COLDSNAP_EXPECTED_UNIT": "unit-0",
+                "COLDSNAP_HIBERNATE_STATE_DIR": str(root / "hibernate-states"),
+                process_template.RESTORE_RUNTIME_ENVIRONMENT_PATH_ENV: str(path),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                self.assertIsNone(process_template.apply_initialized_restore_runtime_environment())
+                path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(process_template.VllmContractError, "invalid"):
+                    process_template.apply_initialized_restore_runtime_environment()
+                payload["unit"] = "unit-0"
+                payload["variables"] = {"UNKNOWN_RUNTIME_VARIABLE": "invalid"}
+                path.write_text(json.dumps(payload))
+                with self.assertRaisesRegex(process_template.VllmContractError, "invalid variable"):
+                    process_template.apply_initialized_restore_runtime_environment()
+                payload["variables"] = {"COLDSNAP_SHAPE_CALIBRATION": "0"}
+                path.write_text(json.dumps(payload))
+                real = root / "handoff.json"
+                path.rename(real)
+                path.symlink_to(real)
+                with self.assertRaisesRegex(process_template.VllmContractError, "regular file"):
+                    process_template.apply_initialized_restore_runtime_environment()
+
     def test_restored_worker_uses_controller_staged_rendezvous_placement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

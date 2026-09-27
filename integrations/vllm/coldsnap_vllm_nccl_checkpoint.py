@@ -706,6 +706,9 @@ def _wrap_worker_method(original: Callable[..., Any], operation: str) -> Callabl
                 "checkpoint_prepare_total_seconds": time.perf_counter() - total_started,
             }
         transport_environment = _apply_restore_transport_environment()
+        from coldsnap_vllm_process_template import apply_initialized_restore_runtime_environment
+
+        apply_initialized_restore_runtime_environment()
         total_started = time.perf_counter()
         result = _runtime().restore()
         phase_started = time.perf_counter()

@@ -202,6 +202,10 @@ def _restored_runtime_environment(
         raise VllmContractError("portable restore has no runtime environment handoff")
     path = Path(raw_path)
     expected = settings.restore_marker_file.parent / RESTORE_RUNTIME_ENVIRONMENT_FILENAME
+    return _read_restore_runtime_environment(path, expected)
+
+
+def _read_restore_runtime_environment(path: Path, expected: Path) -> dict[str, str]:
     if path != expected:
         raise VllmContractError("restore runtime environment path is outside the capsule")
     try:
@@ -238,6 +242,34 @@ def _restored_runtime_environment(
             "restore runtime environment contains an invalid variable"
         )
     return dict(variables)
+
+
+def apply_initialized_restore_runtime_environment() -> dict[str, str] | None:
+    """Adopt the controller handoff when waking an initialized checkpoint.
+
+    Unlike a process template, n610 resumes existing engine and worker objects
+    without running their constructors or exec-time environment handoff again.
+    Ordinary sleep/wake before a restore has no handoff file and is unchanged.
+    """
+    raw_path = os.environ.get(RESTORE_RUNTIME_ENVIRONMENT_PATH_ENV)
+    if not raw_path:
+        return None
+    state_dir = os.environ.get("COLDSNAP_HIBERNATE_STATE_DIR")
+    if not state_dir:
+        raise VllmContractError("initialized restore has no capsule state directory")
+    path = Path(raw_path)
+    expected = Path(state_dir).parent / RESTORE_RUNTIME_ENVIRONMENT_FILENAME
+    if path != expected:
+        raise VllmContractError("restore runtime environment path is outside the capsule")
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    variables = _read_restore_runtime_environment(path, expected)
+    for name in _RESTORE_RUNTIME_ENVIRONMENT_NAMES:
+        os.environ.pop(name, None)
+    os.environ.update(variables)
+    return variables
 
 
 def _apply_restored_runtime_environment(

@@ -385,12 +385,18 @@ class NcclCheckpointRuntimeTest(unittest.TestCase):
         def original_restore(_worker):
             calls.append("vllm-restore")
 
-        with mock.patch.object(checkpoint, "_runtime", return_value=runtime):
+        with (
+            mock.patch.object(checkpoint, "_runtime", return_value=runtime),
+            mock.patch(
+                "coldsnap_vllm_process_template.apply_initialized_restore_runtime_environment",
+                side_effect=lambda: calls.append("runtime-environment"),
+            ),
+        ):
             prepared = checkpoint._wrap_worker_method(original_prepare, "prepare")(object())
             restored = checkpoint._wrap_worker_method(original_restore, "restore")(object())
         self.assertEqual(
             calls,
-            ["vllm-prepare", "nccl-prepare", "nccl-restore", "vllm-restore"],
+            ["vllm-prepare", "nccl-prepare", "runtime-environment", "nccl-restore", "vllm-restore"],
         )
         self.assertGreaterEqual(prepared["engine_checkpoint_prepare_seconds"], 0)
         self.assertGreaterEqual(prepared["checkpoint_prepare_total_seconds"], 0)

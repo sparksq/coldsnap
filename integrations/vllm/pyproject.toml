@@ -8,19 +8,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coldsnap-vllm"
-version = "0.5.11"
+version = "0.5.12"
 description = "ColdSnap checkpoint, hydration, and memory lifecycle plugin for vLLM"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-dependencies = ["coldsnap-core==0.3.29"]
+dependencies = ["coldsnap-core==0.3.30"]
 
 [project.entry-points."vllm.general_plugins"]
 coldsnap = "coldsnap_plugin:register"
 
 [tool.setuptools]
 py-modules = [
+  "coldsnap_b12x_native_state",
   "coldsnap_cache_bootstrap",
   "coldsnap_cuda_epoch",
   "coldsnap_disk_backend",

@@ -12,17 +12,17 @@ members = [
 
 [[package]]
 name = "coldsnap-core"
-version = "0.3.30"
+version = "0.3.31"
 source = { editable = "integrations/core" }
 
 [[package]]
 name = "coldsnap-development"
-version = "0.3.30"
+version = "0.3.31"
 source = { virtual = "." }
 
 [[package]]
 name = "coldsnap-sglang"
-version = "0.3.4"
+version = "0.3.5"
 source = { editable = "integrations/sglang" }
 dependencies = [
     { name = "coldsnap-core" },
@@ -33,7 +33,7 @@ requires-dist = [{ name = "coldsnap-core", editable = "integrations/core" }]
 
 [[package]]
 name = "coldsnap-vllm"
-version = "0.5.12"
+version = "0.5.13"
 source = { editable = "integrations/vllm" }
 dependencies = [
     { name = "coldsnap-core" },

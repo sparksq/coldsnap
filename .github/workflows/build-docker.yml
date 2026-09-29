@@ -45,7 +45,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ inputs.release_tag || github.ref_name }}
           persist-credentials: false
@@ -78,7 +78,7 @@ jobs:
       matrix:
         module: ['.', 'cmd/coldsnap-criu-rpc']
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release-version.outputs.commit }}
           persist-credentials: false
@@ -109,10 +109,10 @@ jobs:
     steps:
       # The verifier comes from this workflow revision, while every Docker
       # build input and embedded identity comes from the immutable release.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.release-version.outputs.commit }}
           path: release-source
@@ -191,7 +191,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: actions/download-artifact@v8

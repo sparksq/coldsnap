@@ -34,7 +34,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Native controller tests and cancellation cleanup
         env:
           TMPDIR: /tmp

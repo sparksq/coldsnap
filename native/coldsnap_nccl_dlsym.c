@@ -62,6 +62,15 @@ void *dlsym(void *handle, const char *name) {
       void *shim = dlopen(path, RTLD_NOW | RTLD_NOLOAD);
       if (shim != NULL) {
         void *interposed = next(shim, name);
+        dlclose(shim);
+        if (interposed == NULL) {
+          /* APIs without synthetic handles (for example ncclGetVersion and
+           * ncclMemAlloc) are not exported by the checkpoint shim. Resolve
+           * them from the selected preloaded runtime before the private
+           * library, so one process does not mix provider and base versions.
+           * The admitted preload order is bridge, shim, then runtime. */
+          interposed = next(RTLD_NEXT, name);
+        }
         if (interposed != NULL) {
           atomic_fetch_or(&route_mask, route_bit(name));
           atomic_fetch_add(&route_count, 1U);

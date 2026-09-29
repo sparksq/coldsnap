@@ -1,0 +1,125 @@
+{
+  "format": 2,
+  "kind": "coldsnap-nccl-provider-recipe",
+  "provider_id": "nccl-2.32.3-1+coldsnap.2",
+  "provider_revision": 2,
+  "nccl_release": "2.32.3",
+  "nccl_version_code": 23203,
+  "provider_abi": {
+    "major": 1,
+    "minor": 0
+  },
+  "checkpoint_abi": 100,
+  "dlsym_bridge_abi": 1,
+  "capabilities": [
+    "communicator-suspend-in-place",
+    "communicator-unwrap",
+    "coordinator-protocol-v1",
+    "cuda-graph",
+    "full-network-reset",
+    "graph-resource-retention",
+    "ib-roce-device-release",
+    "private-dlopen-routing",
+    "ras-reset",
+    "registration-window-replay",
+    "split-shrink-grow-replay",
+    "synchronous-termination",
+    "transport-detach-in-place"
+  ],
+  "limitations": [
+    "distinct-process-local-proxy-state-per-communicator",
+    "exported-device-resources-unsupported",
+    "gin-rma-cft-state-unsupported",
+    "in-place-copy-engine-unsupported",
+    "in-place-nvls-unsupported",
+    "in-place-registration-window-unsupported"
+  ],
+  "builder": {
+    "provider_dockerfile": "deploy/nccl/Dockerfile.provider",
+    "payload_dockerfile": "deploy/nccl/Dockerfile.payload",
+    "payload_repository": "docker.io/scitrera/coldsnap-nccl",
+    "payload_build_image": "docker.io/nvidia/cuda@sha256:7d2f6a8c2071d911524f95061a0db363e24d27aa51ec831fcccf9e76eb72bc92",
+    "payload_platforms": [
+      "linux/amd64",
+      "linux/arm64"
+    ],
+    "base_image_policy": "digest-pinned-multiarch-payload-and-target-images",
+    "mutable_tags_allowed": false
+  },
+  "inputs": {
+    "source_lock": "native/nccl/releases/2.32.3-1/source.lock",
+    "provider_header": "native/nccl/abi/coldsnap_nccl_provider.h",
+    "provider_source": "native/nccl/releases/2.32.3-1/coldsnap_provider.cc",
+    "patches": [
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0001-checkpoint-ib-reset.patch",
+        "sha256": "a3d90637a7a223606f0d97c0cc50b0994e6c655a25a9b3d56258bd61140bb690"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0002-checkpoint-termination.patch",
+        "sha256": "79a6783b441f0c93797fe5c3a131c5e69c48f04abf64fd00e7ba1c9f54c8dff4"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0003-provider-abi.patch",
+        "sha256": "9e53e455507fc5a3b41a24ec5eb68b129a5fe648d74c3ed956bd86fb26b639ab"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0004-build-in-place-provider.patch",
+        "sha256": "f38963a108e806204c8a6f4d81bb9f20e43000d2fa6aa8d10bbef164861f7588"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0005-exact-nccl-net-reattach.patch",
+        "sha256": "1776b606e8b12067f36e61314f12eeae08fbe9167895875bdf46a9900a38e050"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0006-exact-nccl-control-reattach.patch",
+        "sha256": "b1f50ee36f8661422ef31f55382eff5528e55b7f37c4fa41ee735a8370d98b12"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0007-checkpoint-resource-preflight.patch",
+        "sha256": "3dbc899dfb4cf664d51f0836ccb663beb58ff294b1f0c3061d83214e649e80c3"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0008-checkpoint-progress-ras.patch",
+        "sha256": "93a491067bc14a65e1add1e38ed08ec263357a778f464c9606df35e6d2352479"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0009-checkpoint-idle-plugins.patch",
+        "sha256": "39af84fa9da90f760699e1c0e2cda17521669bd6fa72f03857ebeac3f000e758"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0010-checkpoint-ib-capability-cache.patch",
+        "sha256": "317ec747fcdbafc64abef73645fde508f7c388a7fe89ff7f73f6171655fae9e2"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0011-checkpoint-window-bookkeeping.patch",
+        "sha256": "6beaadac101e13901836573e3b7b6dbe4f22be74621603efd2cf83a923197821"
+      },
+      {
+        "path": "native/nccl/releases/2.32.3-1/patches/0012-checkpoint-tls-lifecycle.patch",
+        "sha256": "c57566716f4f7dd84416a0004be6449321aef7f6bbcaad8eb8c5ae680e2cb844"
+      }
+    ]
+  },
+  "build": {
+    "nccl_build_jobs_argument": "NCCL_BUILD_JOBS",
+    "nvcc_gencode_argument": "NCCL_NVCC_GENCODE",
+    "nvcc_gencode": "-gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_100,code=sm_100 -gencode=arch=compute_110,code=sm_110 -gencode=arch=compute_120,code=sm_120 -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_120,code=compute_120",
+    "use_reproducible_nvcc": true,
+    "strip_unneeded": true,
+    "verify_compiled_and_loaded_version": true,
+    "tls_backend": "OPENSSL3"
+  },
+  "outputs": [
+    {
+      "path": "lib/libnccl.so.2.32.3",
+      "role": "nccl-runtime",
+      "soname": "libnccl.so.2"
+    },
+    {
+      "path": "lib/libnccl-checkpoint-shim.so",
+      "role": "checkpoint-shim",
+      "soname": "libnccl-checkpoint-shim.so"
+    }
+  ]
+}

@@ -129,6 +129,7 @@ jobs:
           NCCL_NVCC_GENCODE: ${{ matrix.nvcc_gencode }}
           NCCL_REPRODUCIBLE_NVCC: ${{ matrix.reproducible_nvcc }}
           NCCL_STRIP_OUTPUTS: ${{ matrix.strip_outputs }}
+          NCCL_TLS_BACKEND: ${{ matrix.tls_backend }}
           NCCL_VERSION_CODE: ${{ matrix.nccl_version_code }}
           PAYLOAD_DOCKERFILE: ${{ matrix.payload_dockerfile }}
           PLATFORM: ${{ matrix.platform }}
@@ -151,6 +152,7 @@ jobs:
             --build-arg "NCCL_NVCC_GENCODE=${NCCL_NVCC_GENCODE}" \
             --build-arg "NCCL_REPRODUCIBLE_NVCC=${NCCL_REPRODUCIBLE_NVCC}" \
             --build-arg "NCCL_STRIP_OUTPUTS=${NCCL_STRIP_OUTPUTS}" \
+            --build-arg "NCCL_TLS_BACKEND=${NCCL_TLS_BACKEND}" \
             --build-arg "COLDSNAP_NCCL_PROVIDER_ID=${COLDSNAP_NCCL_PROVIDER_ID}" \
             --build-arg "COLDSNAP_SOURCE_REVISION=${GITHUB_SHA}" \
             --cache-from "type=gha,scope=nccl-${RELEASE}-${ARCH}" \

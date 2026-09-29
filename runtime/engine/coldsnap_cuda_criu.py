@@ -274,7 +274,7 @@ def _criu_rpc_command(
                 "--cuda-process-tree",
                 "--tcp-established",
                 "--ghost-limit",
-                str(64 * 1024**2),
+                str(128 * 1024**2),
             ]
         )
         if action == "dump":

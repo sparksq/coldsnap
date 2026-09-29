@@ -24,6 +24,13 @@ and is archived outside the public source tree. Current locked releases,
 capability admission records, and provider-selection tests remain under
 `native/nccl/` and `test/`.
 
+The `2.32.3-1` source recipe builds provider `nccl-2.32.3-1+coldsnap.2`.
+Its production admission accepts the declared reconstruction and in-place
+capabilities. ARM64 GPU/CRIU and x86 build/ABI evidence are recorded separately;
+active GIN/RMA, CFT/NVLS, and in-place window/CE resources remain gated. See the
+[release review](../../native/nccl/releases/2.32.3-1/source-diff.md) for the
+port changes and validation limits. The examples below use an admitted release.
+
 The repository-owned `publish-nccl.yml` workflow builds native `linux/amd64`
 and `linux/arm64` payloads and publishes one OCI index. An operator explicitly
 dispatches one named release (or `all`) after configuring `DOCKERHUB_USERNAME`
@@ -89,10 +96,26 @@ and enforced thereafter. They are integrity metadata, not historical
 qualification gates.
 
 The scratch payload image carries `/README.md`, ColdSnap's license and
-third-party notices, NVIDIA NCCL's separate BSD-3-Clause license, and the
-ColdSnap source/build inputs needed to reconstruct the patched payload under
+third-party notices, NVIDIA NCCL's Apache-2.0 and BSD-3-Clause license texts,
+and the ColdSnap source/build inputs needed to reconstruct the patched payload under
 `/source/coldsnap`. OCI labels identify the provider, source revision, target
 platform, exact CUDA `NVCC_GENCODE` set, and aggregate license expression.
 Managers must verify that `io.sparksq.coldsnap.cuda.gencode` contains the
 target GPU's `sm_*` code before assembly. A missing or incompatible label is a
 payload miss and should use the locked target-architecture local build.
+
+### NCCL 2.32 encrypted sockets
+
+The 2.32.3-1 recipe selects `OPENSSL3`. Payload builds must pass
+`--build-arg NCCL_TLS_BACKEND=OPENSSL3`; the Dockerfile verifies the argument
+against the selected recipe. The release planner and publication workflow carry
+this setting automatically. Older recipes use an empty backend argument.
+Builds install OpenSSL 3 headers, and target images must already contain
+`libcrypto.so.3` and `libssl.so.3`. Provider assembly checks those dependencies.
+
+The compiled backend enables the NCCL encryption API; applications still call
+`ncclSetEncryption` with their configuration before opening communicators.
+Checkpoint reset preserves that configuration, closes all SSL state, and requires
+fresh entropy before reconnection. No keys are included in payloads or build
+arguments. See [capability support](../../docs/nccl-capability-support.md) for
+qualification boundaries and the separate hardware-dependent resource gates.

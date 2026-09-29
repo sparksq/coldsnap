@@ -31,6 +31,7 @@ LICENSE_OVERRIDES = {
 EXCLUDED_PREFIXES = (
     "native/nccl/releases/2.30.7-1/patches/",
     "native/nccl/releases/2.31.2-1/patches/",
+    "native/nccl/releases/2.32.3-1/patches/",
     "third_party/licenses/",
 )
 EXCLUDED_PATHS = {

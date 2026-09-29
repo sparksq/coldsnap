@@ -114,6 +114,38 @@ class _InPlaceProvider(ctypes.Structure):
     ]
 
 
+_ResourceInspect = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_uint32)
+
+
+class _ResourceProvider(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("abi_major", ctypes.c_uint32),
+        ("abi_minor", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("inspect", _ResourceInspect),
+        ("evidence_json", _InPlaceEvidence),
+    ]
+
+
+def _query_resources(library: Any) -> _ResourceProvider | None:
+    query = getattr(library, "coldsnapNcclResourcesQuery", None)
+    if query is None:
+        return None
+    query.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.POINTER(_ResourceProvider))]
+    query.restype = ctypes.c_int32
+    pointer = ctypes.POINTER(_ResourceProvider)()
+    result = query(1, ctypes.byref(pointer))
+    if result != 0:
+        raise RuntimeError(f"coldsnapNcclResourcesQuery failed with ncclResult_t={result}")
+    if not pointer or pointer.contents.struct_size < ctypes.sizeof(_ResourceProvider):
+        raise RuntimeError("NCCL resource provider ABI is truncated")
+    table = pointer.contents
+    if table.abi_major != 1 or not table.inspect or not table.evidence_json:
+        raise RuntimeError("NCCL resource provider ABI is incompatible or incomplete")
+    return table
+
+
 class _NCCLCheckpoint:
     def __init__(
         self,
@@ -123,6 +155,7 @@ class _NCCLCheckpoint:
         in_place_provider: bool = False,
     ) -> None:
         library = ctypes.CDLL(None)
+        self._resources = _query_resources(library)
         self._prepare = library.ncclCheckpointPrepare
         self._prepare.argtypes = []
         self._prepare.restype = ctypes.c_int
@@ -186,6 +219,7 @@ class _NCCLCheckpoint:
             "ib_reset": self._ib_reset is not None,
             "network_reset": native_network_reset is not None,
             "in_place_provider": in_place_provider,
+            "resource_inventory": self._resources is not None,
         }
 
     def _in_place_evidence(self) -> dict[str, Any]:
@@ -199,12 +233,31 @@ class _NCCLCheckpoint:
             raise RuntimeError("NCCL in-place provider evidence is not an object")
         return value
 
+    def _record_resources(self, phase: str) -> None:
+        if self._resources is None:
+            return
+        mode = "in-place" if self._in_place is not None else "recreate"
+        result = self._resources.inspect(int(self._in_place is not None))
+        raw = self._resources.evidence_json()
+        if not raw:
+            raise RuntimeError("NCCL resource inspection returned no evidence")
+        value = json.loads(raw.decode("utf-8"))
+        if not isinstance(value, dict):
+            raise RuntimeError("NCCL resource evidence is not an object")
+        self.version[f"{phase}_resources"] = value
+        if (value.get("format") != 1 or value.get("kind") != "coldsnap-nccl-resource-inventory"
+                or value.get("mode") != mode or value.get("complete") is not True
+                or value.get("admitted") is not True or not isinstance(value.get("communicators"), list)):
+            raise RuntimeError(f"NCCL resource inspection did not admit {mode}: {value!r}")
+        self._check(result, "NCCL resource inspection")
+
     @staticmethod
     def _check(result: int, operation: str) -> None:
         if result != 0:
             raise RuntimeError(f"{operation} failed with ncclResult_t={result}")
 
     def prepare(self) -> None:
+        self._record_resources("prepare")
         if self._in_place is not None:
             self._check(self._in_place.communicator_suspend(), "ncclCommSuspend/in-place")
             self._check(self._in_place.transport_detach(), "NCCL in-place transport detach")
@@ -219,8 +272,9 @@ class _NCCLCheckpoint:
             self._check(self._in_place.transport_reattach(), "NCCL in-place transport reattach")
             self._check(self._in_place.communicator_resume(), "ncclCommResume/in-place")
             self.version["restore_evidence"] = self._in_place_evidence()
-            return
-        self._check(self._restore(), "ncclCheckpointRestore")
+        else:
+            self._check(self._restore(), "ncclCheckpointRestore")
+        self._record_resources("restore")
 
 
 def _coordinator_store(dist: Any, endpoint_path: Path, namespace: str, timeout: float) -> Any:
@@ -477,6 +531,7 @@ def main() -> int:
                         "NCCL_IB_HCA",
                         "NCCL_IB_RELEASE_ON_FINALIZE",
                         "NCCL_RAS_ENABLE",
+                        "NCCL_PROGRESS_COUNTERS",
                         "NCCL_SOCKET_IFNAME",
                     )
                 },
@@ -537,6 +592,10 @@ def main() -> int:
             last_sequence = sequence
             if operation == "shutdown":
                 break
+        # NCCL destruction waits for graph-held communicator references to drain.
+        torch.cuda.synchronize()
+        if captured_collective is not None:
+            captured_collective.graph.reset()
         dist.destroy_process_group()
         return 0
     except BaseException as error:

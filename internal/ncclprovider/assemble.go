@@ -76,6 +76,7 @@ type recipePatch struct {
 }
 
 type recipeBuild struct {
+	TLSBackend                     string `json:"tls_backend,omitempty"`
 	NCCLBuildJobsArgument          string `json:"nccl_build_jobs_argument"`
 	NVCCGencodeArgument            string `json:"nvcc_gencode_argument"`
 	NVCCGencode                    string `json:"nvcc_gencode"`
@@ -370,6 +371,9 @@ func validateAssemblyMetadata(recipe providerRecipe, qualification qualification
 		filepath.Clean(recipe.Builder.ProviderDockerfile) == recipe.Builder.ProviderDockerfile &&
 		filepath.Clean(recipe.Builder.PayloadDockerfile) == recipe.Builder.PayloadDockerfile
 	validPlatforms := slices.Equal(recipe.Builder.PayloadPlatforms, []string{"linux/amd64", "linux/arm64"})
+	if recipe.Build.TLSBackend != "" && (recipe.Build.TLSBackend != "OPENSSL3" || recipe.NCCLVersionCode < 23203) {
+		return errors.New("NCCL provider recipe TLS backend is unsupported")
+	}
 	if len(recipe.Outputs) != 2 || len(recipe.Inputs.Patches) == 0 || recipe.Build.UseReproducibleNVCC == nil || recipe.Build.StripUnneeded == nil || !nvccGencodePattern.MatchString(recipe.Build.NVCCGencode) || !recipe.Build.VerifyCompiledAndLoadedVersion || recipe.Builder.MutableTagsAllowed || recipe.Builder.BaseImagePolicy != "digest-pinned-multiarch-payload-and-target-images" || !validBuildImage || !validRepository || !validBuilderPaths || !validPlatforms {
 		return errors.New("NCCL provider recipe build policy is incomplete")
 	}

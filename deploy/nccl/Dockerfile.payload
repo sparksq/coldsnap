@@ -9,6 +9,7 @@ FROM ${NCCL_BUILD_IMAGE} AS provider_payload_build
 ARG NCCL_BUILD_IMAGE
 ARG NCCL_LIBRARY_RELEASE
 ARG NCCL_VERSION_CODE
+ARG NCCL_TLS_BACKEND=
 
 RUN case "${NCCL_BUILD_IMAGE}" in *@sha256:*) ;; *) echo "NCCL_BUILD_IMAGE must be digest-pinned" >&2; exit 2 ;; esac \
     && image_digest="${NCCL_BUILD_IMAGE##*@sha256:}" \
@@ -20,6 +21,11 @@ RUN case "${NCCL_BUILD_IMAGE}" in *@sha256:*) ;; *) echo "NCCL_BUILD_IMAGE must 
         patch \
         pkg-config \
         python3 \
+    && case "${NCCL_TLS_BACKEND}" in \
+         "") ;; \
+         OPENSSL3) apt-get install -y --no-install-recommends libssl-dev ;; \
+         *) echo "NCCL_TLS_BACKEND must be empty or OPENSSL3" >&2; exit 2 ;; \
+       esac \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=nccl_source . /opt/nccl
@@ -34,6 +40,7 @@ ARG NCCL_STRIP_OUTPUTS=0
 RUN test -n "${NCCL_LIBRARY_RELEASE}" \
     && test -n "${NCCL_VERSION_CODE}" \
     && test -n "${NCCL_NVCC_GENCODE}" \
+    && python3 -c 'import json,sys; r=json.load(open("/tmp/coldsnap-nccl-release/recipe.json")); assert r["build"].get("tls_backend", "") == sys.argv[1], "TLS backend differs from recipe"' "${NCCL_TLS_BACKEND}" \
     && rm -rf /opt/nccl/.git \
     && while IFS= read -r patch_name; do \
          test -n "${patch_name}" || continue; \
@@ -41,9 +48,9 @@ RUN test -n "${NCCL_LIBRARY_RELEASE}" \
          patch --fuzz=0 -d /opt/nccl -p1 -i "/tmp/coldsnap-nccl-release/patches/${patch_name}"; \
        done < /tmp/coldsnap-nccl-release/patches/series \
     && case "${NCCL_REPRODUCIBLE_NVCC}" in \
-         0) make -C /opt/nccl -j"${NCCL_BUILD_JOBS}" src.build \
+         0) make -C /opt/nccl -j"${NCCL_BUILD_JOBS}" src.build TLS_BACKEND="${NCCL_TLS_BACKEND}" \
               NVCC_GENCODE="${NCCL_NVCC_GENCODE}" ;; \
-         1) make -C /opt/nccl -j"${NCCL_BUILD_JOBS}" src.build \
+         1) make -C /opt/nccl -j"${NCCL_BUILD_JOBS}" src.build TLS_BACKEND="${NCCL_TLS_BACKEND}" \
               NVCC=/usr/local/bin/coldsnap-nccl-nvcc \
               NVCC_GENCODE="${NCCL_NVCC_GENCODE}" ;; \
          *) echo "NCCL_REPRODUCIBLE_NVCC must be 0 or 1" >&2; exit 2 ;; \
@@ -57,8 +64,8 @@ COPY native/nccl/abi/coldsnap_nccl_provider.h \
 
 RUN cp /tmp/coldsnap-nccl-release/*.cc /opt/nccl/contrib/nccl_checkpoint/ \
     && case "${NCCL_REPRODUCIBLE_NVCC}" in \
-         0) make -C /opt/nccl/contrib/nccl_checkpoint -j"${NCCL_BUILD_JOBS}" ;; \
-         1) make -C /opt/nccl/contrib/nccl_checkpoint -j"${NCCL_BUILD_JOBS}" \
+         0) make -C /opt/nccl/contrib/nccl_checkpoint -j"${NCCL_BUILD_JOBS}" TLS_BACKEND="${NCCL_TLS_BACKEND}" ;; \
+         1) make -C /opt/nccl/contrib/nccl_checkpoint -j"${NCCL_BUILD_JOBS}" TLS_BACKEND="${NCCL_TLS_BACKEND}" \
               NVCC=/usr/local/bin/coldsnap-nccl-nvcc ;; \
          *) echo "NCCL_REPRODUCIBLE_NVCC must be 0 or 1" >&2; exit 2 ;; \
        esac \
@@ -90,6 +97,7 @@ ARG COLDSNAP_NCCL_PROVIDER_ID
 ARG COLDSNAP_SOURCE_REVISION
 ARG NCCL_LIBRARY_RELEASE
 ARG NCCL_NVCC_GENCODE
+ARG NCCL_TLS_BACKEND=
 ARG TARGETOS
 ARG TARGETARCH
 LABEL org.opencontainers.image.title="ColdSnap NCCL provider payload" \
@@ -97,7 +105,8 @@ LABEL org.opencontainers.image.title="ColdSnap NCCL provider payload" \
       org.opencontainers.image.source="https://github.com/sparksq/coldsnap" \
       org.opencontainers.image.revision="${COLDSNAP_SOURCE_REVISION}" \
       org.opencontainers.image.version="${COLDSNAP_NCCL_PROVIDER_ID}" \
-      org.opencontainers.image.licenses="AGPL-3.0-only AND BSD-3-Clause" \
+      org.opencontainers.image.licenses="AGPL-3.0-only AND Apache-2.0 AND BSD-3-Clause" \
+      io.sparksq.coldsnap.nccl.tls-backend="${NCCL_TLS_BACKEND}" \
       io.sparksq.coldsnap.nccl.release="${NCCL_LIBRARY_RELEASE}" \
       io.sparksq.coldsnap.cuda.gencode="${NCCL_NVCC_GENCODE}" \
       io.sparksq.coldsnap.platform="${TARGETOS}/${TARGETARCH}"

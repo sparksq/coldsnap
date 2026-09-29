@@ -1,0 +1,105 @@
+diff --git a/contrib/nccl_checkpoint/Makefile b/contrib/nccl_checkpoint/Makefile
+index 166fd81..0507d2d 100644
+--- a/contrib/nccl_checkpoint/Makefile
++++ b/contrib/nccl_checkpoint/Makefile
+@@ -68,12 +68,12 @@ $(SHIM_EXPORTS): $(SHIM_HEADERS) gen_shim.py
+ 	python3 gen_shim.py $(SHIM_HEADERS) --exports >$@
+ $(OBJDIR)/shim.o: shim.cc $(SHIM_AUTO)
+ 
+-HOST_SRC := shim_core.cc shim.cc shim_checkpoint.cc kv_store_client.cc coldsnap_provider.cc coldsnap_in_place_provider.cc
++HOST_SRC := shim_core.cc shim.cc shim_checkpoint.cc kv_store_client.cc coldsnap_provider.cc coldsnap_in_place_provider.cc coldsnap_resource_provider.cc
+ HOST_OBJ := $(HOST_SRC:%.cc=$(OBJDIR)/%.o)
+ $(HOST_OBJ): $(NCCL_HEADER)
+ 
+ # ColdSnap in-place transport retains exact-version internal communicator access.
+-$(OBJDIR)/coldsnap_in_place_provider.o: CXXFLAGS += -I$(NCCL_SRC)/include/plugin
++$(OBJDIR)/coldsnap_in_place_provider.o $(OBJDIR)/coldsnap_resource_provider.o: CXXFLAGS += -I$(NCCL_SRC)/include/plugin
+ 
+ # Compile host code
+ $(OBJDIR)/%.o: %.cc
+diff --git a/contrib/nccl_checkpoint/gen_shim.py b/contrib/nccl_checkpoint/gen_shim.py
+index d2876b9..3b46d63 100644
+--- a/contrib/nccl_checkpoint/gen_shim.py
++++ b/contrib/nccl_checkpoint/gen_shim.py
+@@ -59,6 +59,7 @@ MANUALLY_SHIMMED_FUNCS: Set[str] = {
+ EXTRA_EXPORTED_FUNCS: Set[str] = {
+     "coldsnapNcclProviderQuery",
+     "coldsnapNcclInPlaceQuery",
++    "coldsnapNcclResourcesQuery",
+     "ncclCheckpointCommGetReal",
+     "ncclCheckpointGetVersion",
+     "ncclCheckpointPrepare",
+@@ -74,6 +75,9 @@ RESTORE_UNSAFE_COMM_FUNCS: Dict[str, str] = {
+ }
+ 
+ RESTORE_UNSAFE_WINDOW_FUNCS: Dict[str, str] = {
++    "ncclGetMultimemDeviceLeInfo": '"exported CFT endpoint IDs are not restored"',
++    "ncclGetCftDeviceLeInfo": '"exported CFT endpoint IDs are not restored"',
++    "ncclGetPeerDeviceLeInfo": '"exported CFT endpoint IDs are not restored"',
+     "ncclGetLsaMultimemDevicePointer": '"device window pointers are not valid after restore"',
+     "ncclGetMultimemDevicePointer": '"device window pointers are not valid after restore"',
+     "ncclGetLsaDevicePointer": '"device window pointers are not valid after restore"',
+diff --git a/contrib/nccl_checkpoint/shim_checkpoint.cc b/contrib/nccl_checkpoint/shim_checkpoint.cc
+index 0f9cfde..e00c4f2 100644
+--- a/contrib/nccl_checkpoint/shim_checkpoint.cc
++++ b/contrib/nccl_checkpoint/shim_checkpoint.cc
+@@ -453,7 +453,10 @@ static ncclResult_t destroyRestoredUserDestroyedComms() {
+   return ncclSuccess;
+ }
+ 
++extern "C" ncclResult_t coldsnapNcclCheckpointPreflight(uint32_t mode);
++
+ extern "C" ncclResult_t ncclCheckpointPrepare(void) {
++  NCCLCHECK(coldsnapNcclCheckpointPreflight(0));
+   using finalize_t = ncclResult_t (*)(ncclComm_t);
+   using terminate_t = ncclResult_t (*)(ncclComm_t);
+   using group_t = ncclResult_t (*)();
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index d81d7da..a542e49 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -2179,7 +2179,7 @@ static ncclResult_t coldsnapForEachNetConnection(struct ncclComm* comm, int send
+   return ncclSuccess;
+ }
+ 
+-static ncclResult_t coldsnapCheckNetBoundary(struct ncclComm* comm) {
++static ncclResult_t coldsnapCheckNetBoundary(struct ncclComm* comm, bool rememberTransport = true) {
+   if (comm == NULL || comm->endMagic != NCCL_MAGIC || comm->proxyState == NULL) return ncclInvalidArgument;
+   const auto idleDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+   while (COMPILER_ATOMIC_LOAD(&comm->proxyState->progressState.active, std::memory_order_acquire) != NULL &&
+@@ -2202,7 +2202,7 @@ static ncclResult_t coldsnapCheckNetBoundary(struct ncclComm* comm) {
+       WARN("ColdSnap in-place NET requires NCCL_IB_RELEASE_ON_FINALIZE=1 for the IB backend");
+       return ncclInvalidUsage;
+     }
+-    coldsnapUsedIb = true;
++    if (rememberTransport) coldsnapUsedIb = true;
+   }
+   if (comm->proxyState->netContext == NULL && comm->netContext != NULL) {
+     WARN("ColdSnap in-place NET found inconsistent communicator/proxy NET contexts");
+@@ -2341,6 +2341,26 @@ static ncclResult_t coldsnapRegisterRecv(struct ncclProxyConnection* connection,
+ 
+ } // namespace
+ 
++// Validate all connections without releasing a registration, socket, or context.
++NCCL_API(ncclResult_t, ncclCheckpointNetPreflight, ncclComm_t comm);
++ncclResult_t ncclCheckpointNetPreflight(ncclComm_t comm) {
++  NCCLCHECK(coldsnapCheckNetBoundary(comm, false));
++  NCCLCHECK(coldsnapForEachNetConnection(comm, 1, [&](struct ncclProxyConnection* connection) {
++    auto* resources = (struct sendNetResources*)connection->transportResources;
++    if (connection->state != connConnected || resources == NULL || resources->shared ||
++        resources->netDeviceHandle != NULL || resources->checkpointDetached ||
++        !ncclIntruQueueEmpty(&connection->proxyMemHandleQueue)) return ncclInvalidUsage;
++    return ncclSuccess;
++  }));
++  return coldsnapForEachNetConnection(comm, 0, [&](struct ncclProxyConnection* connection) {
++    auto* resources = (struct recvNetResources*)connection->transportResources;
++    if (connection->state != connConnected || resources == NULL || resources->shared ||
++        resources->netDeviceHandle != NULL || resources->checkpointDetached ||
++        !ncclIntruQueueEmpty(&connection->proxyMemHandleQueue)) return ncclInvalidUsage;
++    return ncclSuccess;
++  });
++}
++
+ NCCL_API(ncclResult_t, ncclCheckpointNetDetach, ncclComm_t comm);
+ ncclResult_t ncclCheckpointNetDetach(ncclComm_t comm) {
+   NCCLCHECK(coldsnapCheckNetBoundary(comm));

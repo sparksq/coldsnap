@@ -1,0 +1,188 @@
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index 1c552ac..d60d8b7 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -21,6 +21,9 @@
+ #include "register_inline.h"
+ #include "bootstrap.h"
+ #include "ras.h"
++#include "gin.h"
++#include "rma.h"
++#include "gin/gin_host_proxy.h"
+ 
+ #include <chrono>
+ #include <thread>
+@@ -2212,6 +2215,92 @@ static ncclResult_t coldsnapCheckNetBoundary(struct ncclComm* comm, bool remembe
+   return ncclSuccess;
+ }
+ 
++// Built-in RMA/GIN plugins allocate discovery contexts even before any device or
++// RMA API is used. Keep their logical plugin ownership and topology, but replace
++// these idle transport contexts at the checkpoint boundary.
++static ncclResult_t coldsnapCheckIdlePlugins(struct ncclComm* comm, bool attached) {
++  if (comm->sharedRes == nullptr || comm->sharedRes->owner != comm ||
++      COMPILER_ATOMIC_LOAD(&comm->sharedRes->refCount, std::memory_order_acquire) != 1)
++    return ncclInvalidUsage;
++  const auto& rma = comm->rmaState.rmaProxyState;
++  const auto& gin = comm->sharedRes->ginState;
++  if (rma.connected || rma.rmaInstance != nullptr || rma.rmaCommCount != 0 ||
++      rma.rmaProxyCtxCount != 0 || rma.rmaProxyCtxs != nullptr || rma.rmaProgress != 0 ||
++      rma.thread.joinable() || comm->rmaState.rmaCeState.initialized ||
++      gin.connected || gin.devComms != nullptr || gin.proxyThreadsCreated || gin.proxyNthreads != 0)
++    return ncclInvalidUsage;
++  if (rma.ncclRma != nullptr) {
++    if (rma.ncclRma != &ncclRmaIbProxy && rma.ncclRma != &ncclRmaSocketProxy) return ncclInvalidUsage;
++    if ((comm->rmaContext != nullptr) != attached) return ncclInvalidUsage;
++  } else if (comm->rmaContext != nullptr) {
++    return ncclInvalidUsage;
++  }
++  for (int i = 0; i < NCCL_GIN_MAX_CONNECTIONS; ++i) {
++    if (rma.rmaComms[i] != nullptr || gin.thread[i].joinable()) return ncclInvalidUsage;
++  }
++  bool usesIb = rma.ncclRma == &ncclRmaIbProxy;
++  for (int i = 0; i < gin.numActiveBackends; ++i) {
++    const auto& backend = gin.backends[i];
++    if (backend.ncclGin != &ncclGinIbGdaki && backend.ncclGin != &ncclGinProxy) return ncclInvalidUsage;
++    if ((backend.ginInstance != nullptr) != attached || backend.ginCommCount != 0) return ncclInvalidUsage;
++    for (int j = 0; j < NCCL_GIN_MAX_CONNECTIONS; ++j) {
++      if (backend.ginComms[j] != nullptr) return ncclInvalidUsage;
++    }
++    usesIb |= backend.ncclGin == &ncclGinIbGdaki;
++  }
++  if (usesIb) {
++    const char* release = getenv("NCCL_IB_RELEASE_ON_FINALIZE");
++    if (release == nullptr || strcmp(release, "1") != 0) return ncclInvalidUsage;
++  }
++  return ncclSuccess;
++}
++
++static ncclResult_t coldsnapSuspendIdlePlugins(struct ncclComm* comm) {
++  NCCLCHECK(coldsnapCheckIdlePlugins(comm, true));
++  auto& gin = comm->sharedRes->ginState;
++  auto* rma = comm->rmaState.rmaProxyState.ncclRma;
++  if (rma == &ncclRmaIbProxy) coldsnapUsedIb = true;
++  for (int i = 0; i < gin.numActiveBackends; ++i) {
++    auto& backend = gin.backends[i];
++    if (backend.ncclGin == &ncclGinIbGdaki) coldsnapUsedIb = true;
++    NCCLCHECK(backend.ncclGin->finalize(backend.ginInstance));
++    backend.ginInstance = nullptr;
++  }
++  if (rma != nullptr) {
++    NCCLCHECK(rma->finalize(comm->rmaContext));
++    comm->rmaContext = nullptr;
++  }
++  return ncclSuccess;
++}
++
++static ncclResult_t coldsnapResumeIdlePlugins(struct ncclComm* comm) {
++  NCCLCHECK(coldsnapCheckIdlePlugins(comm, false));
++  auto* rma = comm->rmaState.rmaProxyState.ncclRma;
++  if (rma != nullptr) {
++    int expected = 0, actual = 0, unused = 0;
++    NCCLCHECK(ncclRmaGetDevCount(comm->rmaPluginIndex, &expected, &unused));
++    NCCLCHECK(rma->init(&comm->rmaContext, comm->commHash, ncclDebugLog));
++    NCCLCHECK(rma->devices(&actual));
++    if (actual != expected) {
++      WARN("ColdSnap idle RMA restore changed device count from %d to %d", expected, actual);
++      return ncclInvalidUsage;
++    }
++  }
++  auto& gin = comm->sharedRes->ginState;
++  for (int i = 0; i < gin.numActiveBackends; ++i) {
++    auto& backend = gin.backends[i];
++    int expected = 0, actual = 0, unused = 0;
++    NCCLCHECK(ncclGinGetDevCount(backend.pluginIndex, &expected, &unused));
++    NCCLCHECK(backend.ncclGin->init(&backend.ginInstance, comm->commHash, ncclDebugLog));
++    NCCLCHECK(backend.ncclGin->devices(&actual));
++    if (actual != expected) {
++      WARN("ColdSnap idle GIN restore changed device count from %d to %d", expected, actual);
++      return ncclInvalidUsage;
++    }
++  }
++  return ncclSuccess;
++}
++
+ static ncclResult_t coldsnapDetachSend(struct ncclProxyConnection* connection,
+                                        struct ncclProxyState* proxyState) {
+   if (connection->state != connConnected) return ncclInvalidUsage;
+@@ -2346,6 +2435,7 @@ static ncclResult_t coldsnapRegisterRecv(struct ncclProxyConnection* connection,
+ NCCL_API(ncclResult_t, ncclCheckpointNetPreflight, ncclComm_t comm);
+ ncclResult_t ncclCheckpointNetPreflight(ncclComm_t comm) {
+   NCCLCHECK(coldsnapCheckNetBoundary(comm, false));
++  NCCLCHECK(coldsnapCheckIdlePlugins(comm, true));
+   NCCLCHECK(coldsnapForEachNetConnection(comm, 1, [&](struct ncclProxyConnection* connection) {
+     auto* resources = (struct sendNetResources*)connection->transportResources;
+     if (connection->state != connConnected || resources == NULL || resources->shared ||
+@@ -2365,6 +2455,7 @@ ncclResult_t ncclCheckpointNetPreflight(ncclComm_t comm) {
+ NCCL_API(ncclResult_t, ncclCheckpointNetDetach, ncclComm_t comm);
+ ncclResult_t ncclCheckpointNetDetach(ncclComm_t comm) {
+   NCCLCHECK(coldsnapCheckNetBoundary(comm));
++  NCCLCHECK(coldsnapCheckIdlePlugins(comm, true));
+   struct ncclProxyState* proxyState = comm->proxyState;
+   NCCLCHECK(coldsnapForEachNetConnection(comm, 1, [&](struct ncclProxyConnection* connection) {
+     return coldsnapDetachSend(connection, proxyState);
+@@ -2372,6 +2463,7 @@ ncclResult_t ncclCheckpointNetDetach(ncclComm_t comm) {
+   NCCLCHECK(coldsnapForEachNetConnection(comm, 0, [&](struct ncclProxyConnection* connection) {
+     return coldsnapDetachRecv(connection, proxyState);
+   }));
++  NCCLCHECK(coldsnapSuspendIdlePlugins(comm));
+   NCCLCHECK(comm->ncclNet->finalize(comm->netContext));
+   comm->netContext = NULL;
+   proxyState->netContext = NULL;
+@@ -2400,6 +2492,7 @@ ncclResult_t ncclCheckpointNetReinitialize(ncclComm_t comm) {
+   NCCLCHECK(comm->ncclNet->init(&comm->netContext, comm->commHash, &commConfig, ncclDebugLog,
+                                 ncclProfilerCallback));
+   comm->proxyState->netContext = comm->netContext;
++  NCCLCHECK(coldsnapResumeIdlePlugins(comm));
+   return ncclSuccess;
+ }
+ 
+diff --git a/src/transport/net_ib/gin.cc b/src/transport/net_ib/gin.cc
+index 29c539c..941f340 100644
+--- a/src/transport/net_ib/gin.cc
++++ b/src/transport/net_ib/gin.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -51,6 +52,13 @@ static std::mutex ncclGinIbGdakiLockMutex;
+ static int ncclGinIbGdakiNDevs = -1;
+ int ncclGinIbGdakiDevIndexes[MAX_IB_DEVS];
+ 
++// No live GIN contexts remain at the explicit checkpoint boundary.
++void ncclGinIbCheckpointReset() {
++  std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
++  ncclGinIbGdakiNDevs = -1;
++  memset(ncclGinIbGdakiDevIndexes, 0, sizeof(ncclGinIbGdakiDevIndexes));
++}
++
+ ncclResult_t ncclGinIbGdakiInitOnce() {
+   std::lock_guard<std::mutex> lock(ncclGinIbGdakiLockMutex);
+   if (ncclGinIbGdakiNDevs == -1) {
+diff --git a/src/transport/net_ib/init.cc b/src/transport/net_ib/init.cc
+index 9d29fa4..2a20af4 100644
+--- a/src/transport/net_ib/init.cc
++++ b/src/transport/net_ib/init.cc
+@@ -367,15 +367,19 @@ ncclResult_t ncclCheckpointIbGetStatus(int* netRefs, int* ndevs, int* pdRefs, in
+   return ncclSuccess;
+ }
+ 
++void ncclGinIbCheckpointReset();
++
+ NCCL_API(ncclResult_t, ncclCheckpointIbReset);
+ ncclResult_t ncclCheckpointIbReset() {
+   if (!ncclParamIbReleaseOnFinalize()) return ncclInvalidUsage;
+   NCCLCHECK(ncclRasCheckpointReset());
+-  // The checkpoint shim has destroyed every communicator, but unsuccessful
++  // Every communicator has released its transport contexts, but unsuccessful
+   // network/GIN probes can leave unmatched device-cache references behind.
+   // Force the same last-user path at this explicit checkpoint boundary.
+   netRefCount = 1;
+-  return ncclIbFinalizeDevices();
++  NCCLCHECK(ncclIbFinalizeDevices());
++  ncclGinIbCheckpointReset();
++  return ncclSuccess;
+ }
+ 
+ #if defined(__aarch64__)

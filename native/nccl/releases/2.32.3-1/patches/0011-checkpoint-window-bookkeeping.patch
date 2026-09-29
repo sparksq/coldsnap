@@ -1,0 +1,30 @@
+--- a/contrib/nccl_checkpoint/shim.cc
++++ b/contrib/nccl_checkpoint/shim.cc
+@@ -468,6 +468,8 @@
+   using real_t = ncclResult_t (*)(ncclComm_t, void*, size_t, ncclWindow_t*, int);
+   static real_t real_ncclCommWindowRegister = nullptr;
+   NCCLCHECK(resolveRealFunction("ncclCommWindowRegister", &real_ncclCommWindowRegister));
++  if (win == nullptr) return ncclInvalidArgument;
++  *win = nullptr;
+ 
+   ncclComm_t realComm = comm;
+   ncclResult_t ret = g_commHandles.toReal(comm, &realComm);
+@@ -487,6 +489,7 @@
+   if (ret != ncclSuccess && ret != ncclInProgress) {
+     g_commHandles[comm].windows.erase(params->sequence);
+     g_windowHandles.remove(synthWin);
++    *win = nullptr;
+     return ret;
+   }
+   return ret;
+@@ -510,7 +513,9 @@
+   ret = g_windowHandles.toReal(win, &realWin);
+   if (ret != ncclSuccess) return ret;
+   ret = real_ncclCommWindowDeregister(realComm, realWin);
+-  if (ret == ncclSuccess && realWin != nullptr) {
++  // Retain output storage until registration has completed. A successful
++  // deregistration also releases a synthetic record whose real window is null.
++  if (ret == ncclSuccess && entry != nullptr) {
+     if (sequence != 0) g_commHandles[comm].windows.erase(sequence);
+     g_windowHandles.remove(win);
+   }

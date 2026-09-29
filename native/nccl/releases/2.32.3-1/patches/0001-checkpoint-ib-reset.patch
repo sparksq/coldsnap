@@ -1,0 +1,458 @@
+diff --git a/contrib/nccl_checkpoint/gen_shim.py b/contrib/nccl_checkpoint/gen_shim.py
+index e90ae89..88de492 100644
+--- a/contrib/nccl_checkpoint/gen_shim.py
++++ b/contrib/nccl_checkpoint/gen_shim.py
+@@ -1,4 +1,5 @@
+ #!/usr/bin/env python3
++# Modified by ColdSnap for checkpoint lifecycle support.
+ """
+ gen_shim.py — Generate C++ LD_PRELOAD shim wrappers for all NCCL functions
+ that involve ncclComm_t handles.
+@@ -56,6 +57,7 @@ MANUALLY_SHIMMED_FUNCS: Set[str] = {
+ }
+ 
+ EXTRA_EXPORTED_FUNCS: Set[str] = {
++    "ncclCheckpointCommGetReal",
+     "ncclCheckpointGetVersion",
+     "ncclCheckpointPrepare",
+     "ncclCheckpointRestore",
+diff --git a/contrib/nccl_checkpoint/shim.cc b/contrib/nccl_checkpoint/shim.cc
+index 3391e6e..548768f 100644
+--- a/contrib/nccl_checkpoint/shim.cc
++++ b/contrib/nccl_checkpoint/shim.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ #include <nccl.h>
+ #include "shim_core.h"
+ #include <dlfcn.h>
+@@ -16,6 +17,11 @@ extern "C" ncclResult_t ncclCheckpointGetVersion(int* checkpointVersion, int* nc
+   return ncclSuccess;
+ }
+ 
++extern "C" ncclResult_t ncclCheckpointCommGetReal(ncclComm_t comm, ncclComm_t* realComm) {
++  if (realComm == nullptr) return ncclInvalidArgument;
++  return g_commHandles.toReal(comm, realComm);
++}
++
+ static CommInitParams* allocInitParams(int nranks, int rank, const ncclConfig_t* configPtr) {
+   CommInitParams* params = new CommInitParams{};
+   params->creation = create_via_init;
+@@ -41,9 +47,6 @@ static CommInitParams* allocInitParams(int nranks, int rank, const ncclConfig_t*
+       params->config.commName = params->comm_name;
+     }
+   }
+-  params->config.size = sizeof(ncclConfig_t);
+-  params->config.magic = NCCL_API_MAGIC;
+-  params->config.version = NCCL_VERSION_CODE;
+   params->config.netName = params->net_name[0] ? params->net_name : nullptr;
+   params->config.commName = params->comm_name[0] ? params->comm_name : nullptr;
+   params->commParent = nullptr;
+diff --git a/contrib/nccl_checkpoint/shim_core.h b/contrib/nccl_checkpoint/shim_core.h
+index 4fa8487..ff56559 100644
+--- a/contrib/nccl_checkpoint/shim_core.h
++++ b/contrib/nccl_checkpoint/shim_core.h
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ #pragma once
+ /*
+  * Included by shim.cc, shim_checkpoint.cc, and shim_auto.cc.
+@@ -442,3 +443,4 @@ static inline void markWindowCommRestoreUnsafe(ncclWindow_t synthWin, const char
+ extern "C" ncclResult_t ncclCheckpointPrepare(void);
+ extern "C" ncclResult_t ncclCheckpointRestore(void);
+ extern "C" ncclResult_t ncclCheckpointGetVersion(int* checkpointVersion, int* ncclVersion);
++extern "C" ncclResult_t ncclCheckpointCommGetReal(ncclComm_t comm, ncclComm_t* realComm);
+diff --git a/src/bootstrap.cc b/src/bootstrap.cc
+index 7775978..742f628 100644
+--- a/src/bootstrap.cc
++++ b/src/bootstrap.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -140,6 +141,17 @@ ncclResult_t bootstrapNetInit() {
+   return ncclSuccess;
+ }
+ 
++ncclResult_t bootstrapNetCheckpointReset() {
++  std::lock_guard<std::mutex> lock(bootstrapNetMutex);
++  // Communicators have been destroyed at this checkpoint boundary.  Drop the
++  // process-global interface selection so restore discovers the address that
++  // belongs to the destination host instead of rebinding the captured host.
++  bootstrapNetInitDone = 0;
++  memset(bootstrapNetIfName, 0, sizeof(bootstrapNetIfName));
++  memset(&bootstrapNetIfAddr, 0, sizeof(bootstrapNetIfAddr));
++  return ncclSuccess;
++}
++
+ /* Socket Interface Selection type */
+ enum bootstrapInterface_t {
+   findSubnetIf = -1,
+diff --git a/src/include/bootstrap.h b/src/include/bootstrap.h
+index a2c1348..1a996b1 100644
+--- a/src/include/bootstrap.h
++++ b/src/include/bootstrap.h
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2015-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -20,6 +21,7 @@ static_assert(sizeof(struct ncclBootstrapHandle) <= sizeof(ncclUniqueId),
+               "Bootstrap handle is too large to fit inside NCCL unique ID");
+ 
+ ncclResult_t bootstrapNetInit();
++ncclResult_t bootstrapNetCheckpointReset();
+ ncclResult_t bootstrapCreateRoot(struct ncclBootstrapHandle* handle, bool idFromEnv);
+ ncclResult_t bootstrapGetUniqueId(struct ncclBootstrapHandle* handle, struct ncclComm* comm);
+ ncclResult_t bcastGrowHandle(struct ncclBootstrapHandle* handle, struct ncclComm* parent, bool isRoot);
+diff --git a/src/include/net.h b/src/include/net.h
+index 5dd0d86..7995e95 100644
+--- a/src/include/net.h
++++ b/src/include/net.h
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -20,6 +21,8 @@ typedef char ncclNetHandle_t[NCCL_NET_HANDLE_MAXSIZE];
+ ncclResult_t ncclNetInit(struct ncclComm* comm);
+ ncclResult_t ncclNetInitFromParent(struct ncclComm* comm, struct ncclComm* parent);
+ ncclResult_t ncclNetFinalize(struct ncclComm* comm);
++ncclResult_t ncclNetSocketCheckpointReset();
++extern "C" ncclResult_t ncclCheckpointIbReset();
+ ncclResult_t ncclNetGetDevCount(int netPluginIndex, int* nPhysDev, int* nVirtDev);
+ ncclResult_t ncclNetSetVirtDevCount(int netPluginIndex, int nVirtDev);
+ ncclResult_t ncclCollNetGetDevCount(int netPluginIndex, int* nPhysDev, int* nVirtDev);
+diff --git a/src/include/ras.h b/src/include/ras.h
+index ffece73..1ba3e8a 100644
+--- a/src/include/ras.h
++++ b/src/include/ras.h
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -22,6 +23,7 @@ struct rasRankInit {
+ 
+ ncclResult_t ncclRasCommInit(struct ncclComm* comm, struct rasRankInit* myRank);
+ ncclResult_t ncclRasCommFini(const struct ncclComm* comm);
++ncclResult_t ncclRasCheckpointReset();
+ ncclResult_t ncclRasAddRanks(struct rasRankInit* ranks, int nranks);
+ ncclResult_t ncclRunRasDiagnostics(struct ncclComm* comm);
+ 
+diff --git a/src/ras/ras.cc b/src/ras/ras.cc
+index fed5ddb..31303a4 100644
+--- a/src/ras/ras.cc
++++ b/src/ras/ras.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -181,6 +182,17 @@ static void rasTerminate() {
+   if (rasLocalNotify(&msg) == ncclSuccess) rasThread.join();
+ }
+ 
++ncclResult_t ncclRasCheckpointReset() {
++  if (!rasInitialized) return ncclSuccess;
++  int references = COMPILER_ATOMIC_LOAD(&rasInitRefCount, std::memory_order_acquire);
++  if (references != 0) {
++    WARN("RAS checkpoint reset refused with %d live communicator references", references);
++    return ncclInvalidUsage;
++  }
++  rasTerminate();
++  return ncclSuccess;
++}
++
+ // Invoked by regular NCCL threads on every (non-split) comm initialization.  Provides info on all the ranks within
+ // the communicator.
+ ncclResult_t ncclRasAddRanks(struct rasRankInit* ranks, int nranks) {
+diff --git a/src/transport/net_ib/common.cc b/src/transport/net_ib/common.cc
+index 75f810d..7f78004 100644
+--- a/src/transport/net_ib/common.cc
++++ b/src/transport/net_ib/common.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -162,7 +163,7 @@ static void ncclIbUpdateDeviceSpeed(struct ncclIbDev* dev) {
+   }
+ }
+ 
+-std::thread ncclIbAsyncThread;
++std::thread ncclIbAsyncThreads[MAX_IB_DEVS];
+ void* ncclIbAsyncThreadMain(void* args) {
+   struct ncclIbDev* dev = (struct ncclIbDev*)args;
+   while (1) {
+diff --git a/src/transport/net_ib/common.h b/src/transport/net_ib/common.h
+index a422f11..a75c824 100644
+--- a/src/transport/net_ib/common.h
++++ b/src/transport/net_ib/common.h
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -25,6 +26,7 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ #include <mutex>
++#include <new>
+ #define ENABLE_TIMER 0
+ #include "timer.h"
+ 
+@@ -697,7 +699,7 @@ ncclResult_t ncclIbStatsCheckFatalCount(struct ncclIbStats* stat, const char* fu
+ 
+ extern ncclProfilerCallback_t ncclProfilerFunction;
+ 
+-extern std::thread ncclIbAsyncThread;
++extern std::thread ncclIbAsyncThreads[MAX_IB_DEVS];
+ void* ncclIbAsyncThreadMain(void* args);
+ 
+ ncclResult_t ncclIbGdrSupport();
+diff --git a/src/transport/net_ib/init.cc b/src/transport/net_ib/init.cc
+index b04713d..9d29fa4 100644
+--- a/src/transport/net_ib/init.cc
++++ b/src/transport/net_ib/init.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -7,6 +8,7 @@
+ 
+ #include "common.h"
+ #include "p2p_resiliency_recovery.h"
++#include "ras.h"
+ 
+ NCCL_PARAM(IbPciRelaxedOrdering, "IB_PCI_RELAXED_ORDERING", 2);
+ NCCL_PARAM(IbAdaptiveRouting, "IB_ADAPTIVE_ROUTING", -2);
+@@ -28,6 +30,7 @@ NCCL_PARAM(IbDisable, "IB_DISABLE", 0);
+ NCCL_PARAM(IbMergeVfs, "IB_MERGE_VFS", 1);
+ NCCL_PARAM(IbMergeNics, "IB_MERGE_NICS", 1);
+ NCCL_PARAM(IbDevicePciOrder, "IB_DEVICE_PCI_ORDER", 1);
++NCCL_PARAM(IbReleaseOnFinalize, "IB_RELEASE_ON_FINALIZE", 0);
+ NCCL_PARAM(IbSortMergeNics, "IB_SORT_MERGE_NICS", 1);
+ 
+ extern int64_t ncclParamIbArThreshold();
+@@ -297,10 +300,84 @@ const char* ibProviderName[] = {
+ };
+ 
+ ncclResult_t ncclIbFinalizeDevices(void) {
+-  netRefCount--;
++  if (--netRefCount != 0 || !ncclParamIbReleaseOnFinalize()) return ncclSuccess;
++
++  std::lock_guard<std::mutex> lock(ncclIbMutex);
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    ncclIbDev* dev = ncclIbDevs + d;
++    if (dev->pdRefs != 0 || dev->mrCache.population != 0) {
++      WARN("NET/IB : Device %d still owns checkpoint-unsafe resources (pdRefs=%d mrCount=%d)", d, dev->pdRefs,
++           dev->mrCache.population);
++      return ncclInternalError;
++    }
++  }
++
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    if (ncclIbAsyncThreads[d].joinable()) {
++      int err = pthread_cancel(ncclIbAsyncThreads[d].native_handle());
++      if (err != 0) {
++        WARN("NET/IB : Failed to stop async event thread for device %d: %s", d, strerror(err));
++        return ncclSystemError;
++      }
++    }
++  }
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    if (ncclIbAsyncThreads[d].joinable()) ncclIbAsyncThreads[d].join();
++  }
++
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    ibv_context* context = ncclIbDevs[d].context;
++    bool first = context != NULL;
++    for (int prev = 0; prev < d && first; prev++) {
++      if (ncclIbDevs[prev].context == context) first = false;
++    }
++    if (first && wrap_ibv_close_device(context) != ncclSuccess) {
++      WARN("NET/IB : Failed to close device context %p", context);
++      return ncclSystemError;
++    }
++  }
++
++  for (int d = 0; d < ncclNIbDevs; d++) {
++    free(ncclIbDevs[d].pciPath);
++    free(ncclIbDevs[d].mrCache.slots);
++    ncclIbDevs[d].~ncclIbDev();
++    new (ncclIbDevs + d) ncclIbDev();
++  }
++  memset(ncclIbMergedDevs, 0, sizeof(ncclIbMergedDevs));
++  ncclIbRelaxedOrderingEnabled = 0;
++  ncclNMergedIbDevs = -1;
++  ncclNIbDevs = -1;
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointIbGetStatus, int* netRefs, int* ndevs, int* pdRefs, int* mrCount);
++ncclResult_t ncclCheckpointIbGetStatus(int* netRefs, int* ndevs, int* pdRefs, int* mrCount) {
++  if (netRefs == nullptr || ndevs == nullptr || pdRefs == nullptr || mrCount == nullptr) return ncclInvalidArgument;
++
++  std::lock_guard<std::mutex> lock(ncclIbMutex);
++  *netRefs = netRefCount;
++  *ndevs = ncclNIbDevs < 0 ? 0 : ncclNIbDevs;
++  *pdRefs = 0;
++  *mrCount = 0;
++  for (int d = 0; d < *ndevs; d++) {
++    std::lock_guard<std::mutex> devLock(ncclIbDevs[d].mutex);
++    *pdRefs += ncclIbDevs[d].pdRefs;
++    *mrCount += ncclIbDevs[d].mrCache.population;
++  }
+   return ncclSuccess;
+ }
+ 
++NCCL_API(ncclResult_t, ncclCheckpointIbReset);
++ncclResult_t ncclCheckpointIbReset() {
++  if (!ncclParamIbReleaseOnFinalize()) return ncclInvalidUsage;
++  NCCLCHECK(ncclRasCheckpointReset());
++  // The checkpoint shim has destroyed every communicator, but unsuccessful
++  // network/GIN probes can leave unmatched device-cache references behind.
++  // Force the same last-user path at this explicit checkpoint boundary.
++  netRefCount = 1;
++  return ncclIbFinalizeDevices();
++}
++
+ #if defined(__aarch64__)
+ static const bool ncclIbCpuArchAarch64 = true;
+ #else
+@@ -350,11 +427,11 @@ static int ncclIbGetPciIndex(int nPaths, const char** pciPaths, struct ncclIbDev
+ 
+ // returns the policy and the total number of devices subject to the policy.
+ static ncclResult_t ncclIbAutoPolicy(enum ncclIbRailPolicy* policy, int* nDevs) {
+-  static int count = 0;
+-  static std::once_flag onceFlag;
+-  static ncclIbRailPolicy cache = NCCL_IB_RAIL_POLICY_NONE;
++  // ColdSnap can re-enumerate devices after restore; do not retain a host-derived count.
++  int count = 0;
++  ncclIbRailPolicy cache = NCCL_IB_RAIL_POLICY_NONE;
+ 
+-  std::call_once(onceFlag, [&]() {
++  {
+     ncclIbGetRailPolicy(&cache);
+     if (ncclIbCpuArchAarch64 && (cache == NCCL_IB_RAIL_POLICY_CX9_BLOCK || cache == NCCL_IB_RAIL_POLICY_CX9_ALT ||
+                                  cache == NCCL_IB_RAIL_POLICY_CX9_FLIP)) {
+@@ -368,7 +445,7 @@ static ncclResult_t ncclIbAutoPolicy(enum ncclIbRailPolicy* policy, int* nDevs)
+       }
+       if (count == 0) cache = NCCL_IB_RAIL_POLICY_NONE;
+     }
+-  });
++  }
+   *policy = cache;
+   *nDevs = count;
+   return ncclSuccess;
+@@ -599,9 +676,9 @@ ncclResult_t ncclIbInitDevices(ncclDebugLogger_t logFunction, ncclProfilerCallba
+                  ncclIbDevs[ncclNIbDevs].speed, context, ncclIbDevs[ncclNIbDevs].pciPath, ncclIbDevs[ncclNIbDevs].ar,
+                  ncclIbDevs[ncclNIbDevs].oooRqSize);
+ 
+-            ncclIbAsyncThread = std::thread(ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs);
+-            ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
+-            ncclIbAsyncThread.detach();
++            ncclIbAsyncThreads[ncclNIbDevs] = std::thread(ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs);
++            ncclSetThreadName(ncclIbAsyncThreads[ncclNIbDevs], "NCCL IbAsync %2d", ncclNIbDevs);
++            if (!ncclParamIbReleaseOnFinalize()) ncclIbAsyncThreads[ncclNIbDevs].detach();
+ 
+             ncclNIbDevs++;
+             nPorts++;
+diff --git a/src/transport/net_socket.cc b/src/transport/net_socket.cc
+index de4767d..0f8240b 100644
+--- a/src/transport/net_socket.cc
++++ b/src/transport/net_socket.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -691,6 +692,17 @@ ncclResult_t ncclNetSocketFinalize(void* ctx) {
+   return ncclSuccess;
+ }
+ 
++ncclResult_t ncclNetSocketCheckpointReset() {
++  std::lock_guard<std::mutex> lock(ncclNetSocketMutex);
++  if (netRefCount != 0) {
++    WARN("NET/Socket : checkpoint reset refused with %d live references", netRefCount);
++    return ncclInvalidUsage;
++  }
++  NCCLCHECK(ncclRmaSocketCheckpointReset());
++  ncclProfilerFunction = nullptr;
++  return ncclSuccess;
++}
++
+ ncclNet_t ncclNetSocket = {
+   "Socket",
+   ncclNetSocketInit,
+diff --git a/src/transport/net_socket/common.cc b/src/transport/net_socket/common.cc
+index 4e7fe94..7543220 100644
+--- a/src/transport/net_socket/common.cc
++++ b/src/transport/net_socket/common.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -60,6 +61,15 @@ fail:
+   return ret;
+ }
+ 
++// ColdSnap resets discovery only after both socket transports release their users.
++ncclResult_t ncclNetSocketCheckpointResetDevices() {
++  std::lock_guard<std::mutex> lock(ncclNetSocketDevicesMutex);
++  for (int device = 0; device < ncclNetIfs; device++) free(ncclNetSocketDevs[device].pciPath);
++  memset(ncclNetSocketDevs, 0, sizeof(ncclNetSocketDevs));
++  ncclNetIfs = -1;
++  return ncclSuccess;
++}
++
+ ncclResult_t ncclNetSocketGetSpeed(char* devName, int* speed) {
+   ncclResult_t ret = ncclSuccess;
+   *speed = 0;
+diff --git a/src/transport/net_socket/common.h b/src/transport/net_socket/common.h
+index 63a0aab..9b61c6f 100644
+--- a/src/transport/net_socket/common.h
++++ b/src/transport/net_socket/common.h
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -22,6 +23,8 @@ extern int ncclNetIfs;
+ extern struct ncclNetSocketDev ncclNetSocketDevs[MAX_IFS];
+ 
+ ncclResult_t ncclNetSocketInitDevices(const char* logPrefix);
++ncclResult_t ncclNetSocketCheckpointResetDevices();
++ncclResult_t ncclRmaSocketCheckpointReset();
+ ncclResult_t ncclNetSocketGetSpeed(char* devName, int* speed);
+ /* Initialize a caller-owned listener and publish its bootstrap address and magic. */
+ ncclResult_t ncclNetSocketCreateListener(const char* logPrefix, int dev, struct ncclSocket* sock,
+diff --git a/src/transport/rma_socket.cc b/src/transport/rma_socket.cc
+index de3428b..e994a19 100644
+--- a/src/transport/rma_socket.cc
++++ b/src/transport/rma_socket.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -630,6 +631,16 @@ ncclResult_t ncclRmaSocketProxyFinalize(void* ctx) {
+   return ncclSuccess;
+ }
+ 
++// ColdSnap must not reset the shared device cache while RMA still owns it.
++ncclResult_t ncclRmaSocketCheckpointReset() {
++  std::lock_guard<std::mutex> lock(ncclRmaSocketProxyMutex);
++  if (ncclRmaSocketProxyRefCount != 0) {
++    WARN("RMA/Socket : checkpoint reset refused with %d live references", ncclRmaSocketProxyRefCount);
++    return ncclInvalidUsage;
++  }
++  return ncclNetSocketCheckpointResetDevices();
++}
++
+ /* rma_v14 callback table exported to the built-in plugin registry. */
+ 
+ ncclRma_t ncclRmaSocketProxy = {

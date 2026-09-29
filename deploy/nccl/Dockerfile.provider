@@ -41,7 +41,9 @@ COPY LICENSE THIRD_PARTY_NOTICES.md ./
 COPY third_party/licenses/nccl/LICENSE.txt ./third_party/licenses/nccl/LICENSE.txt
 COPY scripts/nccl-target-observe.py ./scripts/nccl-target-observe.py
 
-RUN python3 scripts/nccl-target-observe.py \
+RUN python3 -c 'import ctypes,json,sys; r=json.load(open(sys.argv[1])); [ctypes.CDLL(n) for n in ("libcrypto.so.3", "libssl.so.3")] if r["build"].get("tls_backend") == "OPENSSL3" else None' \
+      "/src/coldsnap/native/nccl/releases/${NCCL_RELEASE_TAG}/recipe.json" \
+    && python3 scripts/nccl-target-observe.py \
       --base-image-digest "sha256:${TARGET_IMAGE##*@sha256:}" \
       --transport ib-roce \
       --nccl-policy "${COLDSNAP_NCCL_POLICY}" \
@@ -57,6 +59,6 @@ RUN python3 scripts/nccl-target-observe.py \
 
 FROM scratch
 LABEL org.opencontainers.image.source="https://github.com/sparksq/coldsnap" \
-      org.opencontainers.image.licenses="AGPL-3.0-only AND BSD-3-Clause" \
+      org.opencontainers.image.licenses="AGPL-3.0-only AND Apache-2.0 AND BSD-3-Clause" \
       io.sparksq.coldsnap.copyright-holders="Scitrera LLC and Fox Engine Ltd"
 COPY --from=provider_assembly /out/provider /

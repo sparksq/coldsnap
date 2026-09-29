@@ -189,7 +189,8 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/dev/shm"),  # nosec B108
     )
-    parser.add_argument("--ghost-limit", type=int, default=64 * 1024**2)
+    # Retained NCCL 2.32 proxy shared memory can exceed 64 MiB.
+    parser.add_argument("--ghost-limit", type=int, default=128 * 1024**2)
     parser.add_argument(
         "--criu-compress-block-bytes",
         dest="compress_block_bytes",

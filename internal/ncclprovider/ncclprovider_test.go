@@ -548,6 +548,13 @@ func TestAssembleBindsQualifiedPayloadAndTarget(t *testing.T) {
 		Policy: "production", Capabilities: slices.Clone(recipe.Capabilities),
 		Transports: []string{"ib-roce", "socket"}, Checks: []string{"abi-contract", "socket-restore"},
 	}
+	for _, backend := range []string{"OPENSSL3", "unsupported"} {
+		candidate := recipe
+		candidate.Build.TLSBackend = backend
+		if err := validateAssemblyMetadata(candidate, qualification, fixture.target); err == nil || !strings.Contains(err.Error(), "TLS backend") {
+			t.Fatalf("legacy recipe with TLS backend %q: %v", backend, err)
+		}
+	}
 	qualificationPath := filepath.Join(releaseRoot, "qualification.json")
 	writeJSONFixture(t, qualificationPath, qualification)
 	targetPath := filepath.Join(sourceRoot, "target.json")

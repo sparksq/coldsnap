@@ -105,6 +105,25 @@ int32_t coldsnapNcclInPlaceQuery(
     uint32_t requested_abi_major,
     const struct coldsnap_nccl_in_place_v1** provider);
 
+/* Optional non-mutating resource admission ABI. Call while the workload is quiescent.
+ * The evidence pointer is thread-local and valid until that thread's next inspect.
+ * A successful preflight is not a substitute for workload/host qualification. */
+enum coldsnap_nccl_checkpoint_mode {
+  COLDSNAP_NCCL_CHECKPOINT_RECREATE = 0,
+  COLDSNAP_NCCL_CHECKPOINT_IN_PLACE = 1,
+};
+typedef int32_t (*coldsnap_nccl_resource_inspect_fn)(uint32_t checkpoint_mode);
+struct coldsnap_nccl_resources_v1 {
+  uint32_t struct_size;
+  uint32_t abi_major;
+  uint32_t abi_minor;
+  uint32_t reserved0;
+  coldsnap_nccl_resource_inspect_fn inspect;
+  coldsnap_nccl_provider_evidence_fn evidence_json;
+};
+int32_t coldsnapNcclResourcesQuery(
+    uint32_t requested_abi_major, const struct coldsnap_nccl_resources_v1** provider);
+
 /* Keep the existing C linkage trailer at its original debug line. */
 #line 69
 

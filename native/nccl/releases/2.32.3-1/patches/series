@@ -1,0 +1,12 @@
+0001-checkpoint-ib-reset.patch
+0002-checkpoint-termination.patch
+0003-provider-abi.patch
+0004-build-in-place-provider.patch
+0005-exact-nccl-net-reattach.patch
+0006-exact-nccl-control-reattach.patch
+0007-checkpoint-resource-preflight.patch
+0008-checkpoint-progress-ras.patch
+0009-checkpoint-idle-plugins.patch
+0010-checkpoint-ib-capability-cache.patch
+0011-checkpoint-window-bookkeeping.patch
+0012-checkpoint-tls-lifecycle.patch

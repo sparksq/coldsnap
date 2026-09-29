@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "kind": "coldsnap-nccl-source-lock",
+  "repository": "https://github.com/NVIDIA/nccl.git",
+  "signed_tag": "v2.32.3-1",
+  "commit": "12df1a11afad322be5a204a2db890161cbf8131d",
+  "source_archive": "https://github.com/NVIDIA/nccl/archive/refs/tags/v2.32.3-1.tar.gz",
+  "source_archive_sha256": "29ac5f4c8c91c6d062eb5fead866efce46ce4b2ea29930caf70665581b868f9e",
+  "license": "Apache-2.0 AND BSD-3-Clause"
+}

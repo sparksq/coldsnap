@@ -23,6 +23,7 @@ checks in disposable test environments with explicit resource limits.
 | `nccl_cuda_checkpoint_target.py` | Generic rank/generation-specific collective and CUDA-graph parity target. |
 | `nccl_cuda_criu_node.py` | Coordinate one rank of the generic NCCL CUDA/CRIU round trip; requires explicit coordinator, artifact, checkpoint, and provider inputs. |
 | `nccl_dlsym_interposer_smoke.py` | Verify current dlsym bridge routing; requires the bridge preloaded and `COLDSNAP_NCCL_REAL_LIBRARY_PATH`, `COLDSNAP_NCCL_DLSYM_BRIDGE_PATH`, and provider settings. |
+| `nccl_provider_lifecycle_smoke.py` | Compile the native test target and verify local NCCL preflight, registration replay, launch events, retained graphs, and shared progress monitors; no CRIU. |
 | `nccl_instanttensor_unwrap_smoke.py` | Exercise provider communicator unwrap with a local PyTorch NCCL process group and qualified NCCL runtime. |
 
 ## Manager-driven measurements

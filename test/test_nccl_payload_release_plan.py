@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -30,8 +32,8 @@ class NcclPayloadReleasePlanTest(unittest.TestCase):
         releases = self.planner._all_releases()
         plan = self.planner._make_plan(releases)
         self.assertTrue(plan["has_changes"])
-        self.assertEqual(len(plan["release_matrix"]["include"]), 2)
-        self.assertEqual(len(plan["build_matrix"]["include"]), 4)
+        self.assertEqual(len(plan["release_matrix"]["include"]), 3)
+        self.assertEqual(len(plan["build_matrix"]["include"]), 6)
         self.assertEqual(
             {item["platform"] for item in plan["build_matrix"]["include"]},
             {"linux/amd64", "linux/arm64"},
@@ -40,8 +42,25 @@ class NcclPayloadReleasePlanTest(unittest.TestCase):
             item["release"]: item["provider_tag"]
             for item in plan["release_matrix"]["include"]
         }
+        self.assertEqual(tags["2.32.3-1"], "2.32.3-1.coldsnap.2")
         self.assertEqual(tags["2.31.2-1"], "2.31.2-1.coldsnap.12")
         self.assertEqual(tags["2.30.7-1"], "2.30.7-1.coldsnap.1")
+
+    def test_tls_backend_is_forwarded_and_validated(self) -> None:
+        plan = self.planner._make_plan(self.planner._all_releases())
+        for row in plan["build_matrix"]["include"]:
+            self.assertEqual(row["tls_backend"], "OPENSSL3" if row["release"] == "2.32.3-1" else "")
+        for release, backend in (("2.32.3-1", "unsupported"), ("2.31.2-1", "OPENSSL3")):
+            with self.subTest(release=release, backend=backend), tempfile.TemporaryDirectory() as directory:
+                source = ROOT / "native/nccl/releases" / release
+                destination = Path(directory) / release
+                destination.mkdir()
+                recipe = json.loads((source / "recipe.json").read_text())
+                recipe["build"]["tls_backend"] = backend
+                (destination / "recipe.json").write_text(json.dumps(recipe))
+                (destination / "source.lock").write_bytes((source / "source.lock").read_bytes())
+                with self.assertRaisesRegex(ValueError, "unsupported TLS backend"):
+                    self.planner._release_metadata(destination)
 
     def test_capability_admission_change_does_not_rebuild_payload(self) -> None:
         releases = self.planner._all_releases()
@@ -53,11 +72,13 @@ class NcclPayloadReleasePlanTest(unittest.TestCase):
 
     def test_release_build_input_selects_only_that_release(self) -> None:
         releases = self.planner._all_releases()
-        selected = self.planner._select_changed(
-            releases,
-            ["native/nccl/releases/2.31.2-1/coldsnap_provider.cc"],
-        )
-        self.assertEqual(selected, {"2.31.2-1"})
+        for release in releases:
+            with self.subTest(release=release):
+                selected = self.planner._select_changed(
+                    releases,
+                    [f"native/nccl/releases/{release}/coldsnap_provider.cc"],
+                )
+                self.assertEqual(selected, {release})
 
     def test_shared_build_input_selects_every_release(self) -> None:
         releases = self.planner._all_releases()

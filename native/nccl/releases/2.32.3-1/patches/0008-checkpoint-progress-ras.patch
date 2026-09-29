@@ -1,0 +1,274 @@
+diff --git a/src/bootstrap.cc b/src/bootstrap.cc
+index a9d478d..533b450 100644
+--- a/src/bootstrap.cc
++++ b/src/bootstrap.cc
+@@ -1568,6 +1568,40 @@ ncclResult_t bootstrapBroadcast(void* commState, int rank, int nranks, int root,
+   return ncclSuccess;
+ }
+ 
++NCCL_API(ncclResult_t, ncclCheckpointRasDetach, ncclComm_t comm);
++ncclResult_t ncclCheckpointRasDetach(ncclComm_t comm) {
++  if (comm == nullptr) return ncclInvalidArgument;
++  return ncclRasCommFini(comm);
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointRasListen, ncclComm_t comm, struct rasRankInit* rank);
++ncclResult_t ncclCheckpointRasListen(ncclComm_t comm, struct rasRankInit* rank) {
++  if (comm == nullptr || rank == nullptr) return ncclInvalidArgument;
++  memset(rank, 0, sizeof(*rank));
++  if (ncclParamRasEnable() != 1) return ncclSuccess;
++  NCCLCHECK(bootstrapNetInit());
++  ncclCheckpointRefreshHostHash();
++  memcpy(&rank->addr, &bootstrapNetIfAddr, sizeof(rank->addr));
++  rank->pid = ncclOsGetPid();
++  rank->cudaDev = comm->cudaDev;
++  rank->nvmlDev = comm->nvmlDev;
++  rank->hostHash = getHostHash();
++  rank->pidHash = getPidHash();
++  return ncclRasCommInit(comm, rank);
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointRasPublish, ncclComm_t comm, const struct rasRankInit* ranks, int count);
++ncclResult_t ncclCheckpointRasPublish(ncclComm_t comm, const struct rasRankInit* ranks, int count) {
++  if (comm == nullptr || ranks == nullptr || count != comm->nRanks) return ncclInvalidArgument;
++  if (ncclParamRasEnable() != 1) return ncclSuccess;
++  struct rasRankInit* owned;
++  NCCLCHECK(ncclCalloc(&owned, count));
++  memcpy(owned, ranks, count * sizeof(*owned));
++  ncclResult_t result = ncclRasAddRanks(owned, count);
++  if (result != ncclSuccess) free(owned);
++  return result;
++}
++
+ NCCL_API(ncclResult_t, ncclCheckpointControlDetach, ncclComm_t comm);
+ ncclResult_t ncclCheckpointControlDetach(ncclComm_t comm) {
+   if (comm == NULL || comm->endMagic != NCCL_MAGIC || comm->bootstrap == NULL || comm->proxyState == NULL) {
+diff --git a/src/include/utils.h b/src/include/utils.h
+index 46470cb..8de2a23 100644
+--- a/src/include/utils.h
++++ b/src/include/utils.h
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -39,6 +40,7 @@ ncclResult_t getBusId(int cudaDev, int64_t* busId);
+ 
+ ncclResult_t getHostName(char* hostname, int maxlen, const char delim);
+ uint64_t getHostHash();
++void ncclCheckpointRefreshHostHash();
+ uint64_t getPidHash();
+ uint64_t hashCombine(uint64_t baseHash, uint64_t value);
+ ncclResult_t getRandomData(void* buffer, size_t bytes);
+diff --git a/src/init.cc b/src/init.cc
+index 374d974..257b277 100644
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -657,16 +657,17 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
+   return ncclSuccess;
+ }
+ 
++static std::mutex progressCounterClockMutex;
++static int64_t progressCounterClockOffsets[kRasMaxCudaDevices] = {};
++
+ static int64_t progressCounterCalibrateGpuTimer(struct ncclComm* comm, cudaStream_t deviceStream) {
+   if (comm->cudaDev < 0 || comm->cudaDev >= kRasMaxCudaDevices) return 0;
+ 
+   // Cache the CPU/GPU timer offset per device. Failed calibrations are retried.
+-  static std::mutex mutex;
+-  static int64_t offsets[kRasMaxCudaDevices] = {};
+   int64_t offsetNs;
+   {
+-    std::lock_guard<std::mutex> lock(mutex);
+-    offsetNs = offsets[comm->cudaDev];
++    std::lock_guard<std::mutex> lock(progressCounterClockMutex);
++    offsetNs = progressCounterClockOffsets[comm->cudaDev];
+   }
+   if (offsetNs != 0) return offsetNs;
+ 
+@@ -695,9 +696,9 @@ static int64_t progressCounterCalibrateGpuTimer(struct ncclComm* comm, cudaStrea
+   }
+   if (measured) {
+     {
+-      std::lock_guard<std::mutex> lock(mutex);
+-      if (offsets[comm->cudaDev] == 0) offsets[comm->cudaDev] = offsetNs;
+-      offsetNs = offsets[comm->cudaDev];
++      std::lock_guard<std::mutex> lock(progressCounterClockMutex);
++      if (progressCounterClockOffsets[comm->cudaDev] == 0) progressCounterClockOffsets[comm->cudaDev] = offsetNs;
++      offsetNs = progressCounterClockOffsets[comm->cudaDev];
+     }
+     TRACE(NCCL_RAS, "NCCL progress-counter clock calibration: cudaDev %d gpuTimerOffsetNs=%ld", comm->cudaDev,
+           (long)offsetNs);
+@@ -710,6 +711,37 @@ static int64_t progressCounterCalibrateGpuTimer(struct ncclComm* comm, cudaStrea
+   return offsetNs;
+ }
+ 
++extern "C" ncclResult_t ncclCheckpointProgressIdle();
++NCCL_API(ncclResult_t, ncclCheckpointProgressReset);
++ncclResult_t ncclCheckpointProgressReset() {
++  NCCLCHECK(ncclCheckpointProgressIdle());
++  std::lock_guard<std::mutex> lock(progressCounterClockMutex);
++  memset(progressCounterClockOffsets, 0, sizeof(progressCounterClockOffsets));
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointProgressResume, ncclComm_t comm);
++ncclResult_t ncclCheckpointProgressResume(ncclComm_t comm) {
++  if (comm == nullptr) return ncclInvalidArgument;
++  if (comm->deviceCountersBlock == nullptr && comm->hostCountersBlock == nullptr) return ncclSuccess;
++  if (comm->deviceCountersBlock == nullptr || comm->hostCountersBlock == nullptr) return ncclInvalidUsage;
++  CUDACHECK(cudaSetDevice(comm->cudaDev));
++  cudaStream_t stream;
++  CUDACHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++  // Preserve graph-visible addresses, but start diagnostics in the destination's clock epoch.
++  cudaError_t error = cudaMemsetAsync(comm->deviceCountersBlock, 0, sizeof(*comm->deviceCountersBlock), stream);
++  if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
++  if (error != cudaSuccess) {
++    (void)cudaStreamDestroy(stream);
++    return ncclUnhandledCudaError;
++  }
++  memset(comm->hostCountersBlock, 0, sizeof(*comm->hostCountersBlock));
++  comm->gpuTimerOffsetNs = progressCounterCalibrateGpuTimer(comm, stream);
++  CUDACHECK(cudaStreamDestroy(stream));
++  return ncclProgressCounterMonitorInit(comm);
++}
++
++
+ static ncclResult_t devCommSetup(ncclComm_t comm) {
+   ncclResult_t ret = ncclSuccess;
+   int nRanks = comm->nRanks;
+@@ -3535,6 +3567,7 @@ fail:
+ 
+ NCCL_API(ncclResult_t, ncclCheckpointNetworkReset);
+ ncclResult_t ncclCheckpointNetworkReset() {
++  NCCLCHECK(ncclCheckpointProgressReset());
+   NCCLCHECK(bootstrapNetCheckpointReset());
+   NCCLCHECK(ncclNetSocketCheckpointReset());
+   NCCLCHECK(ncclCheckpointIbReset());
+@@ -3543,6 +3576,7 @@ ncclResult_t ncclCheckpointNetworkReset() {
+ 
+ NCCL_API(ncclResult_t, ncclCheckpointNetworkInit);
+ ncclResult_t ncclCheckpointNetworkInit() {
++  ncclCheckpointRefreshHostHash();
+   return bootstrapNetInit();
+ }
+ 
+diff --git a/src/misc/utils.cc b/src/misc/utils.cc
+index fcd379d..1b744a5 100644
+--- a/src/misc/utils.cc
++++ b/src/misc/utils.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -152,6 +153,9 @@ static void getHostHashOnce() {
+ 
+   hostHashValue = getHash(hostHash, strlen(hostHash));
+ }
++// Called only at ColdSnap's quiescent restore boundary, before communicator/proxy initialization.
++void ncclCheckpointRefreshHostHash() { getHostHashOnce(); }
++
+ uint64_t getHostHash(void) {
+   static std::once_flag once;
+   std::call_once(once, getHostHashOnce);
+diff --git a/src/ras/progress_monitor.cc b/src/ras/progress_monitor.cc
+index a8c3643..7483b3e 100644
+--- a/src/ras/progress_monitor.cc
++++ b/src/ras/progress_monitor.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -402,3 +403,40 @@ ncclResult_t ncclProgressCounterMonitorDestroy(struct ncclComm* comm) {
+   if (haveDestroyRef) releaseGpuProgressCounterMonitorDestroyRef(g);
+   return ncclSuccess;
+ }
++
++// All monitor registrations must be released before freezing the process.
++NCCL_API(ncclResult_t, ncclCheckpointProgressIdle);
++ncclResult_t ncclCheckpointProgressIdle() {
++  std::lock_guard<std::mutex> lock(gpuProgressCounterMonitorsMu);
++  for (int device = 0; device < kRasMaxCudaDevices; ++device) {
++    if (gpuProgressCounterMonitors[device] != nullptr) return ncclInvalidUsage;
++  }
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointProgressSuspend, ncclComm_t comm);
++ncclResult_t ncclCheckpointProgressSuspend(ncclComm_t comm) {
++  if (comm == nullptr) return ncclInvalidArgument;
++  NCCLCHECK(ncclProgressCounterMonitorDestroy(comm));
++  comm->gpuTimerOffsetNs = 0;
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointProgressStatus, ncclComm_t comm, int* monitors, int* registered);
++ncclResult_t ncclCheckpointProgressStatus(ncclComm_t comm, int* monitors, int* registered) {
++  if (comm == nullptr || monitors == nullptr || registered == nullptr) return ncclInvalidArgument;
++  *monitors = 0;
++  *registered = 0;
++  std::lock_guard<std::mutex> lock(gpuProgressCounterMonitorsMu);
++  for (int device = 0; device < kRasMaxCudaDevices; ++device) {
++    auto* monitor = gpuProgressCounterMonitors[device];
++    if (monitor == nullptr) continue;
++    ++*monitors;
++    std::lock_guard<std::mutex> deviceLock(monitor->mutex);
++    for (auto* current = ncclIntruQueueHead(&monitor->registrations); current != nullptr;
++         current = current->nextProgressRegistration) {
++      if (current == comm) *registered = 1;
++    }
++  }
++  return ncclSuccess;
++}
+diff --git a/src/ras/ras.cc b/src/ras/ras.cc
+index 31303a4..cee8269 100644
+--- a/src/ras/ras.cc
++++ b/src/ras/ras.cc
+@@ -158,17 +158,19 @@ fail:
+ // Invoked by regular NCCL threads on every comm termination.
+ ncclResult_t ncclRasCommFini(const struct ncclComm* comm) {
+   if (!rasInitialized) return ncclSuccess;
++  bool registered = false;
+   {
+     std::lock_guard<std::mutex> lock(ncclCommsMutex);
+     for (int i = 0; i < nNcclComms; i++) {
+       if (ncclComms[i] == comm) {
+         ncclComms[i] = nullptr;
+         ncclCommsSorted = false;
++        registered = true;
+         break;
+       }
+     }
+   }
+-  ncclAtomicRefCountDecrement(&rasInitRefCount);
++  if (registered) ncclAtomicRefCountDecrement(&rasInitRefCount);
+   return ncclSuccess;
+ }
+ 
+diff --git a/src/transport/net.cc b/src/transport/net.cc
+index a542e49..1c552ac 100644
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -20,6 +20,7 @@
+ #include "compiler.h"
+ #include "register_inline.h"
+ #include "bootstrap.h"
++#include "ras.h"
+ 
+ #include <chrono>
+ #include <thread>
+@@ -2377,8 +2378,12 @@ ncclResult_t ncclCheckpointNetDetach(ncclComm_t comm) {
+   return ncclSuccess;
+ }
+ 
++extern "C" ncclResult_t ncclCheckpointProgressReset();
++
+ NCCL_API(ncclResult_t, ncclCheckpointNetResetGlobals);
+ ncclResult_t ncclCheckpointNetResetGlobals() {
++  NCCLCHECK(ncclCheckpointProgressReset());
++  NCCLCHECK(ncclRasCheckpointReset());
+   NCCLCHECK(bootstrapNetCheckpointReset());
+   NCCLCHECK(ncclNetSocketCheckpointReset());
+   if (coldsnapUsedIb) NCCLCHECK(ncclCheckpointIbReset());

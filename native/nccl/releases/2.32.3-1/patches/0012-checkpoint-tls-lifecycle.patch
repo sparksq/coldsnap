@@ -1,0 +1,197 @@
+--- a/src/misc/crypt.cc
++++ b/src/misc/crypt.cc
+@@ -5,6 +5,7 @@
+  * See LICENSE.txt for more license information
+  *************************************************************************/
+ 
++// Modified by ColdSnap: isolated TLS entropy and checkpoint connection lifecycle.
+ #include "crypt.h"
+ #include "core.h"
+ #include "alloc.h"
+@@ -23,6 +24,7 @@
+ #include <openssl/opensslv.h>
+ #include <openssl/params.h>
+ #include <openssl/ssl.h>
++#include <openssl/rand.h>
+ 
+ #if OPENSSL_VERSION_MAJOR != 3
+ #error "NCCL TLS support requires OpenSSL 3"
+@@ -56,6 +58,9 @@
+   SYMBOL(EVP_KDF_derive) \
+   SYMBOL(EVP_KDF_fetch) \
+   SYMBOL(EVP_KDF_free) \
++  SYMBOL(EVP_RAND_reseed) \
++  SYMBOL(OSSL_LIB_CTX_new) \
++  SYMBOL(RAND_get0_primary) \
+   SYMBOL(OPENSSL_cleanse) \
+   SYMBOL(OSSL_PARAM_construct_end) \
+   SYMBOL(OSSL_PARAM_construct_octet_string) \
+@@ -67,7 +72,7 @@
+   SYMBOL(SSL_CTX_clear_options) \
+   SYMBOL(SSL_CTX_ctrl) \
+   SYMBOL(SSL_CTX_free) \
+-  SYMBOL(SSL_CTX_new) \
++  SYMBOL(SSL_CTX_new_ex) \
+   SYMBOL(SSL_CTX_set_ciphersuites) \
+   SYMBOL(SSL_CTX_set_psk_find_session_callback) \
+   SYMBOL(SSL_CTX_set_psk_use_session_callback) \
+@@ -125,6 +130,7 @@
+ };
+ 
+ static std::mutex ncclCryptLock; // owns all static-scoped variables for this translation unit
++static size_t ncclCryptActiveConnections = 0;
+ static bool ncclCryptHaveKey = false;
+ static unsigned char* ncclCryptConfigKey;
+ static size_t ncclCryptConfigKeyLen;
+@@ -170,6 +176,11 @@
+ #if defined(NCCL_TLS_BACKEND_OPENSSL3)
+ static const unsigned char ncclCryptPskIdentity[] = "nccl-psk-v1";
+ static bool ncclCryptLibReady = false;
++// Keep the private library context for process lifetime. Persistent application
++// threads may own its thread-local DRBGs; freeing it here would invalidate them.
++// It never becomes the application's default OpenSSL context.
++static OSSL_LIB_CTX* ncclCryptLibCtx;
++static bool ncclCryptNeedsReseed = false;
+ static BIO_METHOD* ncclCryptBioMethod;
+ static SSL_CTX* ncclCryptClientCtx;
+ static SSL_CTX* ncclCryptServerCtx;
+@@ -334,6 +345,24 @@
+     ret = ncclSystemError;
+     goto fail;
+   }
++  if (ncclCryptLibCtx == nullptr) ncclCryptLibCtx = ncclCryptOpenSsl.pfn_OSSL_LIB_CTX_new();
++  if (ncclCryptLibCtx == nullptr) {
++    ret = ncclSystemError;
++    goto fail;
++  }
++  if (ncclCryptNeedsReseed) {
++    // All NCCL SSL objects are gone and creation is serialized by ncclCryptLock.
++    // Reseed this private primary before any restored handshake. Its thread-local
++    // children reseed on next use; other libraries' OpenSSL contexts are untouched.
++    EVP_RAND_CTX* primary = ncclCryptOpenSsl.pfn_RAND_get0_primary(ncclCryptLibCtx);
++    if (primary == nullptr || ncclCryptOpenSsl.pfn_EVP_RAND_reseed(
++          primary, /*prediction_resistance=*/1, nullptr, 0, nullptr, 0) != 1) {
++      WARN("ncclCrypt: fresh checkpoint-restore entropy unavailable");
++      ret = ncclSystemError;
++      goto fail;
++    }
++    ncclCryptNeedsReseed = false;
++  }
+   ncclCryptBioMethod =
+     ncclCryptOpenSsl.pfn_BIO_meth_new(ncclCryptOpenSsl.pfn_BIO_get_new_index() | BIO_TYPE_SOURCE_SINK, "NCCL socket");
+   if (ncclCryptBioMethod == nullptr ||
+@@ -346,8 +375,8 @@
+     ret = ncclSystemError;
+     goto fail;
+   }
+-  ncclCryptClientCtx = ncclCryptOpenSsl.pfn_SSL_CTX_new(ncclCryptOpenSsl.pfn_TLS_method());
+-  ncclCryptServerCtx = ncclCryptOpenSsl.pfn_SSL_CTX_new(ncclCryptOpenSsl.pfn_TLS_method());
++  ncclCryptClientCtx = ncclCryptOpenSsl.pfn_SSL_CTX_new_ex(ncclCryptLibCtx, nullptr, ncclCryptOpenSsl.pfn_TLS_method());
++  ncclCryptServerCtx = ncclCryptOpenSsl.pfn_SSL_CTX_new_ex(ncclCryptLibCtx, nullptr, ncclCryptOpenSsl.pfn_TLS_method());
+   contexts[0] = ncclCryptClientCtx;
+   contexts[1] = ncclCryptServerCtx;
+   for (int i = 0; i < 2; i++) {
+@@ -380,7 +409,7 @@
+   NCCLCHECK(ncclCalloc(&keyCopy, keyLen));
+   memcpy(keyCopy, key, keyLen);
+   static const char info[] = "NCCL PSK domain separation key";
+-  EVP_KDF* kdf = ncclCryptOpenSsl.pfn_EVP_KDF_fetch(nullptr, "HKDF", nullptr);
++  EVP_KDF* kdf = ncclCryptOpenSsl.pfn_EVP_KDF_fetch(ncclCryptLibCtx, "HKDF", nullptr);
+   EVP_KDF_CTX* ctx = kdf == nullptr ? nullptr : ncclCryptOpenSsl.pfn_EVP_KDF_CTX_new(kdf);
+   OSSL_PARAM params[] = {
+     ncclCryptOpenSsl.pfn_OSSL_PARAM_construct_utf8_string(ncclCryptKdfParamDigest, (char*)"SHA256", /*bsize=*/0),
+@@ -513,7 +542,9 @@
+ 
+ #if defined(NCCL_TLS_BACKEND_OPENSSL3)
+ static ncclResult_t cryptEnsure(struct ncclSocket* sock, bool isServer) {
++  std::lock_guard<std::mutex> lock(ncclCryptLock);
+   if (sock->crypto != nullptr) return ncclSuccess;
++  NCCLCHECK(cryptInitLib());
+   ncclResult_t ret = ncclSuccess;
+   struct ncclSocketCrypto* crypto = nullptr;
+   BIO* bio = nullptr;
+@@ -531,6 +562,7 @@
+   else ncclCryptOpenSsl.pfn_SSL_set_connect_state(crypto->ssl);
+   crypto->bio = bio;
+   sock->crypto = crypto;
++  ncclCryptActiveConnections++;
+   return ncclSuccess;
+ fail:
+   if (crypto != nullptr) {
+@@ -797,8 +829,39 @@
+ 
+ void ncclCryptFree(struct ncclSocketCrypto* crypto) {
+   if (crypto == nullptr) return;
++  std::lock_guard<std::mutex> lock(ncclCryptLock);
+ #if defined(NCCL_TLS_BACKEND_OPENSSL3)
+   ncclCryptOpenSsl.pfn_SSL_free(crypto->ssl);
++  ncclCryptActiveConnections--;
+ #endif
+   free(crypto);
+ }
++
++// Called only after every communicator/control-plane transport is detached.
++// Reject unowned live connections rather than checkpointing an SSL session.
++NCCL_API(ncclResult_t, ncclCheckpointCryptReset);
++ncclResult_t ncclCheckpointCryptReset() {
++  std::lock_guard<std::mutex> lock(ncclCryptLock);
++  if (ncclCryptActiveConnections != 0) return ncclInvalidUsage;
++#if defined(NCCL_TLS_BACKEND_OPENSSL3)
++  cryptFreeLibObjects();
++  ncclCryptNeedsReseed = ncclCryptLibCtx != nullptr;
++#endif
++  return ncclSuccess;
++}
++
++NCCL_API(ncclResult_t, ncclCheckpointCryptStatus, int* compiled, size_t* active, int* ready, int* reseed);
++ncclResult_t ncclCheckpointCryptStatus(int* compiled, size_t* active, int* ready, int* reseed) {
++  if (compiled == nullptr || active == nullptr || ready == nullptr || reseed == nullptr)
++    return ncclInvalidArgument;
++  std::lock_guard<std::mutex> lock(ncclCryptLock);
++  *active = ncclCryptActiveConnections;
++#if defined(NCCL_TLS_BACKEND_OPENSSL3)
++  *compiled = 1;
++  *ready = ncclCryptLibReady;
++  *reseed = ncclCryptNeedsReseed;
++#else
++  *compiled = *ready = *reseed = 0;
++#endif
++  return ncclSuccess;
++}
+--- a/src/init.cc
++++ b/src/init.cc
+@@ -3565,12 +3565,15 @@
+   goto exit;
+ }
+ 
++extern "C" ncclResult_t ncclCheckpointCryptReset();
++
+ NCCL_API(ncclResult_t, ncclCheckpointNetworkReset);
+ ncclResult_t ncclCheckpointNetworkReset() {
+   NCCLCHECK(ncclCheckpointProgressReset());
+   NCCLCHECK(bootstrapNetCheckpointReset());
+   NCCLCHECK(ncclNetSocketCheckpointReset());
+   NCCLCHECK(ncclCheckpointIbReset());
++  NCCLCHECK(ncclCheckpointCryptReset());
+   return ncclSuccess;
+ }
+ 
+--- a/src/transport/net.cc
++++ b/src/transport/net.cc
+@@ -2472,6 +2472,8 @@
+ 
+ extern "C" ncclResult_t ncclCheckpointProgressReset();
+ 
++extern "C" ncclResult_t ncclCheckpointCryptReset();
++
+ NCCL_API(ncclResult_t, ncclCheckpointNetResetGlobals);
+ ncclResult_t ncclCheckpointNetResetGlobals() {
+   NCCLCHECK(ncclCheckpointProgressReset());
+@@ -2479,6 +2481,7 @@
+   NCCLCHECK(bootstrapNetCheckpointReset());
+   NCCLCHECK(ncclNetSocketCheckpointReset());
+   if (coldsnapUsedIb) NCCLCHECK(ncclCheckpointIbReset());
++  NCCLCHECK(ncclCheckpointCryptReset());
+   return ncclSuccess;
+ }
+ 

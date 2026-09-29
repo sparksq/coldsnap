@@ -29,9 +29,19 @@ provider revision (`2.31.2-1.coldsnap.12`); the shorter upstream-release tag is
 an advancing alias. See [`deploy/nccl`](../../deploy/nccl/README.md) for the
 manual workflow and local source-build fallback.
 
-The checked-in 2.31.2-1 and 2.30.7-1 recipes are locked. The 2.31.2-1 provider
-also owns the n610 in-place communicator and transport lifecycle used to retain
-CUDA graph executables. Its low-level experiment-named environment switch and
+The checked-in 2.32.3-1, 2.31.2-1, and 2.30.7-1 recipes are locked. The new
+`nccl-2.32.3-1+coldsnap.2` provider ports the 2.31.2-1 lifecycle to the updated
+Socket/RMA discovery, bootstrap, and checkpoint internals. Its source and local
+validation review is in [`releases/2.32.3-1/source-diff.md`](releases/2.32.3-1/source-diff.md).
+Its production admission is **accepted** for its declared capabilities, based
+on the final ARM64 payload checkpoint/restore matrix and x86 build/ABI checks.
+The review records hardware and topology limits; active GIN/RMA, CFT/NVLS,
+and in-place window/CE resources remain gated.
+The existing 2.31.2-1 and 2.30.7-1 admission records remain accepted.
+
+The 2.31.2-1 and 2.32.3-1 providers also own the n610 in-place communicator and
+transport lifecycle used to retain CUDA graph executables. Their low-level
+experiment-named environment switch and
 `qualified:false` self-report are retained ABI details; production admission is
 carried by the release-owned `qualification.json` capability policy and the
 assembled provider manifest. New capabilities must be listed in both the recipe

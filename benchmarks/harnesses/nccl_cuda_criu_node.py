@@ -41,6 +41,10 @@ TRANSPORT_ENVIRONMENT = (
     "NCCL_IB_RELEASE_ON_FINALIZE",
     "NCCL_CROSS_NIC",
     "NCCL_RAS_ENABLE",
+    "NCCL_PROGRESS_COUNTERS",
+    "NCCL_PROGRESS_COUNTER_MONITOR_POLL_MS",
+    "NCCL_PROGRESS_COUNTER_MONITOR_STALE_MS",
+    "NCCL_PROGRESS_COUNTER_MONITOR_STALE_WARN_SEC",
     "NCCL_SOCKET_IFNAME",
 )
 SOCKET_INODE = re.compile(r"^socket:\[(\d+)\]$")
@@ -66,7 +70,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--minimum-target-pid", type=int, default=512)
     parser.add_argument("--shared-memory-dir", type=Path, default=Path("/dev/shm"))
-    parser.add_argument("--ghost-limit", type=int, default=64 * 1024**2)
+    # Retained NCCL 2.32 proxy shared memory can exceed 64 MiB.
+    parser.add_argument("--ghost-limit", type=int, default=128 * 1024**2)
     parser.add_argument(
         "--network-lock",
         choices=("nftables", "iptables", "skip"),

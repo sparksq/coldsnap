@@ -1,0 +1,103 @@
+diff --git a/src/transport/net_ib/gdr.cc b/src/transport/net_ib/gdr.cc
+index 07265ac..bc0fc51 100644
+--- a/src/transport/net_ib/gdr.cc
++++ b/src/transport/net_ib/gdr.cc
+@@ -1,3 +1,4 @@
++// Modified by ColdSnap for checkpoint lifecycle support.
+ /*************************************************************************
+  * SPDX-FileCopyrightText: Copyright (c) 2016-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+@@ -12,6 +13,9 @@
+ // ncclSuccess : GDR works
+ // ncclSystemError : no module or module loaded but not supported by GPU
+ #define KNL_MODULE_LOADED(a) ((access(a, F_OK) == -1) ? 0 : 1)
++static std::mutex ncclIbGdrModuleMutex;
++static bool ncclIbGdrModuleChecked = false;
++static bool ncclIbPeerMemModuleChecked = false;
+ static int ncclIbGdrModuleLoaded = 0; // 1 = true, 0 = false
+ static void ibGdrSupportInitOnce() {
+   // Check for the nv_peer_mem module being loaded
+@@ -22,8 +26,11 @@ static void ibGdrSupportInitOnce() {
+ 
+ // Returns ncclSuccess if any of the peermem modules are loaded.
+ ncclResult_t ncclIbGdrSupport() {
+-  static std::once_flag once;
+-  std::call_once(once, ibGdrSupportInitOnce);
++  std::lock_guard<std::mutex> lock(ncclIbGdrModuleMutex);
++  if (!ncclIbGdrModuleChecked) {
++    ibGdrSupportInitOnce();
++    ncclIbGdrModuleChecked = true;
++  }
+   if (!ncclIbGdrModuleLoaded) return ncclSystemError;
+   return ncclSuccess;
+ }
+@@ -36,12 +43,23 @@ static void ibPeerMemSupportInitOnce() {
+ // Returns ncclSuccess if nvidia_peermem module is loaded. Does not check legacy implementations of nv_peer_mem
+ // (e.g. nv_mem, nv_mem_nc)
+ ncclResult_t ncclIbPeerMemSupport() {
+-  static std::once_flag once;
+-  std::call_once(once, ibPeerMemSupportInitOnce);
++  std::lock_guard<std::mutex> lock(ncclIbGdrModuleMutex);
++  if (!ncclIbPeerMemModuleChecked) {
++    ibPeerMemSupportInitOnce();
++    ncclIbPeerMemModuleChecked = true;
++  }
+   if (!ncclIbPeerMemModuleLoaded) return ncclSystemError;
+   return ncclSuccess;
+ }
+ 
++// Re-evaluate destination kernel-module availability after every checkpoint.
++void ncclIbGdrCheckpointReset() {
++  std::lock_guard<std::mutex> lock(ncclIbGdrModuleMutex);
++  ncclIbGdrModuleChecked = ncclIbPeerMemModuleChecked = false;
++  ncclIbGdrModuleLoaded = ncclIbPeerMemModuleLoaded = 0;
++}
++
++static std::mutex ncclIbDmaBufSupportMutex;
+ static thread_local int ibDmaSupportInitDev; // which device to init, must be thread local
+ static void ibDmaBufSupportInitOnce() {
+   ncclResult_t res;
+@@ -71,12 +89,18 @@ failure:
+ // ncclSuccess : DMA-BUF support is available
+ // ncclSystemError : DMA-BUF is not supported by the kernel
+ ncclResult_t ncclIbDmaBufSupport(int dev) {
+-  static std::once_flag onces[MAX_IB_DEVS];
+-  // init the device only once
+-  ibDmaSupportInitDev = dev;
+-  std::call_once(onces[dev], ibDmaBufSupportInitOnce);
+-  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + ibDmaSupportInitDev;
++  std::lock_guard<std::mutex> lock(ncclIbDmaBufSupportMutex);
++  if (dev < 0 || dev >= ncclNMergedIbDevs) return ncclInvalidArgument;
++  ncclIbMergedDev* mergedDev = ncclIbMergedDevs + dev;
++  if (mergedDev->vProps.ndevs <= 0 || mergedDev->vProps.devs[0] < 0 ||
++      mergedDev->vProps.devs[0] >= ncclNIbDevs) return ncclInvalidArgument;
+   ncclIbDev* ibDev = ncclIbDevs + mergedDev->vProps.devs[0];
++  // The result belongs to the opened device, not to the lifetime of the process.
++  // Device finalization reconstructs ncclIbDev with dmaBufSupported == 0.
++  if (ibDev->dmaBufSupported == 0) {
++    ibDmaSupportInitDev = dev;
++    ibDmaBufSupportInitOnce();
++  }
+   int dmaBufSupported = ibDev->dmaBufSupported;
+   if (dmaBufSupported == 1) return ncclSuccess;
+   return ncclSystemError;
+diff --git a/src/transport/net_ib/init.cc b/src/transport/net_ib/init.cc
+index 2a20af4..d583bb3 100644
+--- a/src/transport/net_ib/init.cc
++++ b/src/transport/net_ib/init.cc
+@@ -368,6 +368,7 @@ ncclResult_t ncclCheckpointIbGetStatus(int* netRefs, int* ndevs, int* pdRefs, in
+ }
+ 
+ void ncclGinIbCheckpointReset();
++void ncclIbGdrCheckpointReset();
+ 
+ NCCL_API(ncclResult_t, ncclCheckpointIbReset);
+ ncclResult_t ncclCheckpointIbReset() {
+@@ -379,6 +380,7 @@ ncclResult_t ncclCheckpointIbReset() {
+   netRefCount = 1;
+   NCCLCHECK(ncclIbFinalizeDevices());
+   ncclGinIbCheckpointReset();
++  ncclIbGdrCheckpointReset();
+   return ncclSuccess;
+ }
+ 

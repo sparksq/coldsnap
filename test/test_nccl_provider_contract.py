@@ -66,8 +66,13 @@ class NcclProviderSourceContractTest(unittest.TestCase):
         self.assertNotIn("benchmarks/results/", dockerignore)
         self.assertNotIn("--evidence", provider)
 
-    def test_in_place_graph_provider_is_owned_by_qualified_release(self) -> None:
-        release = ROOT / "native/nccl/releases/2.31.2-1"
+    def test_in_place_graph_provider_is_owned_by_release(self) -> None:
+        for release_tag in ("2.31.2-1", "2.32.3-1"):
+            with self.subTest(release=release_tag):
+                self._assert_in_place_graph_provider(release_tag)
+
+    def _assert_in_place_graph_provider(self, release_tag: str) -> None:
+        release = ROOT / "native/nccl/releases" / release_tag
         source = (release / "coldsnap_in_place_provider.cc").read_text()
         patch_source = (release / "patches/0004-build-in-place-provider.patch").read_text()
         transport_patch = (
@@ -79,9 +84,7 @@ class NcclProviderSourceContractTest(unittest.TestCase):
         payload_dockerfile = (ROOT / "deploy/nccl/Dockerfile.payload").read_text()
         provider_dockerfile = (ROOT / "deploy/nccl/Dockerfile.provider").read_text()
         patch_series = (release / "patches/series").read_text().splitlines()
-        production_source = (
-            ROOT / "native/nccl/releases/2.31.2-1/coldsnap_provider.cc"
-        ).read_text()
+        production_source = (release / "coldsnap_provider.cc").read_text()
 
         self.assertIn('COLDSNAP_NCCL_IN_PLACE_MODE', source)
         self.assertIn('net-reconnect-v1', source)
@@ -140,10 +143,16 @@ class NcclProviderSourceContractTest(unittest.TestCase):
 
     def test_release_recipes_bind_outputs_to_capability_admission(self) -> None:
         releases = {
-            "2.31.2-1": ("nccl-2.31.2-1+coldsnap.12", 23102, True, True, 13),
-            "2.30.7-1": ("nccl-2.30.7-1+coldsnap.1", 23007, True, True, 9),
+            "2.32.3-1": ("nccl-2.32.3-1+coldsnap.2", 23203, True, True, 13, "accepted"),
+            "2.31.2-1": ("nccl-2.31.2-1+coldsnap.12", 23102, True, True, 13, "accepted"),
+            "2.30.7-1": ("nccl-2.30.7-1+coldsnap.1", 23007, True, True, 9, "accepted"),
         }
-        for release, (provider_id, version, reproducible_nvcc, strip, capability_count) in releases.items():
+        self.assertEqual(
+            {path.parent.name for path in (ROOT / "native/nccl/releases").glob("*/recipe.json")},
+            set(releases),
+        )
+        for release, expected in releases.items():
+            provider_id, version, reproducible_nvcc, strip, capability_count, state = expected
             with self.subTest(release=release):
                 root = ROOT / "native/nccl/releases" / release
                 recipe = json.loads((root / "recipe.json").read_text())
@@ -186,13 +195,16 @@ class NcclProviderSourceContractTest(unittest.TestCase):
                 for item in recipe["inputs"]["patches"]:
                     payload = ROOT.joinpath(item["path"]).read_bytes()
                     self.assertEqual(hashlib.sha256(payload).hexdigest(), item["sha256"])
-                self.assertEqual(qualification["state"], "accepted")
+                self.assertEqual(qualification["state"], state)
                 self.assertEqual(qualification["policy"], "production")
                 self.assertEqual(
                     qualification["capabilities"], recipe["capabilities"]
                 )
                 self.assertEqual(qualification["transports"], ["ib-roce", "socket"])
-                self.assertTrue(qualification["checks"])
+                if state == "accepted":
+                    self.assertTrue(qualification["checks"])
+                else:
+                    self.assertEqual(qualification["checks"], [])
                 self.assertNotIn("evidence", qualification)
                 self.assertNotIn("valid_until", qualification)
 

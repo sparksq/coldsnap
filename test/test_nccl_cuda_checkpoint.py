@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1] / "benchmarks" / "harnesses"
@@ -157,6 +159,77 @@ class NcclCudaCheckpointTest(unittest.TestCase):
             source.count('response["nccl_checkpoint"] = checkpoint.version'),
             2,
         )
+
+    def test_optional_resource_query_rejects_invalid_tables(self) -> None:
+        self.assertIsNone(target._query_resources(SimpleNamespace()))
+        table = target._ResourceProvider()
+
+        def query(major, output):
+            self.assertEqual(major, 1)
+            ctypes.cast(output, ctypes.POINTER(ctypes.POINTER(target._ResourceProvider)))[0] = ctypes.pointer(table)
+            return 0
+
+        library = SimpleNamespace(coldsnapNcclResourcesQuery=query)
+        with self.assertRaisesRegex(RuntimeError, "truncated"):
+            target._query_resources(library)
+        table.struct_size = ctypes.sizeof(table)
+        table.abi_major = 2
+        with self.assertRaisesRegex(RuntimeError, "incompatible"):
+            target._query_resources(library)
+        table.abi_major = 1
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            target._query_resources(library)
+
+    def test_resource_rejection_prevents_any_lifecycle_mutation(self) -> None:
+        for in_place in (False, True):
+            for change in ({"admitted": False}, {"complete": False}, {"mode": "wrong"}, {}):
+                with self.subTest(in_place=in_place, change=change):
+                    evidence = {
+                        "format": 1, "kind": "coldsnap-nccl-resource-inventory",
+                        "mode": "in-place" if in_place else "recreate",
+                        "complete": True, "admitted": True, "communicators": [],
+                    } | change
+                    checkpoint = target._NCCLCheckpoint.__new__(target._NCCLCheckpoint)
+                    checkpoint._resources = SimpleNamespace(
+                        inspect=Mock(return_value=0 if change else 5),
+                        evidence_json=Mock(return_value=json.dumps(evidence).encode()),
+                    )
+                    checkpoint._in_place = Mock() if in_place else None
+                    checkpoint._prepare = Mock(return_value=0)
+                    checkpoint._network_reset = Mock(return_value=0)
+                    checkpoint.version = {}
+                    with self.assertRaises(RuntimeError):
+                        checkpoint.prepare()
+                    checkpoint._prepare.assert_not_called()
+                    checkpoint._network_reset.assert_not_called()
+                    if in_place:
+                        checkpoint._in_place.communicator_suspend.assert_not_called()
+                    self.assertEqual(checkpoint.version["prepare_resources"], evidence)
+
+    def test_resource_evidence_surrounds_reconstruction_in_order(self) -> None:
+        calls = []
+        checkpoint = target._NCCLCheckpoint.__new__(target._NCCLCheckpoint)
+        evidence = {
+            "format": 1, "kind": "coldsnap-nccl-resource-inventory", "mode": "recreate",
+            "complete": True, "admitted": True, "communicators": [],
+        }
+        checkpoint._resources = SimpleNamespace(
+            inspect=lambda mode: calls.append(("inspect", mode)) or 0,
+            evidence_json=Mock(return_value=json.dumps(evidence).encode()),
+        )
+        checkpoint._in_place = None
+        checkpoint._prepare = lambda: calls.append("prepare") or 0
+        checkpoint._network_reset = lambda: calls.append("network-reset") or 0
+        checkpoint._restore = lambda: calls.append("restore") or 0
+        checkpoint.version = {}
+        checkpoint.prepare()
+        checkpoint.restore()
+        self.assertEqual(calls, [("inspect", 0), "prepare", "network-reset", "restore", ("inspect", 0)])
+        self.assertEqual(checkpoint.version["prepare_resources"], evidence)
+        self.assertEqual(checkpoint.version["restore_resources"], evidence)
+        checkpoint._resources = None
+        checkpoint.prepare()  # Older releases have no optional resource export.
+        self.assertEqual(calls[-2:], ["prepare", "network-reset"])
 
     def test_checkpoint_termination_patch_is_opt_in_and_portable(self) -> None:
         patch_source = (

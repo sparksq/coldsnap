@@ -51,8 +51,9 @@ at `/opt/coldsnap/licenses/third-party/cuda-checkpoint/LICENSE`.
 
 ## NVIDIA NCCL
 
-ColdSnap's versioned NCCL providers patch and rebuild NVIDIA NCCL, which is
-BSD-3-Clause. The upstream license is retained at
+ColdSnap's versioned NCCL providers patch and rebuild NVIDIA NCCL. Releases
+through 2.31.2-1 use BSD-3-Clause; 2.32.3-1 uses Apache-2.0 with portions retaining
+BSD-3-Clause. The upstream license texts and earlier copyright notice are retained at
 `third_party/licenses/nccl/LICENSE.txt` and embedded as a separately declared,
 manifest-verified provider file at
 `licenses/third-party/nccl/LICENSE.txt`.

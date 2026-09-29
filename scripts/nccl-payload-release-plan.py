@@ -79,6 +79,9 @@ def _release_metadata(release_root: Path) -> dict[str, Any]:
         is None
     ):
         raise ValueError(f"{release_root}: payload_repository is invalid")
+    tls_backend = build.get("tls_backend", "")
+    if tls_backend not in ("", "OPENSSL3") or (tls_backend and recipe["nccl_version_code"] < 23203):
+        raise ValueError(f"{release_root}: unsupported TLS backend")
     provider_tag = f"{release}.coldsnap.{match.group('revision')}"
     common = {
         "release": release,
@@ -93,6 +96,7 @@ def _release_metadata(release_root: Path) -> dict[str, Any]:
         "nccl_version_code": str(recipe["nccl_version_code"]),
         "nvcc_gencode": str(build["nvcc_gencode"]),
         "reproducible_nvcc": "1" if build["use_reproducible_nvcc"] else "0",
+        "tls_backend": tls_backend,
         "strip_outputs": "1" if build["strip_unneeded"] else "0",
         "source_archive": str(source_lock["source_archive"]),
         "source_archive_sha256": str(source_lock["source_archive_sha256"]),

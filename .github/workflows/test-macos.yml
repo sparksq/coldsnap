@@ -31,7 +31,7 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - uses: astral-sh/setup-uv@v9.0.0
